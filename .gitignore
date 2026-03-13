@@ -1,0 +1,85 @@
+# =============================================================================
+# AudiobookMaker — .gitignore
+# =============================================================================
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+*.key
+
+# ── Model weights & large files ───────────────────────────────────────────────
+# HuggingFace cache
+.cache/
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+# XGBoost model (trained locally)
+chapter_classifier.json
+
+# ── Input books ───────────────────────────────────────────────────────────────
+# Keep the folder structure but ignore actual book files
+LOTM/*.epub
+LOTM/*.mobi
+LOTM/*.pdf
+LOTM/*.docx
+LOTM/*.odt
+LOTM/*.txt
+
+# ── Voice samples ─────────────────────────────────────────────────────────────
+narrator_voice/
+# Processed voices saved by the UI
+audiobook_output/narrator_voice_processed.wav
+
+# ── Generated audiobook output ────────────────────────────────────────────────
+audiobook_output/
+
+# ── Debug / extraction output ─────────────────────────────────────────────────
+debug_extraction_output/
+
+# ── OS cruft ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.bak
+*.swp
+*~
+
+# ── IDEs ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Temp files ────────────────────────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+abm_ch*/          # Temp chapter processing dirs created by pipeline.py

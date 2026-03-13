@@ -1,143 +1,237 @@
-# The AI Audiobook Factory  Audiobook
+# 📖 AudiobookMaker
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue)
+![UI](https://img.shields.io/badge/UI-Gradio-orange)
 
-This project is a complete, end-to-end Python-based pipeline for converting e-books (in EPUB format) into high-quality, chapterized audiobooks with synchronised, sentence-level lyrics.
-
-It uses the powerful open-source [Coqui XTTS v2](https://github.com/coqui-ai/TTS) model for expressive, natural-sounding narration through voice cloning. The entire process is managed by a robust, parallel-processing script that can handle massive books and is fully resumable, meaning you can stop and restart long generation jobs without losing progress.
-
-## Key Features
-
-- **High-Quality TTS:** Leverages the Coqui XTTS v2 model for expressive, cloned-voice narration based on a short audio sample.
-- **EPUB to Audiobook:** Directly processes `.epub` files, automatically parsing chapters, titles, and cleaning text content.
-- **Persistent Worker Architecture:** Initialises the large AI model only once, making chapter-to-chapter processing significantly faster and avoiding redundant loading.
-- **Parallel Processing:** Uses a producer-consumer pipeline to keep the GPU fully utilised, maximising generation speed for each chapter.
-- **Fully Resumable:** If the process is interrupted, it automatically detects and skips already completed chapters on the next run, saving hours of work.
-- **Chapterized Output:** Creates a separate, neatly named MP3 file for each chapter, perfect for use in modern audiobook players.
-- **Synchronised Lyrics:** Automatically generates a timed `.lrc` file for each chapter and embeds the data directly into the MP3's ID3 tags for compatible players.
-- **Fully Configurable:** All major settings (file paths, TTS parameters, chapter skipping) are handled via command-line arguments for maximum flexibility.
-- **Utility Toolkit:** Includes scripts for:
-    - **`test_bench.py`:** Quickly test narrator voices and TTS parameters on a small text sample.
-    - **`lrc_to_srt_converter.py`:** Convert the generated LRC lyric files to the SRT subtitle format for use in video players.
-    - **`finalizer.py`:** A legacy tool to upgrade audiobooks created with older versions of this script.
-
-## Setup
-
-### 1. Prerequisites
-- Python 3.10 or higher.
-- An **NVIDIA GPU with at least 8GB of VRAM** is **highly recommended** for acceptable performance.
-- [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) (version 11.8 or higher is recommended for library compatibility).
-- **FFmpeg:** This is essential for combining audio chunks and creating the final MP3 files. Please take a look at the installation instructions below.
+An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, clone a narrator voice, clean it up, and generate a chapterized, mastered audiobook — all locally, no cloud APIs needed.
 
 ---
-### **FFmpeg Installation**
 
-The script needs `ffmpeg` to be accessible from the command line. You have two options:
+## ✨ Features
 
-#### **Option 1: System-wide Installation (Recommended)**
-This makes `ffmpeg` available to any program on your computer.
-
-*   **On Windows (using a package manager):**
-    *   Open PowerShell and use either Winget (built-in) or Chocolatey (if installed).
-    *   **Winget:** `winget install -e --id Gyan.FFmpeg`
-    *   **Chocolatey:** `choco install ffmpeg`
-
-*   **On Windows (Manual):**
-    1.  Download a build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) or the [official site](https://ffmpeg.org/download.html).
-    2.  Unzip the downloaded file to a permanent location, for example `C:\ffmpeg`.
-    3.  Search for "Environment Variables" in the Start Menu and select "Edit the system environment variables".
-    4.  Click the "Environment Variables..." button.
-    5.  Under "System variables", find the `Path` variable, select it, and click "Edit...".
-    6.  Click "New" and add the full path to the `bin` folder inside your ffmpeg directory (e.g., `C:\ffmpeg\bin`).
-    7.  Click OK on all windows to close them. **You must close and re-open your terminal/PowerShell for this change to take effect.**
-
-*   **On macOS (using Homebrew):**
-    ```bash
-    brew install ffmpeg
-    ```
-
-*   **On Linux (Debian/Ubuntu):**
-    ```bash
-    sudo apt update && sudo apt install ffmpeg
-    ```
-
-*   **On Linux (Fedora 22+):**
-    ```bash
-    sudo dnf update && sudo dnf install ffmpeg
-    ```    
-
-**To verify your installation,** open a **new** terminal and type `ffmpeg -version`. If it prints version information, you are ready.
-
-#### **Option 2: Project-specific (Portable)**
-If you do not want to install FFmpeg system-wide, you can place it directly in this project folder.
-1.  Download the FFmpeg build as described in the manual Windows instructions.
-2.  Unzip the file.
-3.  Go into the `bin` folder.
-4.  Copy **all** the files from inside `bin` (`ffmpeg.exe`, `ffprobe.exe`, `ffplay.exe`, and all the `.dll` files) and paste them directly into the root of your `Audio_Book_Maker` folder.
+- **Multi-format book support** — EPUB, MOBI, PDF, DOCX, ODT, TXT
+- **Smart chapter detection** — EPUB/MOBI use a TOC-based chapter checklist; PDF/DOCX/ODT let you split by page ranges
+- **AI text extraction** — 5-phase pipeline (Docling + OCR + ML classification + heuristic normalization) produces clean, TTS-ready text
+- **EPUB image OCR** — EasyOCR reads text embedded in images inside EPUBs
+- **Voice cloning** — Clone any narrator voice from a 3–30 second WAV sample (Qwen3-TTS)
+- **Voice preprocessing** — 7-step audio cleaning pipeline: noise reduction, noise gate, high-pass filter, silence removal, normalization, formant shifting, resampling
+- **Voice test tab** — Type any sentence and preview the cloned voice before generating
+- **Mastered output** — FFmpeg loudnorm at your chosen LUFS target; export to MP3, FLAC, WAV, or M4B
+- **Live generation log** — Stream progress in real time with a per-chapter progress bar and Cancel button
 
 ---
-### 2. Installation
-1.  Clone this repository or download the source code into your `Audio_Book_Maker` folder.
-2.  It is **strongly recommended** to use a Python virtual environment. Open a terminal in the project folder and run:
-    ```bash
-    # Create the virtual environment
-    python -m venv venv
 
-    # Activate the environment
-    # On Windows:
-    .\venv\Scripts\activate
-    # On macOS/Linux:
-    # source venv/bin/activate
-    ```
-3.  Install the required Python libraries using the provided `requirements.txt` file. This includes a specific, GPU-enabled version of PyTorch.
-    ```bash
-    pip install -r requirements.txt
-    ```
+## 🖥️ UI Preview
 
-## How to Use Your Audiobook Factory
+### 📚 Book Tab — Upload & Chapter Selection
+![Book Tab](docs/preview/01_book_tab.png)
 
-### Step 1: Prepare Your Assets
-1.  Place your e-book file (e.g., `MyBook.epub`) into the Your_Novel folder.
-2.  Find a high-quality, clean (no music/noise), 15-30 second audio clip of the narrator voice you want to use. Save it as a `.wav` file (e.g., `MyNarrator.wav`) inside a `narrator_voice` folder.
+### 🎧 Voice Preprocessing Tab — 7-Step Audio Cleaning
+![Voice Preprocessing Tab](docs/preview/02_voice_preprocessing_tab.png)
 
-### Step 2 (Recommended): The Test Bench
-Before starting a multi-hour generation, find the perfect voice style.
-1.  Create a small `test.txt` file with a few paragraphs from your book.
-2.  Open `test_bench.py` and update the `INPUT_TEXT_FILE` and `NARRATOR_VOICE_SAMPLE` paths at the top.
-3.  Adjust the `TEMPERATURE` and `TOP_P` values to experiment with expressiveness vs. stability.
-4.  Run the script: `python test_bench.py`.
-5.  Listen to the `test_output.wav` file. Repeat until you are happy with the style and note the best parameter values.
+### 🎙️ Voice Studio Tab — Clone & Test Voice
+![Voice Studio Tab](docs/preview/03_voice_studio_tab.png)
 
-### Step 3: Run the Main Production
-This is the main command you will run. It will create a new project folder for your audiobook and begin processing chapter by chapter.
+### ⚙️ Advanced Tab
+![Advanced Tab](docs/preview/04_advanced_tab.png)
 
-Open your terminal, ensure your virtual environment is activated, and run the `audiobook_factory.py` script with your desired settings.
+### 🚀 Generate Tab — Live Log & Download
+![Generate Tab](docs/preview/05_generate_tab.png)
 
-**Example Command (for Windows):**
-```bash
-python audiobook_factory.py ^
-  --epub_file "./Your_Novel/MyBook.epub" ^
-  --voice_file "./narrator_voice/MyNarrator.wav" ^
-  --book_title "My Awesome Audiobook" ^
-  --skip_start 6 ^
-  --skip_end 2 ^
-  --temperature 0.8 ^
-  --top_p 0.8
+FYI: Ok, I know adding antigravity taken ss is not a good idea, but I am too lazy to take ss myself when antigravity already took them for me during the testing.
+
+---
+
+## 🗂️ Project Structure
+
+```
+AudiobookMaker/
+├── install.sh / install.bat         ← One-click installer (detects OS + GPU)
+├── run.sh / run.bat                 ← Start app + open browser automatically
+├── app.py                           ← Gradio UI entry point
+├── requirements.txt
+├── docs/
+│   └── preview/                     ← UI screenshots
+└── audiobook_factory/
+    ├── extractor_engine.py          ← Core AI text extraction engine
+    │                                   (DocumentIngestor, MLClassifier, TextNormalizer)
+    ├── text_extractor.py            ← Public API: scan() + extract()
+    ├── voice_preprocessor.py        ← 7-step voice audio cleaning pipeline
+    ├── pipeline.py                  ← Thread-safe audiobook generation orchestrator
+    ├── audio_processor.py           ← Qwen3-TTS consumer worker
+    ├── story_analyzer.py            ← BookNLP story/character analysis
+    ├── text_processing.py           ← Sentence splitting + text normalization
+    ├── ffmpeg_utils.py              ← FFmpeg encoding helpers
+    ├── config.py                    ← AudiobookConfig dataclass
+    └── utils.py                     ← Shared utilities
 ```
 
-OR
+---
 
-```bash
-python audiobook_factory.py # You can change the values in the script directly
+## ⚙️ Prerequisites
+
+- **Python 3.11+**
+- **NVIDIA GPU with 6 GB+ VRAM** (strongly recommended — CPU is very slow for Qwen3-TTS)
+- **CUDA Toolkit 11.8+**
+- **FFmpeg** — the installer tries to handle this automatically
+
+---
+
+## 🚀 Installation
+
+The installer automatically:
+- Detects your OS and installs **Python 3.11** via the native package manager
+- Creates a **virtual environment**
+- Detects your **GPU** and installs the correct PyTorch (CUDA 12.1, CUDA 11.8, or CPU)
+- Installs all **dependencies** from `requirements.txt`
+- Installs **FFmpeg** if missing
+
+### Windows
+```bat
+install.bat
 ```
-The script will start, initialise the worker process (this may take a few minutes), and then begin processing. You can stop this process at any time and re-run the exact same command to resume where you left off.
 
-### Step 4: Enjoy!
-Once the script is finished, you will find a new folder named `My Awesome Audiobook/`. Inside, the `audio_chapters/` subfolder will contain all of your final, per-chapter MP3 files with embedded synchronised lyrics, ready to be enjoyed in your favorite audiobook player.
+### macOS / Linux (Ubuntu, Fedora, Mint, Arch, openSUSE, …)
+```bash
+chmod +x install.sh
+./install.sh
+```
 
-## Project File Overview
--   `audiobook_factory.py`: The main, unified script. This is the one you run to generate a full audiobook from an EPUB.
--   `test_bench.py`: A utility for quickly testing narrator voices and TTS tuning parameters. Run this before the main script for testing.
--   `lrc_to_srt_converter.py`: A utility to convert the generated `.lrc` lyric files into `.srt` subtitle files.
--   `requirements.txt`: A list of all the Python libraries required to run this project.
+---
+
+## ▶️ Running the App
+
+The run script activates the environment, starts the server, and opens your browser automatically.
+
+### Windows
+```bat
+run.bat
+```
+
+### macOS / Linux
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+Your browser will open at **http://localhost:7860** automatically.
+
+---
+
+## 📋 Step-by-Step Usage
+
+### 1. 📚 Book Tab
+1. Upload your book file (`.epub`, `.mobi`, `.pdf`, `.docx`, `.odt`, `.txt`)
+2. **EPUB / MOBI with TOC** → A chapter checklist appears. Tick the chapters you want to convert. Use *Select All* / *Deselect All* for quick bulk selection.
+3. **PDF / DOCX / ODT / MOBI (no TOC)** → Enter page ranges, e.g. `1-50, 51-120, 121-250`. Each range becomes a separate chapter file.
+4. **TXT** → No page structure; the whole file becomes one audio file automatically.
+5. Fill in book title, author, choose output format and LUFS loudness target.
+
+### 2. 🎧 Voice Preprocessing Tab *(recommended before cloning)*
+Upload your raw voice WAV and run any combination of these steps:
+
+| Step | What it does |
+|------|-------------|
+| Noise Reduction | Reduces background hiss/hum |
+| Noise Gate | Silences frames below a dB threshold |
+| High-Pass Filter | Removes low-frequency rumble |
+| Silence Removal | Strips long silences between words |
+| Normalize Volume | Peaks at your chosen dBFS |
+| Formant Shift | Adjust voice gender/timbre *(experimental)* |
+| Resample | Convert to 22k / 44.1k / 48k Hz |
+
+Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as narrator voice** to pass it to the next tab.
+
+### 3. 🎙️ Voice Studio Tab
+1. Upload or carry over the processed voice WAV.
+2. Adjust TTS tuning parameters (speed, temperature, top-p, sentence/paragraph pauses).
+3. Type any sentence in the **Voice Test** box and click **▶ Test Voice** to hear a preview.
+
+### 4. ⚙️ Advanced Tab
+- **Max chunk length** — TTS input character limit per sentence chunk (default 399)
+- **EasyOCR** — Enable to extract text from images embedded inside EPUB files
+- **Force reprocess** — Re-extract text even if cached output exists
+
+### 5. 🚀 Generate Tab
+1. Click **🎧 Generate Audiobook**
+2. Watch the live streaming log and per-chapter progress bar
+3. Use **⛔ Cancel** to stop at any time
+4. When complete, download individual chapter files or use **⬇ Download All (ZIP)**
+
+---
+
+## 🛠️ Customizing the Project
+
+### Change the TTS model
+Edit `audiobook_factory/config.py`:
+```python
+tts_model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+```
+Replace with any compatible Qwen3-TTS checkpoint on HuggingFace.
+
+### Tune the text extraction pipeline
+Edit `audiobook_factory/extractor_engine.py`:
+- **`TextNormalizer._strip_noise()`** — add/remove markdown patterns to clean
+- **`TextNormalizer._fix_isolated_capitals()`** — font-kerning fixes (e.g. `T HE` → `THE`)
+- **`_SKIP_TOC_TITLE`** regex — controls which TOC entries are excluded (copyright, gallery, etc.)
+- **`MLClassifier.predict_is_chapter()`** — swap in a trained XGBoost model here when ready
+
+### Tune audio mastering
+Edit `audiobook_factory/pipeline.py`:
+```python
+lufs:      int   = -18    # loudness target
+true_peak: float = -1.5   # max true peak dBTP
+```
+Or adjust these in the UI (LUFS slider in Book tab, True Peak in Advanced tab).
+
+### Add a new output format
+Edit `audiobook_factory/ffmpeg_utils.py` — add a new entry to `get_format_settings()`.
+
+### Modify the voice preprocessing pipeline
+Edit `audiobook_factory/voice_preprocessor.py`:
+- Each step is a standalone function — easy to add, remove, or reorder
+- `PreprocessConfig` dataclass controls all defaults
+
+---
+
+## 📦 Supported Input Formats
+
+| Format | Chapter Detection | Fallback |
+|--------|-----------------|---------|
+| EPUB | ✅ TOC chapter list | — |
+| MOBI | ✅ Try TOC | Page-range picker |
+| PDF | ❌ | Page-range picker |
+| DOCX | ❌ | Page-range picker |
+| ODT | ❌ | Page-range picker |
+| TXT | ❌ | Whole book |
+
+---
+
+## 📦 Output Formats
+
+| Format | Notes |
+|--------|-------|
+| MP3 | Default, most compatible |
+| FLAC | Lossless |
+| WAV | Uncompressed |
+| M4B | Audiobook format with chapter markers (Apple Books) |
+
+---
+
+## 🙏 Acknowledgements
+
+This project would not have been possible without the incredible work from these projects:
+
+### [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by QwenLM
+The voice cloning and TTS engine powering all audio generation in this project.  
+State-of-the-art text-to-speech with zero-shot voice cloning from a short reference clip.
+
+### [Mangio-RVC-Fork](https://github.com/Mangio621/Mangio-RVC-Fork) by Mangio621
+The voice preprocessing pipeline in this project (noise reduction, noise gate, high-pass filter, silence removal, formant shifting) is directly inspired by the preprocessing architecture used in Mangio-RVC-Fork.
+
+---
+
+## 📄 License
+
+Apache 2.0 — see [LICENSE](LICENSE) for details.
