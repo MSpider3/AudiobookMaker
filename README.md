@@ -78,6 +78,14 @@ AudiobookMaker/
 
 ---
 
+## 📦 Clone Repo
+``
+git clone https://github.com/MSpider3/AudiobookMaker.git
+cd AudiobookMaker
+``
+
+---
+
 ## 🚀 Installation
 
 The installer automatically:
