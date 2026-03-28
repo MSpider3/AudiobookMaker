@@ -20,7 +20,7 @@ error()   { echo -e "${RED}[ERROR]${RESET} $*"; exit 1; }
 header()  { echo -e "\n${BOLD}$*${RESET}"; }
 
 # ── Detect OS ─────────────────────────────────────────────────────────────────
-header "=== AudiobookMaker Installer ==="
+header "=== AudiobookMaker Installer (Advanced Pipeline Details Selected) ==="
 
 OS="$(uname -s)"
 DISTRO=""

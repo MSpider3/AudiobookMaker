@@ -222,18 +222,9 @@ def extract(
     enable_ocr: bool = False,
     page_ranges: list[tuple[int, int]] | None = None,
     log_fn=None,
-) -> list[ExtractedChapter]:
+) -> tuple[list[ExtractedChapter], bytes | None]:
     """
-    Full extraction. Returns normalized, sentence-split chapters.
-
-    Parameters
-    ----------
-    path        : path to the input file
-    selections  : list of chapter numbers to extract (EPUB/MOBI); None = all
-    enable_ocr  : run EasyOCR on embedded images (EPUB only)
-    page_ranges : for PDF/DOCX/ODT — list of (start_page, end_page) tuples, each
-                  becomes one chapter. None = whole document.
-    log_fn      : optional callable(str) for progress messages
+    Full extraction. Returns (chapters, cover_data).
     """
     def log(msg):
         if log_fn:
@@ -246,20 +237,21 @@ def extract(
     if ftype in ("epub", "mobi"):
         return _extract_epub(path, selections, enable_ocr=enable_ocr, log=log)
     elif ftype == "txt":
-        return _extract_txt(path, log=log)
+        return _extract_txt(path, log=log), None
     else:
-        return _extract_paged(path, ftype, page_ranges, log=log)
+        return _extract_paged(path, ftype, page_ranges, log=log), None
+
 
 
 # ── EPUB / MOBI extraction ────────────────────────────────────────────────────
 
 def _extract_epub(
     path: str,
-    selections: list[int] | None,
+    selections: list[int] | list[str] | None,
     *,
     enable_ocr: bool,
     log,
-) -> list[ExtractedChapter]:
+) -> tuple[list[ExtractedChapter], bytes | None]:
     from audiobook_factory.extractor_engine import (  # type: ignore
         DocumentIngestor, MLClassifier, TextNormalizer
     )
@@ -269,11 +261,27 @@ def _extract_epub(
     classifier = MLClassifier()
     normalizer = TextNormalizer()
 
-    chapters, skipped, _ = ingestor.ingest_epub(path, classifier, normalizer)
+    chapters, skipped, cover_data = ingestor.ingest_epub(path, classifier, normalizer)
+
+    # Selections can be:
+    #   None        → include all chapters
+    #   list[int]   → legacy: match by ch.num
+    #   list[str]   → title-based: match by ch.title (avoids scan/extractor
+    #                 numbering mismatch — scan numbers all TOC entries 1-N but
+    #                 ingest_epub re-numbers only ML-classified content chapters)
+    selection_titles: set[str] | None = None
+    selection_nums:   set[int] | None = None
+    if selections:
+        if selections and isinstance(selections[0], str):
+            selection_titles = set(selections)
+        else:
+            selection_nums = set(selections)
 
     results: list[ExtractedChapter] = []
     for ch in chapters:
-        if selections and ch.num not in selections:
+        if selection_nums is not None and ch.num not in selection_nums:
+            continue
+        if selection_titles is not None and ch.title not in selection_titles:
             continue
         log(f"  ✓ Extracted chapter {ch.num}: {ch.title}")
         results.append(ExtractedChapter(
@@ -283,7 +291,9 @@ def _extract_epub(
             sentences=ch.sentences,
         ))
 
-    return results
+    return results, cover_data
+
+
 
 
 # ── TXT extraction ────────────────────────────────────────────────────────────

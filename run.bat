@@ -13,6 +13,7 @@ set URL=http://localhost:%PORT%
 echo.
 echo ========================================
 echo   Starting AudiobookMaker
+echo   (VRAM-Safe Orchestration Enabled)
 echo ========================================
 echo.
 
@@ -40,24 +41,15 @@ echo [INFO]  Starting AudiobookMaker on %URL% ...
 echo [INFO]  Press Ctrl+C in this window to stop the server.
 echo.
 
-:: Start app.py and open the browser after a short delay.
-:: We use start /B so the window stays alive and shows logs.
-start /B python %APP%
-
-:: Wait a few seconds for the server to start
-echo [INFO]  Waiting for server to start...
-timeout /t 5 /nobreak >nul
-
-:: Open browser
+:: Open browser in the background first so it waits for the server
 echo [INFO]  Opening browser at %URL%
 start "" "%URL%"
 
 echo.
-echo [OK]    AudiobookMaker is running. Close this window to stop.
+echo [OK]    AudiobookMaker is launching. Keep this window open.
 echo.
 
-:: Keep the console alive so logs keep printing
-:: (app.py outputs to this console via start /B)
-python %APP%
+:: Start app.py in the foreground (blocks until closed by user)
+python "%APP%"
 
 endlocal

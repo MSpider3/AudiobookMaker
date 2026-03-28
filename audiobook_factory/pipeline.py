@@ -2,22 +2,16 @@
 audiobook_factory/pipeline.py
 ================================
 Thread-safe audiobook generation orchestrator.
-Replaces the monolithic main() in main.py.
 
-Usage (from Gradio UI):
-    from audiobook_factory.pipeline import AudiobookConfig, run_pipeline
-
-    config  = AudiobookConfig(...)
-    log_q   = queue.Queue()
-    prog_q  = queue.Queue()
-
-    thread = threading.Thread(
-        target=run_pipeline,
-        args=(config, chapters, log_q, prog_q)
-    )
-    thread.start()
-
-    # Drain log_q in a loop to update Gradio textbox
+New in this version
+-------------------
+- Audiobookshelf-compatible filenames via filename_sanitizer.make_safe_filename()
+- preview_mode      — returns chapter stats table without calling TTS
+- export_text       — writes a .txt file per chapter alongside the audio
+- worker_count      — ThreadPoolExecutor for parallel chapter processing
+- pronunciation_map — regex search-replace applied to text before TTS
+- tts_provider_name — selects which provider to use (currently: "qwen")
+- TTS logic delegated to tts_providers.get_tts_provider()
 """
 from __future__ import annotations
 
@@ -28,6 +22,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -36,6 +31,7 @@ import soundfile as sf
 
 from audiobook_factory.text_extractor import ExtractedChapter
 from audiobook_factory.text_processing import smart_sentence_splitter
+from audiobook_factory.filename_sanitizer import make_safe_filename
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -44,38 +40,59 @@ from audiobook_factory.text_processing import smart_sentence_splitter
 
 @dataclass
 class AudiobookConfig:
-    # Book metadata
-    book_title:     str  = "Audiobook"
-    author:         str  = "Unknown Author"
-    cover_image:    str | None = None
+    # ── Book metadata ─────────────────────────────────────────────────────────
+    book_title:          str   = "Audiobook"
+    author:              str   = "Unknown Author"
+    cover_image:         str | None = None
 
-    # Output
-    output_dir:     str  = "./output"
-    output_format:  str  = "mp3"     # mp3 | flac | wav | m4b
+    # ── Output ────────────────────────────────────────────────────────────────
+    output_dir:          str   = "./output"
+    output_format:       str   = "mp3"    # mp3 | flac | wav | m4b
 
-    # Voice
-    voice_file:     str  = ""        # path to cloning WAV
+    # ── Voice ─────────────────────────────────────────────────────────────────
+    voice_file:          str   = ""       # path to cloning WAV
 
-    # TTS tuning
-    temperature:    float = 0.3
-    top_p:          float = 0.8
-    max_len:        int   = 399      # max chars per TTS chunk
+    # ── TTS ───────────────────────────────────────────────────────────────────
+    tts_provider_name:   str   = "qwen"   # "qwen" (Qwen3-TTS)
+    temperature:         float = 0.3
+    top_p:               float = 0.8
+    max_len:             int   = 399      # max chars per TTS chunk
 
-    # Pacing
-    pause:          float = 0.5      # seconds between sentences
-    para_pause:     float = 1.2      # seconds between paragraphs
+    # ── Pacing ────────────────────────────────────────────────────────────────
+    pause:               float = 0.5     # seconds between sentences
+    para_pause:          float = 1.2     # seconds between paragraphs
 
-    # Audio mastering
-    lufs:           int   = -18
-    true_peak:      float = -1.5
+    # ── Audio mastering ───────────────────────────────────────────────────────
+    lufs:                int   = -18
+    true_peak:           float = -1.5
 
-    # Device
-    device:         str   = "cuda"
-    tts_model_name: str   = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    # ── Parallelism ───────────────────────────────────────────────────────────
+    worker_count:        int   = 1       # chapters in parallel
 
-    # Misc
-    force_reprocess: bool = False
-    sample_rate:    int   = 24000
+    # ── Modes ─────────────────────────────────────────────────────────────────
+    preview_mode:        bool  = False   # show stats, no TTS
+    export_text:         bool  = False   # write .txt per chapter
+
+    # ── Pronunciation fixes ───────────────────────────────────────────────────
+    # { regex_pattern: replacement }  applied before TTS
+    pronunciation_map:   dict  = field(default_factory=dict)
+
+    # ── Multi-Model Qwen3 ─────────────────────────────────────────────────────
+    device:              str   = "cuda"
+    tts_model_name:      str   = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    tts_instruct:        str   = ""       # For VoiceDesign/CustomVoice instructions
+    tts_timbre:          str   = ""       # For CustomVoice premium speakers
+
+    # ── Modes ─────────────────────────────────────────────────────────────────
+    preview_mode:        bool  = False   # show stats, no TTS
+    export_text:         bool  = False   # write .txt per chapter
+    export_lrc:          bool  = True    # write .lrc timed lyrics
+    single_file_mode:    bool  = False   # combine all into one big file
+
+    # ── Misc ──────────────────────────────────────────────────────────────────
+    force_reprocess:     bool  = False
+    sample_rate:         int   = 24000
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -83,7 +100,7 @@ class AudiobookConfig:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CancelToken:
-    """Shared flag so the UI 'Cancel' button can stop the pipeline."""
+    """Shared flag — the UI Cancel button sets this to stop mid-pipeline."""
     def __init__(self):
         self._cancelled = threading.Event()
 
@@ -96,6 +113,61 @@ class CancelToken:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Pronunciation helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _apply_pronunciation(text: str, pron_map: dict) -> str:
+    """Apply all regex search-replace pairs to *text* before TTS."""
+    for pattern, replacement in pron_map.items():
+        try:
+            text = re.sub(pattern, replacement, text)
+        except re.error:
+            # Treat as literal string if the pattern is invalid.
+            text = text.replace(pattern, replacement)
+    return text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Preview mode
+# ══════════════════════════════════════════════════════════════════════════════
+
+def preview_chapters(
+    chapters:   list[ExtractedChapter],
+    log_queue:  "queue.Queue[str]",
+) -> list[dict]:
+    """
+    Preview mode — return a list of chapter-info dicts without generating audio.
+
+    Returns
+    -------
+    List of { "idx", "title", "chars", "words", "sentences" } dicts.
+    """
+    rows = []
+    total_chars = 0
+
+    for idx, ch in enumerate(chapters, 1):
+        chars  = len(ch.text)
+        words  = len(ch.text.split())
+        sents  = len(smart_sentence_splitter(ch.text, 9999))  # count only
+        total_chars += chars
+        rows.append({
+            "idx":       idx,
+            "title":     ch.title,
+            "chars":     chars,
+            "words":     words,
+            "sentences": sents,
+        })
+        log_queue.put(
+            f"[Preview] Ch {idx:>3}: {ch.title[:50]:<50} "
+            f"| {chars:>7,} chars | {words:>6,} words"
+        )
+
+    log_queue.put(f"\n[Preview] Total characters: {total_chars:,}")
+    log_queue.put(f"[Preview] Total chapters:   {len(rows)}")
+    return rows
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main orchestrator
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -103,14 +175,14 @@ def run_pipeline(
     config:      AudiobookConfig,
     chapters:    list[ExtractedChapter],
     log_queue:   "queue.Queue[str]",
-    prog_queue:  "queue.Queue[tuple[int,int]]",   # (current, total)
+    prog_queue:  "queue.Queue[tuple[int,int]]",
     cancel:      CancelToken | None = None,
 ) -> list[str]:
     """
-    Runs the full audiobook generation pipeline.
+    Run the full audiobook generation pipeline.
 
     Returns list of output file paths (one per chapter).
-    Sends log strings to log_queue and (ch_num, total) to prog_queue.
+    In preview_mode returns an empty list (no audio files generated).
     """
     if cancel is None:
         cancel = CancelToken()
@@ -124,31 +196,119 @@ def run_pipeline(
 
     os.makedirs(config.output_dir, exist_ok=True)
     total = len(chapters)
+
+    # ── Preview mode ──────────────────────────────────────────────────────────
+    if config.preview_mode:
+        log(f"[Pipeline] Preview mode — {total} chapter(s)")
+        preview_chapters(chapters, log_queue)
+        progress(total, total)
+        return []
+
+    log(f"[Pipeline] Starting — {total} chapter(s)")
+    log(f"[Pipeline] Output  : {config.output_dir}")
+    log(f"[Pipeline] Format  : {config.output_format}")
+    log(f"[Pipeline] Workers : {config.worker_count}")
+    if config.pronunciation_map:
+        log(f"[Pipeline] Pronunciation fixes: {len(config.pronunciation_map)}")
+    if config.export_text:
+        log("[Pipeline] Text export: enabled")
+
+    # ── Shared TTS Provider Setup ─────────────────────────────────────────────
+    from audiobook_factory.tts_providers import get_tts_provider
+    provider = None
+    if not config.preview_mode:
+        provider = get_tts_provider(config.tts_provider_name, config)
+
+    # ── Build per-chapter tasks ───────────────────────────────────────────────
+    tasks = list(enumerate(chapters, 1))
     output_files: list[str] = []
+    _lock = threading.Lock()
 
-    log(f"[Pipeline] Starting — {total} chapter(s) to process")
-    log(f"[Pipeline] Output: {config.output_dir}")
-    log(f"[Pipeline] Format: {config.output_format}")
-
-    for idx, chapter in enumerate(chapters, 1):
+    def _process(idx_chapter):
+        idx, chapter = idx_chapter
         if cancel.is_cancelled:
-            log("[Pipeline] ⛔ Cancelled by user.")
-            break
-
+            return None
         log(f"\n[Chapter {idx}/{total}] '{chapter.title}'")
-        progress(idx - 1, total)
-
         try:
-            chapter_path = _process_chapter(config, chapter, idx, total, log, cancel)
-            if chapter_path:
-                output_files.append(chapter_path)
-                log(f"[Chapter {idx}/{total}] ✅ Done → {os.path.basename(chapter_path)}")
+            path = _process_chapter(config, chapter, idx, total, log, cancel, provider)
+            if path:
+                with _lock:
+                    output_files.append(path)
+                log(f"[Chapter {idx}/{total}] ✅ → {os.path.basename(path)}")
+            return path
         except Exception as e:
             log(f"[Chapter {idx}/{total}] ❌ Error: {e}")
+            return None
+        finally:
+            progress(idx, total)
 
-    progress(total, total)
-    log(f"\n[Pipeline] ✅ Complete — {len(output_files)} file(s) generated.")
-    return output_files
+    try:
+        if config.worker_count > 1:
+            with ThreadPoolExecutor(max_workers=config.worker_count) as pool:
+                futures = {pool.submit(_process, t): t for t in tasks}
+                for fut in as_completed(futures):
+                    if cancel.is_cancelled:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+                    fut.result()
+        else:
+            for t in tasks:
+                if cancel.is_cancelled:
+                    log("[Pipeline] ⛔ Cancelled.")
+                    break
+                _process(t)
+                progress(t[0], total)
+
+        progress(total, total)
+
+        if cancel.is_cancelled:
+            log(f"\n[Pipeline] ⛔ Cancelled — {len(output_files)} file(s) saved.")
+            output_files.sort()
+            return output_files
+
+        # ── Single File Mode (Combine all chapters) ───────────────────────────────
+        if config.single_file_mode and len(output_files) > 1:
+            log("\n[Pipeline] 📦 Combining chapters into a single file...")
+            output_files.sort()
+            
+            # Use simple concat protocol for same-format files
+            list_txt = os.path.join(config.output_dir, "concat_list.txt")
+            full_name = make_safe_filename(config.book_title, 0, config.output_dir, f".{config.output_format}")
+            full_path = os.path.join(config.output_dir, f"Combined_{full_name}")
+
+            try:
+                with open(list_txt, "w", encoding="utf-8") as f:
+                    for p in output_files:
+                        p_safe = os.path.abspath(p).replace('\\', '/')
+                        f.write(f"file '{p_safe}'\n")
+                
+                subprocess.run(
+                    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt, "-c", "copy", full_path],
+                    check=True, capture_output=True
+                )
+                log(f"[Pipeline] 📦 Combined file created: {os.path.basename(full_path)}")
+                
+                # Clean up chapters and list
+                for p in output_files:
+                    try: os.remove(p)
+                    except: pass
+                os.remove(list_txt)
+                
+                output_files = [full_path]
+            except Exception as e:
+                log(f"[Pipeline] ❌ Failed to combine: {e}")
+
+        log(f"\n[Pipeline] ✅ Complete — {len(output_files)} file(s) generated.")
+        output_files.sort()
+        return output_files
+
+    finally:
+        if provider is not None:
+            try:
+                provider.cleanup()
+            except Exception as e:
+                log(f"[Pipeline] Cleanup error: {e}")
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -162,15 +322,32 @@ def _process_chapter(
     total:   int,
     log:     Callable,
     cancel:  CancelToken,
+    provider: "BaseTTSProvider" = None,
 ) -> str | None:
     """Generate audio for one chapter. Returns output file path."""
-    from audiobook_factory.audio_processor import tts_consumer
     from audiobook_factory.ffmpeg_utils import get_format_settings
+    from audiobook_factory.tts_providers import get_tts_provider
 
     temp_dir = tempfile.mkdtemp(prefix=f"abm_ch{idx:03d}_")
     try:
-        # ── 1. Build TTS job list ─────────────────────────────────────────────
-        sentences = chapter.sentences or smart_sentence_splitter(chapter.text, config.max_len)
+        # ── Apply pronunciation fixes ─────────────────────────────────────────
+        text = chapter.text
+        if config.pronunciation_map:
+            text = _apply_pronunciation(text, config.pronunciation_map)
+
+        # ── Export text if requested ──────────────────────────────────────────
+        if config.export_text:
+            txt_name = make_safe_filename(chapter.title, idx, config.output_dir, ".txt")
+            txt_path = os.path.join(config.output_dir, txt_name)
+            try:
+                with open(txt_path, "w", encoding="utf-8") as fh:
+                    fh.write(f"{chapter.title}\n{'─' * 60}\n\n{text}")
+                log(f"  [Ch{idx}] Text exported → {txt_name}")
+            except OSError as e:
+                log(f"  [Ch{idx}] Text export failed: {e}")
+
+        # ── Build sentence/chunk list ─────────────────────────────────────────
+        sentences = chapter.sentences or smart_sentence_splitter(text, config.max_len)
         tts_jobs  = []
         for sent in sentences:
             for chunk in _chunk(sent, config.max_len):
@@ -180,60 +357,76 @@ def _process_chapter(
             log(f"  [Ch{idx}] No text to synthesise — skipping.")
             return None
 
-        log(f"  [Ch{idx}] {len(tts_jobs)} TTS chunks...")
+        log(f"  [Ch{idx}] {len(tts_jobs)} TTS chunks…")
 
-        # ── 2. Run TTS using the worker (subprocess-safe) ─────────────────────
-        job_q    = _ImmediateQueue()
-        result_q = _ImmediateQueue()
+        # ── Synthesise via provider ───────────────────────────────────────────
+        if provider is None:
+            # Fallback for manual calls bypassing run_pipeline
+            provider = get_tts_provider(config.tts_provider_name, config)
 
-        # Build a minimal args-like object for tts_consumer
-        class _Args:
-            device          = config.device
-            tts_model_name  = config.tts_model_name
-            temperature     = config.temperature
-            top_p           = config.top_p
-            voice_file      = config.voice_file
+        chunk_paths: list[str | None] = [None] * len(tts_jobs)
+        chunk_durations: list[float] = [0.0] * len(tts_jobs)
 
-        # Spin up TTS consumer thread (in-process, no multiprocessing overhead)
-        consumer_thread = threading.Thread(
-            target=tts_consumer, args=(job_q, result_q, _Args()), daemon=True
-        )
-        consumer_thread.start()
-
-        # Enqueue jobs
-        collected: list[dict | None] = [None] * len(tts_jobs)
-        for i, text in enumerate(tts_jobs):
-            out_path = os.path.join(temp_dir, f"s_{i:04d}.wav")
-            job_q.put((i, text, out_path, config.voice_file))
-
-        job_q.put("STOP")
-        consumer_thread.join(timeout=3600)
-
-        # Collect results (the consumer writes files and puts (idx, text, path) in result_q)
-        while not result_q.empty():
+        for i, chunk_text in enumerate(tts_jobs):
+            if cancel.is_cancelled:
+                return None
+            out_wav = os.path.join(temp_dir, f"s_{i:04d}.wav")
             try:
-                i, text, path = result_q.get_nowait()
-                if path and os.path.exists(path):
-                    collected[i] = {"text": text, "path": path}
-            except queue.Empty:
-                break
+                # Provider.synthesize should ideally take care of the model type internally
+                provider.synthesize(chunk_text, config.voice_file, out_wav)
+                chunk_paths[i] = out_wav
+                # Get duration for LRC
+                if config.export_lrc:
+                    chunk_durations[i] = _get_wav_duration(out_wav)
+            except Exception as e:
+                import traceback
+                error_trace = traceback.format_exc()
+                log(f"  [Ch{idx}] chunk {i} failed: {e}")
+                log(f"  [Ch{idx}] Traceback saved to chapter output dir.")
+                err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_{i}.txt")
+                with open(err_log_path, "w", encoding="utf-8") as err_f:
+                    err_f.write(error_trace)
 
         if cancel.is_cancelled:
             return None
 
-        # ── 3. Build filelist + pauses ─────────────────────────────────────────
+        # ── Generate LRC timed lyrics ─────────────────────────────────────────
+        if config.export_lrc:
+            lrc_name = make_safe_filename(chapter.title, idx, config.output_dir, ".lrc")
+            lrc_path = os.path.join(config.output_dir, lrc_name)
+            try:
+                curr_time = 0.0
+                pause_len = config.pause
+                with open(lrc_path, "w", encoding="utf-8") as fh:
+                    for i, (text_chunk, dur) in enumerate(zip(tts_jobs, chunk_durations)):
+                        m, s = divmod(curr_time, 60)
+                        fh.write(f"[{int(m):02d}:{s:05.2f}]{text_chunk}\n")
+                        curr_time += dur + pause_len
+                log(f"  [Ch{idx}] LRC exported → {lrc_name}")
+            except Exception as e:
+                log(f"  [Ch{idx}] LRC export failed: {e}")
+
+        # ── Build filelist for FFmpeg concat ──────────────────────────────────
+        if not any(chunk_paths):
+            log(f"  [Ch{idx}] ❌ No audio chunks generated successfully. Skipping.")
+            return None
+
         sent_pause_path = os.path.join(temp_dir, "pause_sent.wav")
-        sf.write(sent_pause_path, np.zeros(int(config.pause * config.sample_rate)), config.sample_rate)
+        sf.write(
+            sent_pause_path,
+            np.zeros(int(config.pause * config.sample_rate)),
+            config.sample_rate,
+        )
 
         filelist_path = os.path.join(temp_dir, "filelist.txt")
-        with open(filelist_path, "w", encoding="utf-8") as f:
-            for i, item in enumerate(collected):
-                if item and os.path.exists(item["path"]):
-                    f.write(f"file '{os.path.basename(item['path'])}'\n")
-                    if i < len(collected) - 1:
-                        f.write(f"file '{os.path.basename(sent_pause_path)}'\n")
+        with open(filelist_path, "w", encoding="utf-8") as fh:
+            for i, p in enumerate(chunk_paths):
+                if p and os.path.exists(p):
+                    fh.write(f"file '{os.path.basename(p)}'\n")
+                    if i < len(chunk_paths) - 1:
+                        fh.write(f"file '{os.path.basename(sent_pause_path)}'\n")
 
-        # ── 4. FFmpeg concat ──────────────────────────────────────────────────
+        # ── FFmpeg: concat raw WAV ────────────────────────────────────────────
         raw_wav = os.path.join(temp_dir, "raw.wav")
         subprocess.run(
             ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
@@ -242,7 +435,11 @@ def _process_chapter(
             check=True, capture_output=True, cwd=temp_dir,
         )
 
-        # ── 5. Loudnorm mastering ─────────────────────────────────────────────
+        if not os.path.exists(raw_wav) or os.path.getsize(raw_wav) == 0:
+            log(f"  [Ch{idx}] ❌ Failed to create raw audio. Skipping.")
+            return None
+
+        # ── FFmpeg: loudnorm mastering ────────────────────────────────────────
         master_wav = os.path.join(temp_dir, "master.wav")
         subprocess.run(
             ["ffmpeg", "-y", "-i", raw_wav,
@@ -251,25 +448,39 @@ def _process_chapter(
             check=True, capture_output=True,
         )
 
-        # ── 6. Encode to final format ─────────────────────────────────────────
-        safe_title   = re.sub(r'[\\/*?:"<>|]', "", chapter.title)
-        out_filename = f"{idx:02d}_{safe_title}.{config.output_format}"
-        out_path     = os.path.join(config.output_dir, out_filename)
+        # ── FFmpeg: encode to final format ────────────────────────────────────
+        safe_name  = make_safe_filename(chapter.title, idx, config.output_dir,
+                                        f".{config.output_format}")
+        out_path   = os.path.join(config.output_dir, safe_name)
+        audio_settings, _, _ = get_format_settings(config.output_format)[:3]
 
-        audio_settings, _, _ = get_format_settings(config.output_format)
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", master_wav]
+        
+        # Add cover image if exists
+        has_cover = False
+        if config.cover_image and os.path.exists(config.cover_image):
+            ffmpeg_cmd += ["-i", config.cover_image]
+            has_cover = True
 
-        ffmpeg_cmd = (
-            ["ffmpeg", "-y", "-i", master_wav]
-            + audio_settings
-            + ["-metadata", f"title={chapter.title}",
-               "-metadata", f"artist={config.author}",
-               "-metadata", f"album={config.book_title}",
-               "-metadata", f"track={idx}",
-               "-metadata", "genre=Audiobook",
-               out_path]
-        )
+        ffmpeg_cmd += audio_settings
+
+        if has_cover:
+            # Map audio from first input and video/image from second
+            # id3v2_version 3 for better compatibility
+            ffmpeg_cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy", "-id3v2_version", "3"]
+
+        ffmpeg_cmd += [
+            "-metadata", f"title={chapter.title}",
+            "-metadata", f"artist={config.author}",
+            "-metadata", f"album={config.book_title}",
+            "-metadata", f"track={idx}",
+            "-metadata", "genre=Audiobook",
+            out_path,
+        ]
+        
         subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
         return out_path
+
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -279,6 +490,13 @@ def _process_chapter(
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _get_wav_duration(path: str) -> float:
+    """Return the duration of a WAV file in seconds."""
+    if not os.path.exists(path):
+        return 0.0
+    with sf.SoundFile(path) as f:
+        return f.frames / f.samplerate
+
 def _chunk(text: str, max_len: int) -> list[str]:
     """Split a long string at sentence boundaries to stay under max_len."""
     if len(text) <= max_len:
@@ -287,7 +505,7 @@ def _chunk(text: str, max_len: int) -> list[str]:
 
 
 class _ImmediateQueue(queue.Queue):
-    """A Queue subclass with no max size, usable as a drop-in for multiprocessing.Queue."""
+    """Queue subclass kept for backward compat with old callers."""
     pass
 
 
@@ -296,33 +514,19 @@ def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
     Generate a short TTS preview and return raw WAV bytes.
     Used by the Voice Studio tab.
     """
-    from audiobook_factory.audio_processor import tts_consumer
+    from audiobook_factory.tts_providers import get_tts_provider
 
     if not text.strip():
         return None
 
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "preview.wav")
-
-        job_q    = _ImmediateQueue()
-        result_q = _ImmediateQueue()
-
-        class _Args:
-            device         = config.device
-            tts_model_name = config.tts_model_name
-            temperature    = config.temperature
-            top_p          = config.top_p
-            voice_file     = config.voice_file
-
-        t = threading.Thread(
-            target=tts_consumer, args=(job_q, result_q, _Args()), daemon=True
-        )
-        t.start()
-        job_q.put((0, text.strip(), out_path, config.voice_file))
-        job_q.put("STOP")
-        t.join(timeout=120)
-
-        if os.path.exists(out_path):
-            with open(out_path, "rb") as f:
-                return f.read()
+        try:
+            provider = get_tts_provider(config.tts_provider_name, config)
+            provider.synthesize(text.strip(), config.voice_file, out_path)
+            if os.path.exists(out_path):
+                with open(out_path, "rb") as f:
+                    return f.read()
+        except Exception as e:
+            print(f"[preview_tts] Error: {e}")
     return None

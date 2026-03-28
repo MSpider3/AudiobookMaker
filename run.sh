@@ -32,7 +32,7 @@ source "$VENV_DIR/bin/activate"
 success "Virtual environment activated"
 
 # ── Start app.py in background ────────────────────────────────────────────────
-info "Starting AudiobookMaker on $URL ..."
+info "Starting AudiobookMaker on $URL (VRAM-Safe Orchestration Enabled) ..."
 python "$APP" &
 APP_PID=$!
 

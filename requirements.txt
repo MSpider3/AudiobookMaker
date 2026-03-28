@@ -47,3 +47,4 @@ requests
 tqdm
 pydantic
 rich                # Pretty console output
+sentencex           # Language-aware sentence segmentation (text splitting before TTS)

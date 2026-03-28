@@ -14,11 +14,17 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 - **Smart chapter detection** — EPUB/MOBI use a TOC-based chapter checklist; PDF/DOCX/ODT let you split by page ranges
 - **AI text extraction** — 5-phase pipeline (Docling + OCR + ML classification + heuristic normalization) produces clean, TTS-ready text
 - **EPUB image OCR** — EasyOCR reads text embedded in images inside EPUBs
-- **Voice cloning** — Clone any narrator voice from a 3–30 second WAV sample (Qwen3-TTS)
+- **Voice Design & Cloning** — Clone from a reference WAV or prompt an entire new voice using Qwen3-TTS VoiceDesign and CustomVoice timbre models.
 - **Voice preprocessing** — 7-step audio cleaning pipeline: noise reduction, noise gate, high-pass filter, silence removal, normalization, formant shifting, resampling
 - **Voice test tab** — Type any sentence and preview the cloned voice before generating
-- **Mastered output** — FFmpeg loudnorm at your chosen LUFS target; export to MP3, FLAC, WAV, or M4B
+- **Preview mode** — See chapter list with character + word counts before committing to a full audiobook run
+- **Pronunciation fixes** — Upload a `.txt` file with `search==replace` pairs to fix how the TTS pronounces specific words
+- **Parallel processing with VRAM Safety** — Process extraction and encoding across multiple chapter workers simultaneously, with thread-safe GPU locks and Out-Of-Memory (OOM) recovery to prevent crashes.
+- **Synced Lyrics Export** — Automatically generates `.lrc` timed lyrics files perfect for Audiobookshelf syncing. 
+- **Audiobookshelf-compatible output** — Zero-padded filenames + full ID3 tags (title, author, album, track) ready to drop into Audiobookshelf.
+- **Mastered Output & Single File Mode** — Output mastered MP3, FLAC, WAV, or M4B files. Optionally combine all chapters into a massive single unified file with one click.
 - **Live generation log** — Stream progress in real time with a per-chapter progress bar and Cancel button
+- **Modular TTS provider system** — Qwen3-TTS built-in; designed to support additional providers (Edge-TTS, OpenAI, Kokoro) in future updates
 
 ---
 
@@ -59,12 +65,16 @@ AudiobookMaker/
     ├── text_extractor.py            ← Public API: scan() + extract()
     ├── voice_preprocessor.py        ← 7-step voice audio cleaning pipeline
     ├── pipeline.py                  ← Thread-safe audiobook generation orchestrator
-    ├── audio_processor.py           ← Qwen3-TTS consumer worker
+    ├── audio_processor.py           ← Backward-compat shim (delegates to tts_providers)
+    ├── filename_sanitizer.py        ← Cross-platform, Audiobookshelf-compatible filenames
     ├── story_analyzer.py            ← BookNLP story/character analysis
     ├── text_processing.py           ← Sentence splitting + text normalization
     ├── ffmpeg_utils.py              ← FFmpeg encoding helpers
     ├── config.py                    ← AudiobookConfig dataclass
-    └── utils.py                     ← Shared utilities
+    ├── utils.py                     ← Shared utilities
+    └── tts_providers/               ← Modular TTS provider abstraction
+        ├── base_tts_provider.py     ← BaseTTSProvider ABC + get_tts_provider() factory
+        └── qwen_provider.py         ← Qwen3-TTS implementation (genesis + X-vector cloning)
 ```
 
 ---
@@ -158,25 +168,45 @@ Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as nar
 
 ### 4. ⚙️ Advanced Tab
 - **Max chunk length** — TTS input character limit per sentence chunk (default 399)
+- **Parallel chapter workers** — Process 1–4 chapters simultaneously. Keep at 1 if VRAM is limited.
+- **TTS Provider** — Currently: `qwen` (Qwen3-TTS). More providers will be added in future releases.
 - **EasyOCR** — Enable to extract text from images embedded inside EPUB files
 - **Force reprocess** — Re-extract text even if cached output exists
+- **Export chapter text** — Write a `.txt` file alongside each audio file with the cleaned chapter text
+- **Pronunciation fix file** — Upload a `.txt` with one fix per line in `search==replace` format (regex supported). Comments start with `#`.
+  ```
+  # Fix common TTS mispronunciations
+  Barbadoes==Barbayduss
+  N\.E\.==north east
+  Dr\.==Doctor
+  ```
 
 ### 5. 🚀 Generate Tab
-1. Click **🎧 Generate Audiobook**
-2. Watch the live streaming log and per-chapter progress bar
-3. Use **⛔ Cancel** to stop at any time
-4. When complete, download individual chapter files or use **⬇ Download All (ZIP)**
+1. Click **🔍 Preview Chapters** to see a table of chapter titles, character counts, word counts, and sentence counts — without generating any audio. Great for checking your chapter selections.
+2. Click **🎧 Generate Audiobook** to start the full pipeline
+3. Watch the live streaming log and per-chapter progress bar
+4. Use **⛔ Cancel** to stop at any time
+5. When complete, download individual chapter files or use **⬇ Download All (ZIP)**
 
 ---
 
 ## 🛠️ Customizing the Project
 
 ### Change the TTS model
-Edit `audiobook_factory/config.py`:
+Edit `audiobook_factory/tts_providers/qwen_provider.py`:
 ```python
-tts_model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+# In _load_base_model():
+"Qwen/Qwen3-TTS-12Hz-1.7B-Base"   # replace with any compatible Qwen3 checkpoint
+
+# In _run_genesis():
+"Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"   # design model used once for voice genesis
 ```
-Replace with any compatible Qwen3-TTS checkpoint on HuggingFace.
+
+### Add a new TTS provider (future)
+1. Create `audiobook_factory/tts_providers/my_provider.py`
+2. Subclass `BaseTTSProvider` and implement `synthesize()`, `estimate_cost()`, `get_name()`
+3. Register the name in `base_tts_provider.get_tts_provider()`
+4. Add the name to the `tts_provider_dd` dropdown in `app.py`
 
 ### Tune the text extraction pipeline
 Edit `audiobook_factory/extractor_engine.py`:
@@ -227,12 +257,27 @@ Edit `audiobook_factory/voice_preprocessor.py`:
 
 ---
 
+## 🎧 Audiobookshelf Integration
+
+[Audiobookshelf](https://github.com/advplyr/audiobookshelf) is a self-hosted audiobook library server. AudiobookMaker generates output that Audiobookshelf automatically detects:
+
+1. **Drop the output folder** into your Audiobookshelf library directory
+2. Audiobookshelf will auto-scan and import it as a book
+3. Each chapter file has the correct **ID3 metadata** (title, author, album, track number) so chapter ordering and library display work correctly out of the box
+
+Output filenames follow the `{NNNN}_{Chapter_Title}.mp3` format Audiobookshelf expects.
+
+---
+
 ## 🙏 Acknowledgements
 
 This project would not have been possible without the incredible work from these projects:
 
+### [epub_to_audiobook](https://github.com/p0n1/epub_to_audiobook) by p0n1
+Inspired the modular TTS provider architecture, Audiobookshelf-compatible output format, pronunciation fix file format, and the preview mode features in this project.
+
 ### [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by QwenLM
-The voice cloning and TTS engine powering all audio generation in this project.  
+The voice cloning and TTS engine powering all audio generation in this project.
 State-of-the-art text-to-speech with zero-shot voice cloning from a short reference clip.
 
 ### [Mangio-RVC-Fork](https://github.com/Mangio621/Mangio-RVC-Fork) by Mangio621

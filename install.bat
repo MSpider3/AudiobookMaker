@@ -12,6 +12,7 @@ set REQUIREMENTS=requirements.txt
 echo.
 echo ========================================
 echo   AudiobookMaker Installer (Windows)
+echo   With Advanced Pipeline Features
 echo ========================================
 echo.
 

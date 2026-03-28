@@ -32,7 +32,7 @@ from audiobook_factory.voice_preprocessor import (
     PreprocessConfig, preprocess as voice_preprocess,
 )
 from audiobook_factory.pipeline import (
-    AudiobookConfig, CancelToken, run_pipeline, preview_tts,
+    AudiobookConfig, CancelToken, run_pipeline, preview_tts, preview_chapters,
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -241,6 +241,50 @@ def build_app():
                     sent_pause_sl  = gr.Slider(label="Sentence pause (s)", minimum=0.2, maximum=2.0, value=0.5, step=0.1)
                     para_pause_sl  = gr.Slider(label="Paragraph pause (s)", minimum=0.5, maximum=3.0, value=1.2, step=0.1)
 
+                gr.Markdown("#### Qwen3 Model Configuration")
+                with gr.Row():
+                    tts_model_name = gr.Dropdown(
+                        label="TTS Model Variant",
+                        choices=[
+                            "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+                            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                            "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                            "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                            "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                        ],
+                        value="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                    )
+                    tts_timbre = gr.Dropdown(
+                        label="Premium Timbre (CustomVoice only)",
+                        choices=["serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan"],
+                        value="serena",
+                        visible=False
+                    )
+                
+                tts_instruct = gr.Textbox(
+                    label="Voice Design / Style Instruction",
+                    placeholder="e.g. 'A mature male narrator with a deep resonant voice' or 'Energetic and youthful'",
+                    visible=False,
+                    lines=2
+                )
+
+                def on_model_change(mname):
+                    # Show/hide relevant options
+                    show_clone = "Base" in mname
+                    show_timbre = "CustomVoice" in mname
+                    show_instruct = "VoiceDesign" in mname or "1.7B-CustomVoice" in mname
+                    return [
+                        gr.update(visible=show_clone),
+                        gr.update(visible=show_timbre),
+                        gr.update(visible=show_instruct)
+                    ]
+
+                tts_model_name.change(
+                    on_model_change,
+                    inputs=[tts_model_name],
+                    outputs=[voice_studio_upload, tts_timbre, tts_instruct]
+                )
+
                 gr.Markdown("#### Voice test")
                 with gr.Row():
                     test_text  = gr.Textbox(
@@ -259,11 +303,32 @@ def build_app():
             with gr.Tab("⚙️ Advanced"):
                 gr.Markdown("### Advanced Generation Settings")
                 with gr.Row():
-                    max_len_sl     = gr.Slider(label="Max chunk length (chars)", minimum=100, maximum=600, value=399, step=1)
-                    lufs_adv       = gr.Slider(label="True peak (dBTP)",         minimum=-6,   maximum=-0.5, value=-1.5, step=0.1)
+                    max_len_sl      = gr.Slider(label="Max chunk length (chars)",  minimum=100, maximum=600, value=399, step=1)
+                    lufs_adv        = gr.Slider(label="True peak (dBTP)",           minimum=-6,   maximum=-0.5, value=-1.5, step=0.1)
                 with gr.Row():
-                    epub_ocr_chk   = gr.Checkbox(label="Enable EasyOCR for EPUB image text", value=False)
+                    worker_count_sl = gr.Slider(
+                        label="Parallel chapter workers",
+                        info="Process multiple chapters simultaneously. Keep at 1 if VRAM is limited.",
+                        minimum=1, maximum=4, value=1, step=1,
+                    )
+                    tts_provider_dd = gr.Dropdown(
+                        label="TTS Provider",
+                        choices=["qwen"],
+                        value="qwen",
+                        info="Currently: Qwen3-TTS (local). More providers coming soon.",
+                        interactive=True,
+                    )
+                with gr.Row():
+                    epub_ocr_chk    = gr.Checkbox(label="Enable EasyOCR for EPUB image text", value=False)
                     force_repro_chk = gr.Checkbox(label="Force re-process (ignore saved progress)", value=False)
+                    export_text_chk = gr.Checkbox(label="Export chapter text as .txt", value=False)
+                gr.Markdown("#### Pronunciation fixes")
+                gr.HTML('<div class="warn-box">ℹ️ Upload a plain text file with one fix per line: <code>search==replace</code> (regex supported). Lines starting with # are comments.</div>')
+                pronunciation_file = gr.File(
+                    label="Pronunciation fix file (.txt)",
+                    file_types=[".txt"],
+                    file_count="single",
+                )
 
             # ═══════════════════════════════════════════════════════════════ #
             # TAB 5 — GENERATE                                                #
@@ -272,8 +337,22 @@ def build_app():
                 gr.Markdown("### Generate Audiobook")
 
                 with gr.Row():
-                    generate_btn = gr.Button("🎧 Generate Audiobook", variant="primary", scale=3)
-                    cancel_btn   = gr.Button("⛔ Cancel",              variant="stop",    scale=1)
+                    preview_btn  = gr.Button("🔍 Preview Chapters",   variant="secondary", scale=1)
+                    generate_btn = gr.Button("🎧 Generate Audiobook", variant="primary",   scale=3)
+                    cancel_btn   = gr.Button("⛔ Cancel",              variant="stop",      scale=1)
+
+                with gr.Row():
+                    single_file_mode = gr.Checkbox(label="📦 Combine into single file", value=False)
+                    export_lrc_chk   = gr.Checkbox(label="📜 Generate timed LRC lyrics", value=True)
+
+                preview_table = gr.Dataframe(
+                    headers=["#", "Chapter", "Chars", "Words", "Sentences"],
+                    datatype=["number", "str", "number", "number", "number"],
+                    label="Chapter preview",
+                    visible=False,
+                    interactive=False,
+                    wrap=True,
+                )
 
                 progress_bar = gr.Progress(track_tqdm=False)
                 log_box      = gr.Textbox(
@@ -293,6 +372,43 @@ def build_app():
                     )
                     zip_btn        = gr.Button("⬇ Download All (ZIP)", variant="secondary")
                     zip_file       = gr.File(label="ZIP", interactive=False, visible=False)
+
+                with gr.Accordion("ℹ️ Which format should I choose?", open=False):
+                    gr.Markdown("""
+| Feature          | FLAC                       | MP3               | WAV                       | M4B        |
+| ---------------- | -------------------------- | ----------------- | ------------------------- | ---------- |
+| **Cover Art**    | ✅ Yes                      | ✅ Yes             | ⚠️ Limited / inconsistent | ✅ Yes      |
+| **Title**        | ✅ Yes                      | ✅ Yes             | ⚠️ Limited                | ✅ Yes      |
+| **Artist**       | ✅ Yes                      | ✅ Yes             | ⚠️ Limited                | ✅ Yes      |
+| **Album**        | ✅ Yes                      | ✅ Yes             | ⚠️ Limited                | ✅ Yes      |
+| **Genre**        | ✅ Yes                      | ✅ Yes             | ⚠️ Limited                | ✅ Yes      |
+| **Track Number** | ✅ Yes                      | ✅ Yes             | ⚠️ Limited                | ✅ Yes      |
+| **Lyrics**       | ⚠️ Possible (not standard) | ✅ Yes             | ❌ No                      | ⚠️ Limited |
+| **Chapters**     | ❌ No                       | ⚠️ Rare / limited | ❌ No                      | ✅ Yes      |
+
+### Recommendation:
+- **Single Combined Audiobook**: Choose **M4B**. It supports internal chapters and cover art, making it the industry standard for portable players.
+- **Lossless Quality**: Choose **FLAC** (or WAV if you don't care about metadata).
+- **Maximum Compatibility**: Choose **MP3**. It works on everything but lacks true chapter support (it will be split into many files).
+""")
+
+            # ═══════════════════════════════════════════════════════════════ #
+            # TAB 6 — AUDIOBOOKSHELF                                          #
+            # ═══════════════════════════════════════════════════════════════ #
+            with gr.Tab("📜 Audiobookshelf"):
+                gr.Markdown("""
+## Setting up Audiobookshelf
+
+[Audiobookshelf](https://www.audiobookshelf.org/) is a self-hosted audiobook and podcast server. Here is how to add your generated book:
+
+1. **Install ABS**: If you haven't, install it via Docker or Windows Installer.
+2. **Library Mapping**: Point a 'Library' in ABS to the folder where you save your Audiobooks.
+3. **Organize**: AudiobookMaker follows the `{Author}/{Title}/{Chapter}.mp3` standard. 
+   - Move the generated folder into your Library folder.
+4. **Scan**: Click 'Scan' in the ABS dashboard. It will automatically find the book, the author, the metadata, and the cover art!
+5. **Chapters**: If you used **M4B**, the chapters are embedded! If you used **MP3/FLAC**, ABS will use the filenames to determine chapter order.
+6. **Lyrics**: The `.lrc` files generated by AudiobookMaker will provide timed lyrics/subtitles in the ABS player!
+""")
 
         # ══════════════════════════════════════════════════════════════════
         # EVENT HANDLERS
@@ -323,6 +439,18 @@ def build_app():
 
             title  = result.title  or ""
             author = result.author or ""
+            
+            # Handle cover extraction
+            cover_path = None
+            if result.cover_data:
+                try:
+                    import tempfile
+                    from PIL import Image
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                        f.write(result.cover_data)
+                        cover_path = f.name
+                except:
+                    pass
 
             if result.has_toc and result.chapters:
                 choices = [f"{c.num}. {c.title}  (~{c.word_count:,} words)" for c in result.chapters]
@@ -336,6 +464,7 @@ def build_app():
                     title, author,
                     result,
                     "",
+                    cover_path
                 )
             elif result.file_type == "txt":
                 status_parts.append("ℹ️ No chapters — whole book mode.")
@@ -348,6 +477,7 @@ def build_app():
                     title, author,
                     result,
                     "",
+                    cover_path
                 )
             else:
                 pages_msg = f"**Total pages:** {result.page_count}" if result.page_count else ""
@@ -361,6 +491,7 @@ def build_app():
                     title, author,
                     result,
                     pages_msg,
+                    cover_path
                 )
 
         book_file.upload(
@@ -368,7 +499,7 @@ def build_app():
             inputs=[book_file],
             outputs=[epub_panel, page_panel, txt_panel, scan_status,
                      chapter_check, book_title_box, book_author_box,
-                     scan_state, total_pages_label],
+                     scan_state, total_pages_label, cover_image],
         )
 
         # ── Select/Deselect All ───────────────────────────────────────────
@@ -449,9 +580,10 @@ def build_app():
         # ── Voice Studio: Test Voice ──────────────────────────────────────────
         def on_test_voice(
             voice_path, text, temp, top_p, speed,
+            mname, timbre, instruct
         ):
-            if not voice_path:
-                return None, "⚠️ Upload or set a narrator voice first."
+            if ("Base" in mname) and not voice_path:
+                return None, "⚠️ Upload or set a narrator voice first for Base models."
             if not text.strip():
                 return None, "⚠️ Enter some text to test."
 
@@ -459,6 +591,9 @@ def build_app():
                 voice_file=voice_path,
                 temperature=temp,
                 top_p=top_p,
+                tts_model_name=mname,
+                tts_timbre=timbre,
+                tts_instruct=instruct
             )
             wav_bytes = preview_tts(text, cfg)
             if wav_bytes is None:
@@ -468,36 +603,102 @@ def build_app():
 
         test_btn.click(
             on_test_voice,
-            inputs=[voice_studio_upload, test_text, temp_slider, topp_slider, speed_slider],
+            inputs=[
+                voice_studio_upload, test_text, temp_slider, topp_slider, speed_slider,
+                tts_model_name, tts_timbre, tts_instruct
+            ],
             outputs=[test_audio, test_status],
+        )
+
+        # ── Preview helper ─────────────────────────────────────────────────────
+        def _parse_chapter_titles(labels: list[str]) -> list[str] | None:
+            """
+            Convert checkbox labels like '5. Chapter 1: Crimson  (~1,793 words)'
+            into plain titles like 'Chapter 1: Crimson'.
+
+            Returning titles (not numbers) avoids the scan/extractor numbering
+            mismatch: scan() numbers ALL TOC entries 1-N, but ingest_epub()
+            only numbers ML-classified content chapters 1-M.
+            """
+            if not labels:
+                return None
+            import re as _re
+            out = []
+            for lbl in labels:
+                after_num = lbl.split(". ", 1)[-1]          # strip "5. " prefix
+                title = _re.sub(r'\s+\(~[\d,]+\s*words\)\s*$', '', after_num).strip()
+                if title:
+                    out.append(title)
+            return out or None
+
+        def on_preview(scan_res, file_obj, selected_chapters, page_ranges_str, epub_ocr):
+            if file_obj is None:
+                yield "", gr.update(visible=False)
+                return
+            path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+            selections   = None
+            page_ranges  = None
+            if scan_res and scan_res.has_toc and selected_chapters:
+                selections = _parse_chapter_titles(selected_chapters)
+            elif scan_res and not scan_res.has_toc and scan_res.file_type != "txt":
+                page_ranges = []
+                for part in page_ranges_str.split(","):
+                    part = part.strip()
+                    if "-" in part:
+                        try:
+                            s, e = part.split("-")
+                            page_ranges.append((int(s.strip()), int(e.strip())))
+                        except ValueError:
+                            pass
+            log_q  = queue.Queue()
+            chapters, _ = extract(
+                path, selections=selections, enable_ocr=epub_ocr,
+                page_ranges=page_ranges, log_fn=log_q.put,
+            )
+            if not chapters:
+                yield "⚠️ No chapters found.", gr.update(visible=False)
+                return
+            rows = preview_chapters(chapters, log_q)
+            data = [[r["idx"], r["title"], r["chars"], r["words"], r["sentences"]] for r in rows]
+            yield "", gr.update(value=data, visible=True)
+
+        preview_btn.click(
+            on_preview,
+            inputs=[scan_state, book_file, chapter_check, page_ranges_box, epub_ocr_chk],
+            outputs=[log_box, preview_table],
         )
 
         # ── Generate Audiobook ────────────────────────────────────────────────
         def on_generate(
             scan_res, file_obj,
             selected_chapters, page_ranges_str,
-            book_title, author,
+            book_title, author, cover_path,
             voice_path, output_fmt, lufs,
             temp, top_p, pause, para_pause,
             max_len, true_peak,
             epub_ocr, force_repro,
+            worker_count, export_text, pron_file_obj, tts_provider,
+            mname, timbre, instruct,
+            single_file, export_lrc
         ):
             if file_obj is None:
                 yield "⚠️ Please upload a book file first.", gr.update(visible=False), []
                 return
-            if not voice_path:
-                yield "⚠️ Please set a narrator voice in the Voice Studio tab.", gr.update(visible=False), []
+            if ("Base" in mname) and not voice_path:
+                yield "⚠️ Please set a narrator voice in the Voice Studio tab for Base models.", gr.update(visible=False), []
                 return
 
             path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
 
             # Build selections
-            selections = None
+            selections  = None
             page_ranges = None
 
             if scan_res and scan_res.has_toc and selected_chapters:
-                # Parse chapter numbers from checkbox labels ("1. Title (~N words)")
-                selections = [int(label.split(".")[0]) for label in selected_chapters]
+                # Use title-based matching — avoids the numbering mismatch between
+                # scan() (all 13 TOC entries, nums 1-13) and ingest_epub() (content
+                # chapters only, re-numbered 1-9).
+                selections = _parse_chapter_titles(selected_chapters)
             elif scan_res and not scan_res.has_toc and scan_res.file_type != "txt":
                 # Parse page ranges "1-50, 51-120"
                 page_ranges = []
@@ -512,6 +713,21 @@ def build_app():
                 if not page_ranges:
                     page_ranges = None  # fall back to whole-book
 
+            # ── Parse pronunciation file ──────────────────────────────────────
+            pron_map = {}
+            if pron_file_obj is not None:
+                pron_path = pron_file_obj.name if hasattr(pron_file_obj, "name") else str(pron_file_obj)
+                try:
+                    with open(pron_path, encoding="utf-8") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line or line.startswith("#") or "==" not in line:
+                                continue
+                            search, repl = line.split("==", 1)
+                            pron_map[search.strip()] = repl.strip()
+                except OSError:
+                    pass
+
             # Config
             book_out = os.path.join(
                 _OUTPUT_DIR,
@@ -522,6 +738,7 @@ def build_app():
             cfg = AudiobookConfig(
                 book_title=book_title,
                 author=author,
+                cover_image=cover_path,
                 output_dir=book_out,
                 output_format=output_fmt,
                 voice_file=voice_path,
@@ -533,6 +750,15 @@ def build_app():
                 lufs=int(lufs),
                 true_peak=true_peak,
                 force_reprocess=force_repro,
+                worker_count=int(worker_count),
+                export_text=bool(export_text),
+                pronunciation_map=pron_map,
+                tts_provider_name=tts_provider or "qwen",
+                tts_model_name=mname,
+                tts_timbre=timbre,
+                tts_instruct=instruct,
+                single_file_mode=single_file,
+                export_lrc=export_lrc
             )
 
             log_q  = queue.Queue()
@@ -540,19 +766,27 @@ def build_app():
             cancel = CancelToken()
 
             def _runner():
-                # Extract
-                chapters = extract(
-                    path,
-                    selections=selections,
-                    enable_ocr=epub_ocr,
-                    page_ranges=page_ranges,
-                    log_fn=log_q.put,
-                )
-                if chapters:
-                    # Generate
-                    out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
-                    log_q.put(f"__DONE__::{','.join(out_files)}")
-                else:
+                try:
+                    # Extract
+                    chapters, _ = extract(
+                        path,
+                        selections=selections,
+                        enable_ocr=epub_ocr,
+                        page_ranges=page_ranges,
+                        log_fn=log_q.put,
+                    )
+                    if chapters:
+                        # Generate
+                        out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
+                        log_q.put(f"__DONE__::{','.join(out_files)}")
+                    else:
+                        log_q.put("__DONE__::")
+                except Exception as e:
+                    import traceback
+                    err_msg = f"❌ [Fatal Error] Pipeline crashed: {e}"
+                    print(err_msg)
+                    traceback.print_exc()
+                    log_q.put(err_msg)
                     log_q.put("__DONE__::")
 
             t = threading.Thread(target=_runner, daemon=True)
@@ -587,11 +821,14 @@ def build_app():
             inputs=[
                 scan_state, book_file,
                 chapter_check, page_ranges_box,
-                book_title_box, book_author_box,
+                book_title_box, book_author_box, cover_image,
                 voice_studio_upload, output_format, lufs_slider,
                 temp_slider, topp_slider, sent_pause_sl, para_pause_sl,
                 max_len_sl, lufs_adv,
                 epub_ocr_chk, force_repro_chk,
+                worker_count_sl, export_text_chk, pronunciation_file, tts_provider_dd,
+                tts_model_name, tts_timbre, tts_instruct,
+                single_file_mode, export_lrc_chk
             ],
             outputs=[log_box, download_col, download_files],
         )
@@ -635,7 +872,7 @@ if __name__ == "__main__":
     """
     demo = build_app()
     demo.launch(
-        server_name="0.0.0.0",
+        server_name="localhost",
         server_port=7860,
         share=False,
         show_error=True,
