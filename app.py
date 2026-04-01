@@ -83,6 +83,7 @@ def build_app():
         outputs_state   = gr.State([])       # list[str] output file paths
         cancel_state    = gr.State(None)     # CancelToken
         preproc_state   = gr.State(None)     # processed voice bytes
+        all_chapter_choices_state = gr.State([]) # full list of chapter labels
 
         with gr.Tabs() as tabs:
 
@@ -445,6 +446,7 @@ def build_app():
                     "",
                     None,
                     "",
+                    [],
                 )
 
             path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
@@ -482,7 +484,8 @@ def build_app():
                     title, author,
                     result,
                     "",
-                    cover_path
+                    cover_path,
+                    choices
                 )
             elif result.file_type == "txt":
                 status_parts.append("ℹ️ No chapters — whole book mode.")
@@ -495,7 +498,8 @@ def build_app():
                     title, author,
                     result,
                     "",
-                    cover_path
+                    cover_path,
+                    []
                 )
             else:
                 pages_msg = f"**Total pages:** {result.page_count}" if result.page_count else ""
@@ -509,7 +513,8 @@ def build_app():
                     title, author,
                     result,
                     pages_msg,
-                    cover_path
+                    cover_path,
+                    []
                 )
 
         book_file.upload(
@@ -517,13 +522,14 @@ def build_app():
             inputs=[book_file],
             outputs=[epub_panel, page_panel, txt_panel, scan_status,
                      chapter_check, book_title_box, book_author_box,
-                     scan_state, total_pages_label, cover_image],
+                     scan_state, total_pages_label, cover_image,
+                     all_chapter_choices_state],
         )
 
         # ── Select/Deselect All ───────────────────────────────────────────
         select_all_btn.click(
-            fn=lambda choices: gr.update(value=choices),
-            inputs=[chapter_check],
+            fn=lambda full_list: gr.update(value=full_list),
+            inputs=[all_chapter_choices_state],
             outputs=[chapter_check],
         )
         deselect_all_btn.click(

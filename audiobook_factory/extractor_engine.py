@@ -716,7 +716,7 @@ class DocumentIngestor:
     def _group_spine_by_chapter(
         self,
         items: list,
-        chapter_hrefs: set[str],
+        chapter_href_to_title: dict[str, str], # href -> TOC title
         skip_hrefs: set[str],
     ) -> list[list]:
         """
@@ -738,12 +738,18 @@ class DocumentIngestor:
         for idx, item in enumerate(items):
             name = (item.get_name() or "").split("/")[-1]
 
-            in_chapter = any(name in h for h in chapter_hrefs)
+            found_href = None
+            for h in chapter_href_to_title:
+                if name in h:
+                    found_href = h
+                    break
+
             in_skip    = any(name in h for h in skip_hrefs)
 
-            if in_chapter:
-                # Start a new chapter group
-                current_group = ["chapter", item]
+            if found_href:
+                # Start a new chapter group; store TOC title as well
+                toc_title = chapter_href_to_title[found_href]
+                current_group = ["chapter", toc_title, item]
                 groups.append(current_group)
             elif in_skip:
                 # Explicitly skipped — own isolated group
@@ -776,7 +782,10 @@ class DocumentIngestor:
         print(f"    TOC: {len(chapter_hrefs)} chapter hrefs, {len(skip_hrefs)} skip hrefs.")
 
         # Group spine items so multi-file chapters are merged
-        groups = self._group_spine_by_chapter(items, chapter_hrefs, skip_hrefs)
+        # Create href -> title mapping for chapters
+        chapter_href_to_title = {e.href: e.title for e in toc_entries if e.classification == "chapter"}
+        groups = self._group_spine_by_chapter(items, chapter_href_to_title, skip_hrefs)
+        
         print(f"    Spine groups: {sum(1 for g in groups if g[0]=='chapter')} chapters, "
               f"{sum(1 for g in groups if g[0]=='skip')} skip, "
               f"{sum(1 for g in groups if g[0]=='front')} front.")
@@ -787,7 +796,13 @@ class DocumentIngestor:
 
         for group in groups:
             group_type = group[0]
-            group_items = group[1:]
+            if group_type == "chapter":
+                toc_title   = group[1]
+                group_items = group[2:]
+            else:
+                toc_title   = None
+                group_items = group[1:]
+                
             if not group_items:
                 continue
 
@@ -796,7 +811,8 @@ class DocumentIngestor:
             lead_html = lead_item.get_body_content().decode("utf-8", errors="replace")
             lead_soup = BeautifulSoup(lead_html, "html.parser")
             heading    = lead_soup.find(["h1", "h2", "h3"])
-            item_title = heading.get_text(strip=True) if heading else lead_name
+            # Prefer TOC title for chapter matching, fall back to heading/name
+            item_title = toc_title if toc_title else (heading.get_text(strip=True) if heading else lead_name)
 
             # Handle explicitly skipped groups
             if group_type in ("skip", "front"):
