@@ -99,6 +99,13 @@ def build_app():
                     )
                     with gr.Column():
                         scan_status = gr.Markdown("*Upload a file to begin.*")
+                        book_language_dd = gr.Dropdown(
+                            label="Language (Supported by current TTS)",
+                            choices=["English", "Chinese", "Japanese", "Korean", "French", "Spanish", "Italian", "German"],
+                            value="English",
+                            interactive=True,
+                            info="Select the language of your book to match the TTS engine."
+                        )
                         book_title_box  = gr.Textbox(label="Book title", interactive=True)
                         book_author_box = gr.Textbox(label="Author", interactive=True)
 
@@ -256,8 +263,18 @@ def build_app():
                     )
                     tts_timbre = gr.Dropdown(
                         label="Premium Timbre (CustomVoice only)",
-                        choices=["serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan"],
-                        value="serena",
+                        choices=[
+                            "[Chinese] vivian",
+                            "[Chinese] serena",
+                            "[Chinese] uncle_fu",
+                            "[Chinese (Beijing Dialect)] dylan",
+                            "[Chinese (Sichuan Dialect)] eric",
+                            "[English] ryan",
+                            "[English] aiden",
+                            "[Japanese] ono_anna",
+                            "[Korean] sohee"
+                        ],
+                        value="[English] ryan",
                         visible=False
                     )
                 
@@ -355,6 +372,7 @@ def build_app():
                 )
 
                 progress_bar = gr.Progress(track_tqdm=False)
+                prog_html = gr.HTML('<div style="text-align: center; margin-bottom: 5px; font-weight: bold;">Generation Progress: 0.00%</div><progress value="0" max="100" style="width:100%; height:25px;"></progress>')
                 log_box      = gr.Textbox(
                     label="Generation log",
                     lines=20,
@@ -592,7 +610,7 @@ def build_app():
                 temperature=temp,
                 top_p=top_p,
                 tts_model_name=mname,
-                tts_timbre=timbre,
+                tts_timbre=timbre.split()[-1] if timbre else "",
                 tts_instruct=instruct
             )
             wav_bytes = preview_tts(text, cfg)
@@ -672,14 +690,15 @@ def build_app():
         def on_generate(
             scan_res, file_obj,
             selected_chapters, page_ranges_str,
-            book_title, author, cover_path,
+            book_language, book_title, author, cover_path,
             voice_path, output_fmt, lufs,
             temp, top_p, pause, para_pause,
             max_len, true_peak,
             epub_ocr, force_repro,
             worker_count, export_text, pron_file_obj, tts_provider,
             mname, timbre, instruct,
-            single_file, export_lrc
+            single_file, export_lrc,
+            progress=gr.Progress(track_tqdm=False)
         ):
             if file_obj is None:
                 yield "⚠️ Please upload a book file first.", gr.update(visible=False), []
@@ -738,6 +757,7 @@ def build_app():
             cfg = AudiobookConfig(
                 book_title=book_title,
                 author=author,
+                language=book_language,
                 cover_image=cover_path,
                 output_dir=book_out,
                 output_format=output_fmt,
@@ -755,7 +775,7 @@ def build_app():
                 pronunciation_map=pron_map,
                 tts_provider_name=tts_provider or "qwen",
                 tts_model_name=mname,
-                tts_timbre=timbre,
+                tts_timbre=timbre.split()[-1] if timbre else "",
                 tts_instruct=instruct,
                 single_file_mode=single_file,
                 export_lrc=export_lrc
@@ -794,8 +814,21 @@ def build_app():
 
             log_text = ""
             out_files   = []
+            last_prog_val = 0.0
 
-            while t.is_alive() or not log_q.empty():
+            while t.is_alive() or not log_q.empty() or not prog_q.empty():
+                try:
+                    while not prog_q.empty():
+                        cur_prog, tot_prog = prog_q.get_nowait()
+                        if tot_prog > 0:
+                            prog_val = float(cur_prog) / float(tot_prog)
+                            last_prog_val = prog_val
+                            progress(prog_val, desc=f"{prog_val*100:.2f}% Complete")
+                except queue.Empty:
+                    pass
+                
+                prog_html_str = f'<div style="text-align: center; margin-bottom: 5px; font-weight: bold;">Generation Progress: {last_prog_val*100:.2f}%</div><progress value="{last_prog_val*100}" max="100" style="width:100%; height:25px;"></progress>'
+
                 try:
                     msg = log_q.get(timeout=0.2)
                     if msg.startswith("__DONE__::"):
@@ -803,25 +836,27 @@ def build_app():
                         out_files = [p for p in paths.split(",") if p and os.path.exists(p)]
                         break
                     log_text += msg + "\n"
-                    yield log_text, gr.update(visible=False), []
+                    yield log_text, prog_html_str, gr.update(visible=False), []
                 except queue.Empty:
-                    yield log_text, gr.update(visible=False), []
+                    yield log_text, prog_html_str, gr.update(visible=False), []
 
+            final_prog_html = '<div style="text-align: center; margin-bottom: 5px; font-weight: bold;">Generation Progress: 100.00%</div><progress value="100" max="100" style="width:100%; height:25px;"></progress>'
             if out_files:
                 yield (
                     log_text + "\n✅ Generation complete!",
+                    final_prog_html,
                     gr.update(visible=True),
                     out_files,
                 )
             else:
-                yield log_text + "\n⚠️ No output files generated.", gr.update(visible=False), []
+                yield log_text + "\n⚠️ No output files generated.", final_prog_html, gr.update(visible=False), []
 
         generate_btn.click(
             on_generate,
             inputs=[
                 scan_state, book_file,
                 chapter_check, page_ranges_box,
-                book_title_box, book_author_box, cover_image,
+                book_language_dd, book_title_box, book_author_box, cover_image,
                 voice_studio_upload, output_format, lufs_slider,
                 temp_slider, topp_slider, sent_pause_sl, para_pause_sl,
                 max_len_sl, lufs_adv,
@@ -830,7 +865,7 @@ def build_app():
                 tts_model_name, tts_timbre, tts_instruct,
                 single_file_mode, export_lrc_chk
             ],
-            outputs=[log_box, download_col, download_files],
+            outputs=[log_box, prog_html, download_col, download_files],
         )
 
         # ── Cancel ────────────────────────────────────────────────────────────

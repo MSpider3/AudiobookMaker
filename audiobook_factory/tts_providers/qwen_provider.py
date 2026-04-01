@@ -2,6 +2,13 @@
 audiobook_factory/tts_providers/qwen_provider.py
 ==================================================
 Qwen3-TTS voice-cloning provider.
+"""
+
+from typing import TYPE_CHECKING
+from audiobook_factory.tts_providers.base_tts_provider import BaseTTSProvider
+
+if TYPE_CHECKING:
+    from audiobook_factory.pipeline import AudiobookConfig
 
 # Trim very quiet audio edges before saving (amplitude threshold).
 _TRIM_THRESHOLD = 0.04
@@ -42,7 +49,7 @@ class QwenTTSProvider(BaseTTSProvider):
                     if model_type == "base":
                         wav_data, sr = self._model.generate_voice_clone(
                             text=text,
-                            language="English",
+                            language=getattr(self.config, "language", "English"),
                             ref_audio=voice_ref or self.config.voice_file,
                             x_vector_only_mode=True,
                             temperature=self.config.temperature,
@@ -52,7 +59,7 @@ class QwenTTSProvider(BaseTTSProvider):
                         wav_data, sr = self._model.generate_custom_voice(
                             text=text,
                             speaker=self.config.tts_timbre or "serena",
-                            language="English",
+                            language=getattr(self.config, "language", "English"),
                             instruct=self.config.tts_instruct,
                             temperature=self.config.temperature,
                             top_p=self.config.top_p,
@@ -61,22 +68,25 @@ class QwenTTSProvider(BaseTTSProvider):
                         wav_data, sr = self._model.generate_voice_design(
                             text=text,
                             instruct=self.config.tts_instruct,
-                            language="English",
+                            language=getattr(self.config, "language", "English"),
                             temperature=self.config.temperature,
                             top_p=self.config.top_p,
                         )
                     else:
                         raise ValueError(f"Unknown model type: {model_type}")
 
+                    # ── Release the lock immediately after generation ─────────────────
                     audio = wav_data[0] if isinstance(wav_data, (list, tuple)) else wav_data
                     if hasattr(audio, "ndim") and audio.ndim > 1:
                         audio = audio[0]
                     if isinstance(audio, torch.Tensor):
                         audio = audio.cpu().float().numpy()
 
-                    sf.write(out_path, audio, sr)
-                # If we reached here, success -> break retry loop
+                # ── GPU is now free for other threads/chapters ────────────────
+                # File I/O happens outside the lock to keep GPU utilization high
+                sf.write(out_path, audio, sr)
                 break
+
             except torch.cuda.OutOfMemoryError as e:
                 print("    [QwenTTS] CUDA OOM encountered. Attempting recovery...")
                 self.cleanup()
@@ -113,13 +123,33 @@ class QwenTTSProvider(BaseTTSProvider):
 
     def _load_model(self) -> None:
         import torch
-        from qwen_tts import Qwen3TTSModel
+        import os, sys
+
+        class DevNull:
+            def write(self, msg): pass
+            def flush(self): pass
+            def isatty(self): return False
+            def close(self): pass
+
+        # Suppress annoying SoX not found and TF printout noise during import
+        orig_stdout = sys.stdout
+        orig_stderr = sys.stderr
+        devnull = DevNull()
+        sys.stdout = devnull
+        sys.stderr = devnull
+        try:
+            from qwen_tts import Qwen3TTSModel
+        finally:
+            sys.stdout = orig_stdout
+            sys.stderr = orig_stderr
 
         print(f"    [QwenTTS] Loading model: {self.config.tts_model_name}…")
+        
+        # We explicitly supply torch_dtype to fix the Flash Attention warning
         self._model = Qwen3TTSModel.from_pretrained(
             self.config.tts_model_name,
             device_map=self.config.device,
-            dtype=torch.bfloat16,
+            torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
         )
         self._loaded_model_name = self.config.tts_model_name

@@ -180,6 +180,15 @@ if [[ "$HAS_CUDA" == true ]]; then
     fi
     pip install torch torchvision torchaudio --index-url "$TORCH_INDEX" --quiet
     success "PyTorch installed with CUDA support"
+
+    # ── Step 3.5: Install Flash Attention 2 (Speedup) ──────────────────
+    header "Step 3.5 — Installing Flash Attention 2"
+    info "Installing Flash Attention (this requires g++ and nvcc)..."
+    if pip install flash-attn --no-build-isolation --quiet 2>/dev/null; then
+        success "Flash Attention 2 installed"
+    else
+        warn "Flash Attention could not be built. App will run in Eager mode (standard speed)."
+    fi
 else
     info "No NVIDIA GPU found — installing CPU-only PyTorch..."
     pip install torch torchvision torchaudio --quiet

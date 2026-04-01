@@ -109,6 +109,13 @@ if %HAS_CUDA%==1 (
         pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 --quiet
     )
     echo [OK]    PyTorch installed with CUDA support.
+    
+    :: ── Step 3.5: Install Flash Attention 2 (Speedup) ──────────────────
+    echo [Step 3.5] Installing Flash Attention 2...
+    echo [INFO]  This may take a while or fail if Windows Build Tools are missing.
+    echo [INFO]  Failure here is OK; the app will still work, just slightly slower.
+    pip install flash-attn --no-build-isolation --quiet
+    if %ERRORLEVEL% EQU 0 (echo [OK]    Flash Attention 2 installed.) else (echo [INFO]  Flash Attention skipped (compiler not found).)
 ) else (
     echo [INFO]  Installing CPU-only PyTorch...
     pip install torch torchvision torchaudio --quiet

@@ -43,6 +43,7 @@ class AudiobookConfig:
     # ── Book metadata ─────────────────────────────────────────────────────────
     book_title:          str   = "Audiobook"
     author:              str   = "Unknown Author"
+    language:            str   = "English"
     cover_image:         str | None = None
 
     # ── Output ────────────────────────────────────────────────────────────────
@@ -191,8 +192,8 @@ def run_pipeline(
         log_queue.put(msg)
         print(msg)
 
-    def progress(cur: int, total: int):
-        prog_queue.put((cur, total))
+    def progress(cur: float, total: int):
+        prog_queue.put((cur, float(total)))
 
     os.makedirs(config.output_dir, exist_ok=True)
     total = len(chapters)
@@ -223,6 +224,13 @@ def run_pipeline(
     tasks = list(enumerate(chapters, 1))
     output_files: list[str] = []
     _lock = threading.Lock()
+    
+    chapter_progress = {i: 0.0 for i in range(1, total + 1)}
+    def _update_chapter_prog(idx, frac):
+        with _lock:
+            chapter_progress[idx] = frac
+            sum_frac = sum(chapter_progress.values())
+            progress(sum_frac, total)
 
     def _process(idx_chapter):
         idx, chapter = idx_chapter
@@ -230,17 +238,22 @@ def run_pipeline(
             return None
         log(f"\n[Chapter {idx}/{total}] '{chapter.title}'")
         try:
-            path = _process_chapter(config, chapter, idx, total, log, cancel, provider)
+            path = _process_chapter(
+                config, chapter, idx, total, log, cancel, provider, 
+                prog_cb=lambda f: _update_chapter_prog(idx, f)
+            )
             if path:
                 with _lock:
                     output_files.append(path)
                 log(f"[Chapter {idx}/{total}] ✅ → {os.path.basename(path)}")
             return path
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             log(f"[Chapter {idx}/{total}] ❌ Error: {e}")
             return None
         finally:
-            progress(idx, total)
+            _update_chapter_prog(idx, 1.0)
 
     try:
         if config.worker_count > 1:
@@ -257,7 +270,6 @@ def run_pipeline(
                     log("[Pipeline] ⛔ Cancelled.")
                     break
                 _process(t)
-                progress(t[0], total)
 
         progress(total, total)
 
@@ -323,6 +335,7 @@ def _process_chapter(
     log:     Callable,
     cancel:  CancelToken,
     provider: "BaseTTSProvider" = None,
+    prog_cb: Callable[[float], None] = None,
 ) -> str | None:
     """Generate audio for one chapter. Returns output file path."""
     from audiobook_factory.ffmpeg_utils import get_format_settings
@@ -386,6 +399,9 @@ def _process_chapter(
                 err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_{i}.txt")
                 with open(err_log_path, "w", encoding="utf-8") as err_f:
                     err_f.write(error_trace)
+            
+            if prog_cb:
+                prog_cb((i + 1) / len(tts_jobs))
 
         if cancel.is_cancelled:
             return None

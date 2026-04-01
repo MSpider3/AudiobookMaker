@@ -10,6 +10,12 @@ set APP=app.py
 set PORT=7860
 set URL=http://localhost:%PORT%
 
+:: ── Environment Overrides ────────────────────────────────────────────────────
+:: Suppress TensorFlow oneDNN noise and standard Python warnings
+set TF_ENABLE_ONEDNN_OPTS=0
+set PYTHONWARNINGS=ignore
+set GRADIO_ANALYTICS_ENABLED=False
+
 echo.
 echo ========================================
 echo   Starting AudiobookMaker

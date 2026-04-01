@@ -14,17 +14,17 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 - **Smart chapter detection** — EPUB/MOBI use a TOC-based chapter checklist; PDF/DOCX/ODT let you split by page ranges
 - **AI text extraction** — 5-phase pipeline (Docling + OCR + ML classification + heuristic normalization) produces clean, TTS-ready text
 - **EPUB image OCR** — EasyOCR reads text embedded in images inside EPUBs
-- **Voice Design & Cloning** — Clone from a reference WAV or prompt an entire new voice using Qwen3-TTS VoiceDesign and CustomVoice timbre models.
+- **Voice Design & Cloning** — Clone from a reference WAV or prompt an entire new voice using Qwen3-TTS. Supports **8 languages** (English, Chinese, Japanese, Korean, French, Spanish, Italian, German).
 - **Voice preprocessing** — 7-step audio cleaning pipeline: noise reduction, noise gate, high-pass filter, silence removal, normalization, formant shifting, resampling
-- **Voice test tab** — Type any sentence and preview the cloned voice before generating
-- **Preview mode** — See chapter list with character + word counts before committing to a full audiobook run
-- **Pronunciation fixes** — Upload a `.txt` file with `search==replace` pairs to fix how the TTS pronounces specific words
-- **Parallel processing with VRAM Safety** — Process extraction and encoding across multiple chapter workers simultaneously, with thread-safe GPU locks and Out-Of-Memory (OOM) recovery to prevent crashes.
+- **Voice test tab** — Type any sentence and preview the cloned voice before generating. Includes language-labeled premium timbres for optimized results.
+- **Preview mode** — See chapter list with character + word counts before committing to a full audiobook run.
+- **Pronunciation fixes** — Upload a `.txt` file with `search==replace` pairs to fix how the TTS pronounces specific words.
+- **Parallel processing with Shared VRAM** — Process multiple chapters simultaneously using a **Global Shared Provider**. This allows worker counts up to 4 without multiplying VRAM usage, utilizing a thread-safe GPU lock with asynchronous disk I/O for maximum performance.
 - **Synced Lyrics Export** — Automatically generates `.lrc` timed lyrics files perfect for Audiobookshelf syncing. 
 - **Audiobookshelf-compatible output** — Zero-padded filenames + full ID3 tags (title, author, album, track) ready to drop into Audiobookshelf.
 - **Mastered Output & Single File Mode** — Output mastered MP3, FLAC, WAV, or M4B files. Optionally combine all chapters into a massive single unified file with one click.
-- **Live generation log** — Stream progress in real time with a per-chapter progress bar and Cancel button
-- **Modular TTS provider system** — Qwen3-TTS built-in; designed to support additional providers (Edge-TTS, OpenAI, Kokoro) in future updates
+- **Live generation log & Decimal Progress** — Stream progress in real time with a **sub-chapter decimal progress bar** (e.g. 74.52%) and detailed live logs.
+- **Modular TTS provider system** — Qwen3-TTS built-in; optimized with **Flash Attention 2** and async processing to keep your GPU at peak utilization.
 
 ---
 
@@ -144,7 +144,8 @@ Your browser will open at **http://localhost:7860** automatically.
 2. **EPUB / MOBI with TOC** → A chapter checklist appears. Tick the chapters you want to convert. Use *Select All* / *Deselect All* for quick bulk selection.
 3. **PDF / DOCX / ODT / MOBI (no TOC)** → Enter page ranges, e.g. `1-50, 51-120, 121-250`. Each range becomes a separate chapter file.
 4. **TXT** → No page structure; the whole file becomes one audio file automatically.
-5. Fill in book title, author, choose output format and LUFS loudness target.
+5. **Language Selection** → Choose the language of your book from the dropdown. This tells the TTS engine which phonetic dictionary to use.
+6. Fill in book title, author, choose output format and LUFS loudness target.
 
 ### 2. 🎧 Voice Preprocessing Tab *(recommended before cloning)*
 Upload your raw voice WAV and run any combination of these steps:
@@ -163,12 +164,14 @@ Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as nar
 
 ### 3. 🎙️ Voice Studio Tab
 1. Upload or carry over the processed voice WAV.
-2. Adjust TTS tuning parameters (speed, temperature, top-p, sentence/paragraph pauses).
-3. Type any sentence in the **Voice Test** box and click **▶ Test Voice** to hear a preview.
+2. Select a **TTS Model Variant** (Base for cloning, CustomVoice/VoiceDesign for prompting).
+3. Choose a **Premium Timbre** (if using CustomVoice). Choices are prefixed with their native language (e.g., `[English] ryan`, `[Japanese] ono_anna`) for the best quality match.
+4. Adjust TTS tuning parameters (speed, temperature, top-p, sentence/paragraph pauses).
+5. Type any sentence in the **Voice Test** box and click **▶ Test Voice** to hear a preview.
 
 ### 4. ⚙️ Advanced Tab
-- **Max chunk length** — TTS input character limit per sentence chunk (default 399)
-- **Parallel chapter workers** — Process 1–4 chapters simultaneously. Keep at 1 if VRAM is limited.
+- **Max chunk length** — TTS input character limit per sentence chunk (default 399).
+- **Parallel chapter workers** — Process 1–4 chapters simultaneously. Thanks to our **Shared VRAM** architecture, increasing this does not significantly increase memory usage, but can dramatically speed up generation by pre-fetching the next sentence while the current one is speaking.
 - **TTS Provider** — Currently: `qwen` (Qwen3-TTS). More providers will be added in future releases.
 - **EasyOCR** — Enable to extract text from images embedded inside EPUB files
 - **Force reprocess** — Re-extract text even if cached output exists
@@ -183,9 +186,9 @@ Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as nar
 
 ### 5. 🚀 Generate Tab
 1. Click **🔍 Preview Chapters** to see a table of chapter titles, character counts, word counts, and sentence counts — without generating any audio. Great for checking your chapter selections.
-2. Click **🎧 Generate Audiobook** to start the full pipeline
-3. Watch the live streaming log and per-chapter progress bar
-4. Use **⛔ Cancel** to stop at any time
+2. Click **🎧 Generate Audiobook** to start the full pipeline.
+3. Watch the **Live Decimal Progress Bar** and log stream.
+4. Use **⛔ Cancel** to stop at any time.
 5. When complete, download individual chapter files or use **⬇ Download All (ZIP)**
 
 ---
@@ -272,9 +275,6 @@ Output filenames follow the `{NNNN}_{Chapter_Title}.mp3` format Audiobookshelf e
 ## 🙏 Acknowledgements
 
 This project would not have been possible without the incredible work from these projects:
-
-### [epub_to_audiobook](https://github.com/p0n1/epub_to_audiobook) by p0n1
-Inspired the modular TTS provider architecture, Audiobookshelf-compatible output format, pronunciation fix file format, and the preview mode features in this project.
 
 ### [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by QwenLM
 The voice cloning and TTS engine powering all audio generation in this project.

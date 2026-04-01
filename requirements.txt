@@ -27,6 +27,9 @@ safetensors         # Fast model weight loading
 tokenizers          # Fast tokenizer
 accelerate          # Multi-GPU / CPU offload
 huggingface-hub     # Model download
+einops              # Required for Qwen transformer ops
+qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git  # Direct from source
+# flash-attn        # Performance speedup (Installed via install scripts)
 
 # ── BookNLP (story / character analysis) ─────────────────────────────────────
 booknlp
@@ -48,3 +51,6 @@ tqdm
 pydantic
 rich                # Pretty console output
 sentencex           # Language-aware sentence segmentation (text splitting before TTS)
+chardet             # Encoding detection for TXT files
+pydub               # High-level audio manipulation fallback
+tensorboard         # Sometimes required by transformers logging
