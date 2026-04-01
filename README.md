@@ -6,6 +6,8 @@
 
 An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, clone a narrator voice, clean it up, and generate a chapterized, mastered audiobook — all locally, no cloud APIs needed.
 
+> ⚠️ **This project is under development** — Features and APIs may change. Please report issues and feedback.
+
 ---
 
 ## ✨ Features
