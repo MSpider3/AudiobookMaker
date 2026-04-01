@@ -183,6 +183,8 @@ if [[ "$HAS_CUDA" == true ]]; then
 
     # ── Step 3.5: Install Flash Attention 2 (Speedup) ──────────────────
     header "Step 3.5 — Installing Flash Attention 2"
+    info "Installing build dependencies (psutil, ninja, wheel, setuptools)..."
+    pip install packaging wheel setuptools psutil ninja --quiet 2>/dev/null || true
     info "Installing Flash Attention (this requires g++ and nvcc)..."
     if pip install flash-attn --no-build-isolation --quiet 2>/dev/null; then
         success "Flash Attention 2 installed"
@@ -203,7 +205,15 @@ if [[ ! -f "$REQUIREMENTS" ]]; then
 fi
 
 # Install everything except torch (already installed above)
-grep -v -E "^#|^\s*$|^torch" "$REQUIREMENTS" | pip install -r - --quiet
+# Use Python to properly strip inline comments from requirements
+python3 << 'PYEOF'
+import subprocess, sys
+with open('requirements.txt') as f:
+    reqs = [line.split('#')[0].strip() for line in f if line.strip() and not line.strip().startswith('#')]
+    reqs = [r for r in reqs if r and not r.lower().startswith('torch')]
+    if reqs:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet'] + reqs)
+PYEOF
 success "All dependencies installed"
 
 # ── Step 5: Install FFmpeg if missing ─────────────────────────────────────────

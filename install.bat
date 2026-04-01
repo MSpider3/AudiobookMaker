@@ -114,9 +114,9 @@ if %HAS_CUDA%==1 (
     echo [Step 3.5] Installing Flash Attention 2...
     echo [INFO]  This may take a while or fail if Windows Build Tools are missing.
     echo [INFO]  Failure here is OK; the app will still work, just slightly slower.
-    pip install packaging wheel setuptools --quiet
-    pip install flash-attn --no-build-isolation --quiet
-    if !ERRORLEVEL! EQU 0 (echo [OK]    Flash Attention 2 installed.) else (echo [INFO]  Flash Attention skipped - compiler not found.)
+    pip install packaging wheel setuptools psutil ninja --quiet
+    pip install flash-attn --no-build-isolation --quiet 2>nul
+    if !ERRORLEVEL! EQU 0 (echo [OK]    Flash Attention 2 installed.) else (echo [INFO]  Flash Attention skipped - compiler or dependencies not available.)
 ) else (
     echo [INFO]  Installing CPU-only PyTorch...
     pip install torch torchvision torchaudio --quiet
@@ -134,8 +134,8 @@ if not exist %REQUIREMENTS% (
 )
 
 :: Install all requirements except torch lines (already installed)
-:: Use Python to filter and install
-python -c "import subprocess, sys; reqs = [line.strip() for line in open('%REQUIREMENTS%') if line.strip() and not line.strip().startswith('#') and not line.strip().lower().startswith('torch')]; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet'] + reqs)"
+:: Use Python to filter out comments and install
+python -c "import subprocess, sys; reqs = [line.split('#')[0].strip() for line in open('%REQUIREMENTS%') if line.strip() and not line.strip().startswith('#')]; reqs = [r for r in reqs if r and not r.lower().startswith('torch')]; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet'] + reqs)"
 if !ERRORLEVEL! NEQ 0 (
     echo [ERROR] Dependency installation failed.
     pause

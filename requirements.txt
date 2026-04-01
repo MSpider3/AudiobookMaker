@@ -50,6 +50,7 @@ requests
 tqdm
 pydantic
 rich                # Pretty console output
+nltk                # Natural language toolkit for text processing
 sentencex           # Language-aware sentence segmentation (text splitting before TTS)
 chardet             # Encoding detection for TXT files
 pydub               # High-level audio manipulation fallback
