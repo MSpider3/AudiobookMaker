@@ -48,7 +48,7 @@ PYTHON_BIN=""
 # Check if already installed
 for cmd in python3.11 python3 python; do
     if command -v "$cmd" &>/dev/null; then
-        VER=$("$cmd" --version 2>&1 | grep -oP '\d+\.\d+' | head -1)
+        VER=$("$cmd" --version 2>&1 | awk '{print $2}' | cut -d. -f1,2)
         MAJOR=$(echo "$VER" | cut -d. -f1)
         MINOR=$(echo "$VER" | cut -d. -f2)
         if [[ "$MAJOR" -eq 3 && "$MINOR" -ge 11 ]]; then
@@ -152,7 +152,7 @@ if command -v nvidia-smi &>/dev/null; then
     success "NVIDIA GPU detected: $GPU_NAME"
 
     # Try to get CUDA version
-    CUDA_VER=$(nvidia-smi | grep -oP 'CUDA Version: \K[\d.]+' | head -1 || echo "")
+    CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9.]+' | awk '{print $3}' | head -1 || echo "")
     if [[ -n "$CUDA_VER" ]]; then
         CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
         CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
@@ -203,7 +203,7 @@ if [[ ! -f "$REQUIREMENTS" ]]; then
 fi
 
 # Install everything except torch (already installed above)
-grep -v -E "^#|^\s*$|^torch" "$REQUIREMENTS" | pip install -r /dev/stdin --quiet
+grep -v -E "^#|^\s*$|^torch" "$REQUIREMENTS" | pip install -r - --quiet
 success "All dependencies installed"
 
 # ── Step 5: Install FFmpeg if missing ─────────────────────────────────────────
