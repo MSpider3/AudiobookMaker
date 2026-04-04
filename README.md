@@ -28,12 +28,23 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 
 ---
 
+> [!NOTE]
+> 🚫 **The Voice Preprocessing tab** (#-%F0%9F%8E%A7-voice-preprocessing-tab--7-step-audio-cleaning) **is currently unavailable. Please avoid using this feature until a fix is released.**
+>
+> ✅ All other features are functioning as expected.
+>
+> 🎧 For now, please perform voice preprocessing manually until this issue is resolved.
+
+
+---
+
+
 ## 🖥️ UI Preview
 
 ### 📚 Book Tab — Upload & Chapter Selection
 ![Book Tab](docs/preview/01_book_tab.png)
 
-### 🎧 Voice Preprocessing Tab — 7-Step Audio Cleaning
+### 🎧 Voice Preprocessing Tab — 7-Step Audio Cleaning 
 ![Voice Preprocessing Tab](docs/preview/02_voice_preprocessing_tab.png)
 
 ### 🎙️ Voice Studio Tab — Clone & Test Voice
