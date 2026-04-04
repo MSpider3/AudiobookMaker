@@ -15,12 +15,14 @@ New in this version
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -29,9 +31,19 @@ from typing import Callable
 import numpy as np
 import soundfile as sf
 
+# ── project root & temp folder ────────────────────────────────────────────────
+_ROOT = Path(__file__).resolve().parent.parent
+_TEMP_DIR = _ROOT / "temp"
+_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
 from audiobook_factory.text_extractor import ExtractedChapter
 from audiobook_factory.text_processing import smart_sentence_splitter
 from audiobook_factory.filename_sanitizer import make_safe_filename
+from audiobook_factory.utils import (
+    load_or_create_progress_file, 
+    update_progress_file,
+    format_lrc_timestamp
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -214,14 +226,38 @@ def run_pipeline(
     if config.export_text:
         log("[Pipeline] Text export: enabled")
 
+    # ── Progress tracking setup ───────────────────────────────────────────────
+    progress_name = "generation_progress.json"
+    prog_path_out = os.path.join(config.output_dir, progress_name)
+    prog_path_tmp = os.path.join(str(_TEMP_DIR), progress_name)
+
+    if config.force_reprocess:
+        log("[Pipeline] 🔄 Force reprocess enabled. Clearing old progress.")
+        for p in [prog_path_out, prog_path_tmp]:
+            if os.path.exists(p):
+                try: os.remove(p)
+                except: pass
+
+    # ── Build per-chapter tasks ───────────────────────────────────────────────
+    tasks = list(enumerate(chapters, 1))
+
+    # We only initialize with the output path first, then copy to temp
+    chapters_data = [{"num": i, "title": ch.title} for i, ch in tasks]
+    progress_data = load_or_create_progress_file(prog_path_out, chapters_data, config.book_title)
+    
+    # Sync to temp for user visibility
+    try:
+        with open(prog_path_tmp, "w", encoding="utf-8") as f:
+            json.dump(progress_data, f, indent=4)
+    except:
+        pass
+
     # ── Shared TTS Provider Setup ─────────────────────────────────────────────
     from audiobook_factory.tts_providers import get_tts_provider
     provider = None
     if not config.preview_mode:
         provider = get_tts_provider(config.tts_provider_name, config)
 
-    # ── Build per-chapter tasks ───────────────────────────────────────────────
-    tasks = list(enumerate(chapters, 1))
     output_files: list[str] = []
     _lock = threading.Lock()
     
@@ -236,6 +272,26 @@ def run_pipeline(
         idx, chapter = idx_chapter
         if cancel.is_cancelled:
             return None
+
+        # Check checkpoint
+        ch_status = "pending"
+        for c in progress_data.get("chapters", []):
+            if c["num"] == idx:
+                ch_status = c.get("status", "pending")
+                break
+        
+        if ch_status == "completed" and not config.force_reprocess:
+            log(f"[Chapter {idx}/{total}] ⏩ Already completed. Skipping.")
+            _update_chapter_prog(idx, 1.0)
+            # Find the existing file to return its path
+            safe_name = make_safe_filename(chapter.title, idx, config.output_dir, f".{config.output_format}")
+            existing_path = os.path.join(config.output_dir, safe_name)
+            if os.path.exists(existing_path):
+                with _lock:
+                    output_files.append(existing_path)
+                return existing_path
+            log(f"  [Ch{idx}] ⚠ Warning: Marked 'completed' but file not found. Re-generating.")
+
         log(f"\n[Chapter {idx}/{total}] '{chapter.title}'")
         try:
             path = _process_chapter(
@@ -246,6 +302,13 @@ def run_pipeline(
                 with _lock:
                     output_files.append(path)
                 log(f"[Chapter {idx}/{total}] ✅ → {os.path.basename(path)}")
+                
+                # Update checkpoint files
+                for p in [prog_path_out, prog_path_tmp]:
+                    try:
+                        update_progress_file(p, idx, "completed")
+                    except:
+                        pass
             return path
         except Exception as e:
             import traceback
@@ -341,7 +404,7 @@ def _process_chapter(
     from audiobook_factory.ffmpeg_utils import get_format_settings
     from audiobook_factory.tts_providers import get_tts_provider
 
-    temp_dir = tempfile.mkdtemp(prefix=f"abm_ch{idx:03d}_")
+    temp_dir = tempfile.mkdtemp(prefix=f"abm_ch{idx:03d}_", dir=str(_TEMP_DIR))
     try:
         # ── Apply pronunciation fixes ─────────────────────────────────────────
         text = chapter.text
@@ -535,7 +598,7 @@ def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
     if not text.strip():
         return None
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(dir=str(_TEMP_DIR)) as tmp:
         out_path = os.path.join(tmp, "preview.wav")
         try:
             provider = get_tts_provider(config.tts_provider_name, config)

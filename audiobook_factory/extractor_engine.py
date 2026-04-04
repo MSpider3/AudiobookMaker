@@ -29,6 +29,11 @@ import ebooklib
 from bs4 import BeautifulSoup
 from ebooklib import epub
 
+# ── project root & temp folder ────────────────────────────────────────────────
+_ROOT = Path(__file__).resolve().parent.parent
+_TEMP_DIR = _ROOT / "temp"
+_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
 # ── sys.path so the project root is importable ───────────────────────────────
 # This file lives in audiobook_factory/, so go up one level to find the project root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -662,7 +667,7 @@ class DocumentIngestor:
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
-                suffix=".html", mode="w", encoding="utf-8", delete=False
+                suffix=".html", mode="w", encoding="utf-8", delete=False, dir=str(_TEMP_DIR)
             ) as tmp:
                 tmp.write(processed)
                 tmp_path = tmp.name
