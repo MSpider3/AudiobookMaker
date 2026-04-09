@@ -100,6 +100,8 @@ class AudiobookConfig:
     preview_mode:        bool  = False   # show stats, no TTS
     export_text:         bool  = False   # write .txt per chapter
     export_lrc:          bool  = True    # write .lrc timed lyrics
+    export_srt:          bool  = False   # write .srt subtitles
+    export_vtt:          bool  = False   # write .webvtt subtitles
     single_file_mode:    bool  = False   # combine all into one big file
 
     # ── Misc ──────────────────────────────────────────────────────────────────
@@ -485,6 +487,43 @@ def _process_chapter(
             except Exception as e:
                 log(f"  [Ch{idx}] LRC export failed: {e}")
 
+        # ── Generate SRT timed subtitles ──────────────────────────────────────
+        if config.export_srt:
+            srt_name = make_safe_filename(chapter.title, idx, config.output_dir, ".srt")
+            srt_path = os.path.join(config.output_dir, srt_name)
+            try:
+                from audiobook_factory.utils import seconds_to_srt_time
+                curr_time = 0.0
+                pause_len = config.pause
+                with open(srt_path, "w", encoding="utf-8") as fh:
+                    for i, (text_chunk, dur) in enumerate(zip(tts_jobs, chunk_durations), 1):
+                        start = seconds_to_srt_time(curr_time)
+                        end = seconds_to_srt_time(curr_time + dur)
+                        fh.write(f"{i}\n{start} --> {end}\n{text_chunk}\n\n")
+                        curr_time += dur + pause_len
+                log(f"  [Ch{idx}] SRT exported → {srt_name}")
+            except Exception as e:
+                log(f"  [Ch{idx}] SRT export failed: {e}")
+
+        # ── Generate WebVTT timed subtitles ───────────────────────────────────
+        if config.export_vtt:
+            vtt_name = make_safe_filename(chapter.title, idx, config.output_dir, ".vtt")
+            vtt_path = os.path.join(config.output_dir, vtt_name)
+            try:
+                from audiobook_factory.utils import seconds_to_vtt_time
+                curr_time = 0.0
+                pause_len = config.pause
+                with open(vtt_path, "w", encoding="utf-8") as fh:
+                    fh.write("WEBVTT\n\n")
+                    for i, (text_chunk, dur) in enumerate(zip(tts_jobs, chunk_durations), 1):
+                        start = seconds_to_vtt_time(curr_time)
+                        end = seconds_to_vtt_time(curr_time + dur)
+                        fh.write(f"{i}\n{start} --> {end}\n{text_chunk}\n\n")
+                        curr_time += dur + pause_len
+                log(f"  [Ch{idx}] WebVTT exported → {vtt_name}")
+            except Exception as e:
+                log(f"  [Ch{idx}] WebVTT export failed: {e}")
+
         # ── Build filelist for FFmpeg concat ──────────────────────────────────
         if not any(chunk_paths):
             log(f"  [Ch{idx}] ❌ No audio chunks generated successfully. Skipping.")
@@ -546,7 +585,7 @@ def _process_chapter(
         if has_cover:
             # Map audio from first input and video/image from second
             # id3v2_version 3 for better compatibility
-            ffmpeg_cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy", "-id3v2_version", "3"]
+            ffmpeg_cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy", "-disposition:v", "attached_pic", "-id3v2_version", "3"]
 
         ffmpeg_cmd += [
             "-metadata", f"title={chapter.title}",

@@ -11,12 +11,21 @@ from bs4 import BeautifulSoup
 
 
 
-def ms_to_srt_time(ms):
-    """Converts milliseconds to SRT timestamp format (HH:MM:SS,ms)."""
-    seconds, milliseconds = divmod(ms, 1000)
-    minutes, seconds = divmod(seconds, 60)
+def seconds_to_srt_time(seconds):
+    """Converts seconds to SRT timestamp format (HH:MM:SS,ms)."""
+    ms = int(seconds * 1000)
+    minutes, seconds = divmod(ms // 1000, 60)
     hours, minutes = divmod(minutes, 60)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+    ms = ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds % 60:02d},{ms:03d}"
+
+def seconds_to_vtt_time(seconds):
+    """Converts seconds to WebVTT timestamp format (HH:MM:SS.mmm)."""
+    ms = int(seconds * 1000)
+    minutes, seconds = divmod(ms // 1000, 60)
+    hours, minutes = divmod(minutes, 60)
+    ms = ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds % 60:02d}.{ms:03d}"
 
 def update_progress_file(progress_path, chapter_num, status):
     """

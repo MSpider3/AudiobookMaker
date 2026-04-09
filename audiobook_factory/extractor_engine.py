@@ -607,6 +607,22 @@ class DocumentIngestor:
                 "drop" in classes.lower() or
                 ("font-size" in style and "em" in style)
             ):
+                # Heuristic: If it has a previous sibling that isn't just whitespace,
+                # it's likely an identifier rather than a paragraph drop-cap (There).
+                is_middle = False
+                prev = span.previous_sibling
+                if prev:
+                    prev_txt = prev.get_text() if hasattr(prev, "get_text") else str(prev)
+                    if prev_txt.strip():
+                        is_middle = True
+
+                # If middle and followed by lowercase, ensure space.
+                nxt = span.next_sibling
+                if is_middle and nxt and isinstance(nxt, str):
+                    if nxt.lstrip() and nxt.lstrip()[0].islower():
+                        # Prepend space to the next text node
+                        span.next_sibling.replace_with(" " + nxt.lstrip())
+
                 span.unwrap()   # merge single-char drop-cap with following word
 
         # ── In-flight EPUB Image OCR ──

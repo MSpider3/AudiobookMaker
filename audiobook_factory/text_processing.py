@@ -23,6 +23,16 @@ def normalize_text(text):
     # Searches for Single Capital Char -> Newline/Space -> Capital Word(min 2 chars)
     # This is a bit aggressive, so we perform it carefully.
     text = re.sub(r'(^|\n)([A-Z])\s*\n\s*([A-Z]{2,})', r'\1\2\3', text)
+
+    # 3. Fix Extraction Errors: Merged identifiers.
+    # This identifies "descriptor" words followed by a single-capital identifier joined to a word.
+    # We use a broad list of descriptors common in novel and technical extraction.
+    descriptors = (
+        r'Class|Room|Section|Level|Floor|Group|Area|Zone|Rank|Type|Grade|'
+        r'Exam|Test|Point|Score|Rank|Phase|Stage|Category|Model|Series|'
+        r'Volume|Chapter|Year|Course|Subject|Unit|Part|Item|Step'
+    )
+    text = re.sub(fr'(\b(?:{descriptors})\s+[A-Z])([a-z]{{2,}})', r'\1 \2', text, flags=re.IGNORECASE)
     
     return text
 

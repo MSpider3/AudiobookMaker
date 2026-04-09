@@ -48,24 +48,24 @@ def _sanitize_base_name(name: str) -> str:
     # Unicode NFKC: normalise ligatures, width variants, etc.
     name = unicodedata.normalize("NFKC", name)
 
-    # Replace forbidden / control characters with underscore.
+    # Replace forbidden / control characters with space.
     chars = []
     for ch in name:
         if ch in _FORBIDDEN or (ord(ch) < 32):
-            chars.append("_")
+            chars.append(" ")
         else:
             chars.append(ch)
     sanitized = "".join(chars)
 
-    # Collapse whitespace and replace spaces with underscores.
-    sanitized = "_".join(sanitized.split())
+    # Collapse whitespace.
+    sanitized = " ".join(sanitized.split())
 
-    # Strip leading/trailing dots and underscores (Windows quirk).
-    sanitized = sanitized.strip("._")
+    # Strip leading/trailing dots and spaces (Windows quirk).
+    sanitized = sanitized.strip(". ")
 
     # Guard Windows reserved names.
     if sanitized.upper() in _WIN_RESERVED:
-        sanitized = sanitized + "_file"
+        sanitized = sanitized + " file"
 
     return sanitized or "chapter"
 
@@ -102,16 +102,31 @@ def make_safe_filename(
     name_max = _detect_name_max(output_dir)
     effective_name_max = max(64, min(name_max, 255))
 
-    prefix = f"{idx:04d}_"
-    base   = _sanitize_base_name(title)
+    # New format: Chapter {idx} - {title}.ext
+    # Strip redundant "Chapter {idx}" from the title if it exists
+    trimmed_title = title.strip()
+    prefix_patterns = [
+        f"Chapter {idx}:", f"Chapter {idx}-", f"Chapter {idx}.", f"Chapter {idx} ",
+        f"Ch {idx}:", f"Ch {idx}-", f"Ch {idx}.", f"Ch {idx} ",
+        f"{idx}:", f"{idx}.", f"{idx} "
+    ]
+    for p in prefix_patterns:
+        if trimmed_title.lower().startswith(p.lower()):
+            trimmed_title = trimmed_title[len(p):].strip()
+            # If there's a leading colon or dash after stripping, remove it too
+            trimmed_title = trimmed_title.lstrip(": -").strip()
+            break
+
+    prefix = f"Chapter {idx} - "
+    base   = _sanitize_base_name(trimmed_title)
 
     prefix_bytes = prefix.encode("utf-8")
     ext_bytes    = ext.encode("utf-8")
 
     if len(prefix_bytes) + len(ext_bytes) + 8 >= effective_name_max:
-        raise RuntimeError(
-            "Cannot construct safe filename: prefix+extension exceeds filesystem limit."
-        )
+        # Fallback to shorter prefix if needed
+        prefix = f"{idx:04d} - "
+        prefix_bytes = prefix.encode("utf-8")
 
     max_base_bytes = effective_name_max - len(prefix_bytes) - len(ext_bytes) - reserve
     if max_base_bytes <= 0:
@@ -127,13 +142,13 @@ def make_safe_filename(
     while truncated and (truncated[-1] & 0b11000000) == 0b10000000:
         truncated = truncated[:-1]
 
-    truncated_base = truncated.decode("utf-8", errors="ignore").rstrip("._- ")
+    truncated_base = truncated.decode("utf-8", errors="ignore").rstrip(". ")
     if not truncated_base:
         truncated_base = "chapter"
 
     # Append a short hash so truncated names stay unique.
     h = hashlib.sha1(base_bytes).hexdigest()[:8]
-    candidate = f"{prefix}{truncated_base}_{h}{ext}"
+    candidate = f"{prefix}{truncated_base} {h}{ext}"
 
     # Last-resort: just hash.
     if len(candidate.encode("utf-8")) > effective_name_max:
