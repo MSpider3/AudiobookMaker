@@ -29,7 +29,7 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 ---
 
 > [!NOTE]
-> 🚫 **The Voice Preprocessing tab** (#-%F0%9F%8E%A7-voice-preprocessing-tab--7-step-audio-cleaning) **is currently unavailable. Please avoid using this feature until a fix is released.**
+> 🚫 **The Voice Preprocessing tab** is currently unavailable. Please avoid using this feature until a fix is released.**
 >
 > ✅ All other features are functioning as expected.
 >
