@@ -80,7 +80,8 @@ class AudiobookConfig:
     true_peak:           float = -1.5
 
     # ── Parallelism ───────────────────────────────────────────────────────────
-    worker_count:        int   = 1       # chapters in parallel
+    worker_count:        int   = 1       # chapters/chunks in parallel
+    parallel_mode:       str   = "chunks" # "chapters" | "chunks"
 
     # ── Modes ─────────────────────────────────────────────────────────────────
     preview_mode:        bool  = False   # show stats, no TTS
@@ -321,7 +322,7 @@ def run_pipeline(
             _update_chapter_prog(idx, 1.0)
 
     try:
-        if config.worker_count > 1:
+        if getattr(config, "parallel_mode", "chunks") == "chapters" and config.worker_count > 1:
             with ThreadPoolExecutor(max_workers=config.worker_count) as pool:
                 futures = {pool.submit(_process, t): t for t in tasks}
                 for fut in as_completed(futures):
@@ -445,28 +446,69 @@ def _process_chapter(
         chunk_paths: list[str | None] = [None] * len(tts_jobs)
         chunk_durations: list[float] = [0.0] * len(tts_jobs)
 
-        for i, chunk_text in enumerate(tts_jobs):
-            if cancel.is_cancelled:
-                return None
-            out_wav = os.path.join(temp_dir, f"s_{i:04d}.wav")
-            try:
-                # Provider.synthesize should ideally take care of the model type internally
-                provider.synthesize(chunk_text, config.voice_file, out_wav)
-                chunk_paths[i] = out_wav
-                # Get duration for LRC
-                if config.export_lrc:
-                    chunk_durations[i] = _get_wav_duration(out_wav)
-            except Exception as e:
-                import traceback
-                error_trace = traceback.format_exc()
-                log(f"  [Ch{idx}] chunk {i} failed: {e}")
-                log(f"  [Ch{idx}] Traceback saved to chapter output dir.")
-                err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_{i}.txt")
-                with open(err_log_path, "w", encoding="utf-8") as err_f:
-                    err_f.write(error_trace)
-            
-            if prog_cb:
-                prog_cb((i + 1) / len(tts_jobs))
+        use_parallel_chunks = (getattr(config, "parallel_mode", "chunks") == "chunks" and config.worker_count > 1)
+
+        if use_parallel_chunks:
+            completed_chunks = 0
+            chunk_lock = threading.Lock()
+
+            def _synth_worker(i: int, chunk_text: str):
+                nonlocal completed_chunks
+                if cancel.is_cancelled:
+                    return
+                out_wav = os.path.join(temp_dir, f"s_{i:04d}.wav")
+                try:
+                    provider.synthesize(chunk_text, config.voice_file, out_wav)
+                    chunk_paths[i] = out_wav
+                    if config.export_lrc:
+                        chunk_durations[i] = _get_wav_duration(out_wav)
+                except Exception as e:
+                    import traceback
+                    error_trace = traceback.format_exc()
+                    log(f"  [Ch{idx}] chunk {i} failed: {e}")
+                    log(f"  [Ch{idx}] Traceback saved to chapter output dir.")
+                    err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_{i}.txt")
+                    with open(err_log_path, "w", encoding="utf-8") as err_f:
+                        err_f.write(error_trace)
+                
+                with chunk_lock:
+                    completed_chunks += 1
+                    if prog_cb:
+                        prog_cb(completed_chunks / len(tts_jobs))
+
+            with ThreadPoolExecutor(max_workers=config.worker_count) as pool:
+                futures = {pool.submit(_synth_worker, i, txt): i for i, txt in enumerate(tts_jobs)}
+                for fut in as_completed(futures):
+                    if cancel.is_cancelled:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        log(f"  [Ch{idx}] Unexpected error in chunk thread: {e}")
+        else:
+            for i, chunk_text in enumerate(tts_jobs):
+                if cancel.is_cancelled:
+                    return None
+                out_wav = os.path.join(temp_dir, f"s_{i:04d}.wav")
+                try:
+                    # Provider.synthesize should ideally take care of the model type internally
+                    provider.synthesize(chunk_text, config.voice_file, out_wav)
+                    chunk_paths[i] = out_wav
+                    # Get duration for LRC
+                    if config.export_lrc:
+                        chunk_durations[i] = _get_wav_duration(out_wav)
+                except Exception as e:
+                    import traceback
+                    error_trace = traceback.format_exc()
+                    log(f"  [Ch{idx}] chunk {i} failed: {e}")
+                    log(f"  [Ch{idx}] Traceback saved to chapter output dir.")
+                    err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_{i}.txt")
+                    with open(err_log_path, "w", encoding="utf-8") as err_f:
+                        err_f.write(error_trace)
+                
+                if prog_cb:
+                    prog_cb((i + 1) / len(tts_jobs))
 
         if cancel.is_cancelled:
             return None

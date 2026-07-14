@@ -7,6 +7,7 @@ Opens: http://localhost:7860
 from __future__ import annotations
 
 import io
+import json
 import os
 import queue
 import sys
@@ -61,6 +62,32 @@ def _make_zip(files: list[str]) -> str:
     return zip_path
 
 
+def check_existing_progress(book_title):
+    if not book_title or not book_title.strip():
+        return ""
+    import json
+    import re
+    # We must sanitize the book title just like in on_generate to get the output dir
+    sanitized_book_title = re.sub(r'[\\/*?:"<>|]', "", book_title)
+    prog_path = os.path.join(_OUTPUT_DIR, sanitized_book_title, "generation_progress.json")
+    if os.path.exists(prog_path):
+        try:
+            with open(prog_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            chapters = data.get("chapters", [])
+            completed = sum(1 for c in chapters if c.get("status") in ("completed", "complete"))
+            total = len(chapters)
+            return (
+                f"### 🔄 Existing Progress Found!\n"
+                f"- **Book Title:** {data.get('book_title', book_title)}\n"
+                f"- **Progress:** {completed} / {total} chapters generated ({float(completed)/total*100:.1f}%)\n"
+                f"Generation will automatically resume from the last completed chapter."
+            )
+        except Exception as e:
+            return f"⚠️ Found progress file but failed to read it: {e}"
+    return ""
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Gradio App
 # ══════════════════════════════════════════════════════════════════════════════
@@ -109,6 +136,7 @@ def build_app():
                         )
                         book_title_box  = gr.Textbox(label="Book title", interactive=True)
                         book_author_box = gr.Textbox(label="Author", interactive=True)
+                        existing_progress_info = gr.Markdown("")
 
                 # ── EPUB / MOBI: chapter checklist ───────────────────────────
                 with gr.Group(visible=False) as epub_panel:
@@ -325,10 +353,18 @@ def build_app():
                     lufs_adv        = gr.Slider(label="True peak (dBTP)",           minimum=-6,   maximum=-0.5, value=-1.5, step=0.1)
                 with gr.Row():
                     worker_count_sl = gr.Slider(
-                        label="Parallel chapter workers",
-                        info="Process multiple chapters simultaneously. Keep at 1 if VRAM is limited.",
+                        label="Parallel workers count",
+                        info="Number of parallel workers. For 'chunks' mode, process chunks of the same chapter at once.",
                         minimum=1, maximum=4, value=1, step=1,
                     )
+                    parallel_mode_dd = gr.Dropdown(
+                        label="Parallelism level",
+                        choices=["chapters", "chunks"],
+                        value="chunks",
+                        info="chapters: process multiple chapters at once (high VRAM). chunks: process chunks of the same chapter at once (recommended).",
+                        interactive=True,
+                    )
+                with gr.Row():
                     tts_provider_dd = gr.Dropdown(
                         label="TTS Provider",
                         choices=["qwen"],
@@ -347,6 +383,14 @@ def build_app():
                     file_types=[".txt"],
                     file_count="single",
                 )
+                gr.Markdown("#### Resume / Sync Progress")
+                gr.HTML('<div class="warn-box">ℹ️ Upload an existing <code>generation_progress.json</code> file to resume progress. Uploading will automatically pre-fill the Book title.</div>')
+                progress_file_upload = gr.File(
+                    label="Upload existing generation_progress.json",
+                    file_types=[".json"],
+                    file_count="single",
+                )
+                progress_upload_status = gr.Markdown("")
 
             # ═══════════════════════════════════════════════════════════════ #
             # TAB 5 — GENERATE                                                #
@@ -362,6 +406,8 @@ def build_app():
                 with gr.Row():
                     single_file_mode = gr.Checkbox(label="📦 Combine into single file", value=False)
                     export_lrc_chk   = gr.Checkbox(label="📜 Generate timed LRC lyrics", value=True)
+                    export_srt_chk   = gr.Checkbox(label="🎬 Generate SRT subtitles", value=False)
+                    export_vtt_chk   = gr.Checkbox(label="WebVTT Generate WebVTT subtitles", value=False)
 
                 preview_table = gr.Dataframe(
                     headers=["#", "Chapter", "Chars", "Words", "Sentences"],
@@ -701,16 +747,16 @@ def build_app():
             temp, top_p, pause, para_pause,
             max_len, true_peak,
             epub_ocr, force_repro,
-            worker_count, export_text, pron_file_obj, tts_provider,
+            worker_count, parallel_mode, export_text, pron_file_obj, progress_file_obj, tts_provider,
             mname, timbre, instruct,
-            single_file, export_lrc,
+            single_file, export_lrc, export_srt, export_vtt,
             progress=gr.Progress(track_tqdm=False)
         ):
             if file_obj is None:
-                yield "⚠️ Please upload a book file first.", gr.update(visible=False), []
+                yield "⚠️ Please upload a book file first.", gr.update(visible=False), gr.update(visible=False), [], None
                 return
             if ("Base" in mname) and not voice_path:
-                yield "⚠️ Please set a narrator voice in the Voice Studio tab for Base models.", gr.update(visible=False), []
+                yield "⚠️ Please set a narrator voice in the Voice Studio tab for Base models.", gr.update(visible=False), gr.update(visible=False), [], None
                 return
 
             path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
@@ -760,6 +806,17 @@ def build_app():
             )
             os.makedirs(book_out, exist_ok=True)
 
+            # If a progress JSON file was uploaded, copy/overwrite it in the output directory
+            if progress_file_obj is not None:
+                uploaded_progress_path = progress_file_obj.name if hasattr(progress_file_obj, "name") else str(progress_file_obj)
+                try:
+                    dest_progress_path = os.path.join(book_out, "generation_progress.json")
+                    import shutil
+                    shutil.copy2(uploaded_progress_path, dest_progress_path)
+                    print(f"[UI] Progress file uploaded. Copied to {dest_progress_path}")
+                except Exception as e:
+                    print(f"[UI] Failed to copy uploaded progress file: {e}")
+
             cfg = AudiobookConfig(
                 book_title=book_title,
                 author=author,
@@ -777,6 +834,7 @@ def build_app():
                 true_peak=true_peak,
                 force_reprocess=force_repro,
                 worker_count=int(worker_count),
+                parallel_mode=parallel_mode,
                 export_text=bool(export_text),
                 pronunciation_map=pron_map,
                 tts_provider_name=tts_provider or "qwen",
@@ -784,7 +842,9 @@ def build_app():
                 tts_timbre=timbre.split()[-1] if timbre else "",
                 tts_instruct=instruct,
                 single_file_mode=single_file,
-                export_lrc=export_lrc
+                export_lrc=export_lrc,
+                export_srt=export_srt,
+                export_vtt=export_vtt
             )
 
             log_q  = queue.Queue()
@@ -842,20 +902,25 @@ def build_app():
                         out_files = [p for p in paths.split(",") if p and os.path.exists(p)]
                         break
                     log_text += msg + "\n"
-                    yield log_text, prog_html_str, gr.update(visible=False), []
+                    yield log_text, prog_html_str, gr.update(visible=False), [], cancel
                 except queue.Empty:
-                    yield log_text, prog_html_str, gr.update(visible=False), []
+                    yield log_text, prog_html_str, gr.update(visible=False), [], cancel
 
             final_prog_html = '<div style="text-align: center; margin-bottom: 5px; font-weight: bold;">Generation Progress: 100.00%</div><progress value="100" max="100" style="width:100%; height:25px;"></progress>'
             if out_files:
+                prog_json_path = os.path.join(book_out, "generation_progress.json")
+                files_to_show = list(out_files)
+                if os.path.exists(prog_json_path):
+                    files_to_show.append(prog_json_path)
                 yield (
                     log_text + "\n✅ Generation complete!",
                     final_prog_html,
                     gr.update(visible=True),
-                    out_files,
+                    files_to_show,
+                    cancel
                 )
             else:
-                yield log_text + "\n⚠️ No output files generated.", final_prog_html, gr.update(visible=False), []
+                yield log_text + "\n⚠️ No output files generated.", final_prog_html, gr.update(visible=False), [], cancel
 
         generate_btn.click(
             on_generate,
@@ -867,11 +932,48 @@ def build_app():
                 temp_slider, topp_slider, sent_pause_sl, para_pause_sl,
                 max_len_sl, lufs_adv,
                 epub_ocr_chk, force_repro_chk,
-                worker_count_sl, export_text_chk, pronunciation_file, tts_provider_dd,
+                worker_count_sl, parallel_mode_dd, export_text_chk, pronunciation_file, progress_file_upload, tts_provider_dd,
                 tts_model_name, tts_timbre, tts_instruct,
-                single_file_mode, export_lrc_chk
+                single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk
             ],
-            outputs=[log_box, prog_html, download_col, download_files],
+            outputs=[log_box, prog_html, download_col, download_files, cancel_state],
+        )
+
+        # ── Auto-Sync & Progress Listeners ────────────────────────────────────
+        book_title_box.change(
+            check_existing_progress,
+            inputs=[book_title_box],
+            outputs=[existing_progress_info]
+        )
+
+        def on_progress_upload(file_obj):
+            if file_obj is None:
+                return "", gr.update()
+            path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                title = data.get("book_title", "")
+                chapters = data.get("chapters", [])
+                completed = sum(1 for c in chapters if c.get("status") in ("completed", "complete"))
+                total = len(chapters)
+                msg = (
+                    f"### ✅ Progress File Loaded Successfully!\n"
+                    f"- **Book:** {title}\n"
+                    f"- **Total Chapters:** {total}\n"
+                    f"- **Completed Chunks/Chapters:** {completed}\n"
+                    f"The Book title has been set to match the progress file."
+                )
+                if title:
+                    return msg, gr.update(value=title)
+                return msg, gr.update()
+            except Exception as e:
+                return f"❌ Failed to parse progress file: {e}", gr.update()
+
+        progress_file_upload.upload(
+            on_progress_upload,
+            inputs=[progress_file_upload],
+            outputs=[progress_upload_status, book_title_box]
         )
 
         # ── Cancel ────────────────────────────────────────────────────────────
@@ -919,4 +1021,5 @@ if __name__ == "__main__":
         show_error=True,
         theme=_THEME,
         css=_CSS,
+        allowed_paths=[_ROOT],
     )

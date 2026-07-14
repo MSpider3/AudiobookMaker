@@ -28,23 +28,12 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 
 ---
 
-> [!NOTE]
-> 🚫 **The Voice Preprocessing tab** (#-%F0%9F%8E%A7-voice-preprocessing-tab--7-step-audio-cleaning) **is currently unavailable. Please avoid using this feature until a fix is released.**
->
-> ✅ All other features are functioning as expected.
->
-> 🎧 For now, please perform voice preprocessing manually until this issue is resolved.
-
-
----
-
-
 ## 🖥️ UI Preview
 
 ### 📚 Book Tab — Upload & Chapter Selection
 ![Book Tab](docs/preview/01_book_tab.png)
 
-### 🎧 Voice Preprocessing Tab — 7-Step Audio Cleaning 
+### 🎧 Voice Preprocessing Tab — 7-Step Audio Cleaning
 ![Voice Preprocessing Tab](docs/preview/02_voice_preprocessing_tab.png)
 
 ### 🎙️ Voice Studio Tab — Clone & Test Voice
@@ -55,8 +44,6 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 
 ### 🚀 Generate Tab — Live Log & Download
 ![Generate Tab](docs/preview/05_generate_tab.png)
-
-FYI: Ok, I know adding antigravity taken ss is not a good idea, but I am too lazy to take ss myself when antigravity already took them for me during the testing.
 
 ---
 
@@ -280,6 +267,14 @@ Edit `audiobook_factory/voice_preprocessor.py`:
 3. Each chapter file has the correct **ID3 metadata** (title, author, album, track number) so chapter ordering and library display work correctly out of the box
 
 Output filenames follow the `{NNNN}_{Chapter_Title}.mp3` format Audiobookshelf expects.
+
+---
+
+## 🔒 Security & Local File Access
+
+Modern versions of Gradio implement sandbox security checks that restrict browsers from loading server-generated files directly. To ensure seamless operation, AudiobookMaker automatically whitelists the project root directory using `allowed_paths=[_ROOT]` inside `app.py`. This enables:
+- Transferring processed audio from the **Voice Preprocessing** tab directly to the **Voice Studio** tab without errors.
+- Viewing and downloading final generated output audio/ZIP chapter packages directly from the web interface.
 
 ---
 

@@ -284,7 +284,8 @@ def _formant_shift(
 
     # Lifter — zero out high-quefrency components
     q = max(1, int(quefrency * sr / 1000))
-    cepstrum[q : n - q] = 0.0
+    if q < n // 2:
+        cepstrum[q : n - q] = 0.0
 
     # Envelope
     envelope = np.exp(np.real(fft(cepstrum)))
