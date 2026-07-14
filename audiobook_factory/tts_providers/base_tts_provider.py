@@ -45,6 +45,26 @@ class BaseTTSProvider(ABC):
     def synthesize(self, text: str, voice_ref: str, out_path: str) -> None:
         """Generate speech for *text* and save WAV to *out_path*."""
 
+    def synthesize_batch(self, texts: list[str], voice_refs: list[str], out_paths: list[str]) -> list[float]:
+        """
+        Synthesize a batch of texts.
+        Subclasses should override this if they support native batching (like Qwen3-TTS).
+        """
+        import os
+        import soundfile as sf
+        durations = []
+        for text, voice_ref, out_path in zip(texts, voice_refs, out_paths):
+            self.synthesize(text, voice_ref, out_path)
+            dur = 0.0
+            if os.path.exists(out_path):
+                try:
+                    with sf.SoundFile(out_path) as f:
+                        dur = f.frames / f.samplerate
+                except Exception:
+                    pass
+            durations.append(dur)
+        return durations
+
     @abstractmethod
     def estimate_cost(self, total_chars: int) -> float:
         """Estimated USD cost for *total_chars* characters. 0.0 = free."""

@@ -449,43 +449,34 @@ def _process_chapter(
         use_parallel_chunks = (getattr(config, "parallel_mode", "chunks") == "chunks" and config.worker_count > 1)
 
         if use_parallel_chunks:
-            completed_chunks = 0
-            chunk_lock = threading.Lock()
-
-            def _synth_worker(i: int, chunk_text: str):
-                nonlocal completed_chunks
+            batch_size = config.worker_count
+            for batch_start in range(0, len(tts_jobs), batch_size):
                 if cancel.is_cancelled:
-                    return
-                out_wav = os.path.join(temp_dir, f"s_{i:04d}.wav")
+                    break
+                
+                batch_end = min(batch_start + batch_size, len(tts_jobs))
+                batch_texts = tts_jobs[batch_start:batch_end]
+                batch_voice_refs = [config.voice_file] * len(batch_texts)
+                batch_out_paths = [os.path.join(temp_dir, f"s_{i:04d}.wav") for i in range(batch_start, batch_end)]
+                
                 try:
-                    provider.synthesize(chunk_text, config.voice_file, out_wav)
-                    chunk_paths[i] = out_wav
-                    if config.export_lrc:
-                        chunk_durations[i] = _get_wav_duration(out_wav)
+                    durations = provider.synthesize_batch(batch_texts, batch_voice_refs, batch_out_paths)
+                    for idx_chunk, out_wav in enumerate(batch_out_paths):
+                        i = batch_start + idx_chunk
+                        chunk_paths[i] = out_wav
+                        if config.export_lrc:
+                            chunk_durations[i] = durations[idx_chunk]
                 except Exception as e:
                     import traceback
                     error_trace = traceback.format_exc()
-                    log(f"  [Ch{idx}] chunk {i} failed: {e}")
+                    log(f"  [Ch{idx}] Batch starting at chunk {batch_start} failed: {e}")
                     log(f"  [Ch{idx}] Traceback saved to chapter output dir.")
-                    err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_{i}.txt")
+                    err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_batch_{batch_start}.txt")
                     with open(err_log_path, "w", encoding="utf-8") as err_f:
                         err_f.write(error_trace)
                 
-                with chunk_lock:
-                    completed_chunks += 1
-                    if prog_cb:
-                        prog_cb(completed_chunks / len(tts_jobs))
-
-            with ThreadPoolExecutor(max_workers=config.worker_count) as pool:
-                futures = {pool.submit(_synth_worker, i, txt): i for i, txt in enumerate(tts_jobs)}
-                for fut in as_completed(futures):
-                    if cancel.is_cancelled:
-                        pool.shutdown(wait=False, cancel_futures=True)
-                        break
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        log(f"  [Ch{idx}] Unexpected error in chunk thread: {e}")
+                if prog_cb:
+                    prog_cb(batch_end / len(tts_jobs))
         else:
             for i, chunk_text in enumerate(tts_jobs):
                 if cancel.is_cancelled:

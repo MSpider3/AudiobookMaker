@@ -99,6 +99,84 @@ class QwenTTSProvider(BaseTTSProvider):
                     continue
                 raise
 
+    def synthesize_batch(self, texts: list[str], voice_refs: list[str], out_paths: list[str]) -> list[float]:
+        import soundfile as sf
+        import torch
+
+        durations = [0.0] * len(texts)
+        if not texts:
+            return durations
+
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                with self._lock:
+                    self._ensure_initialised()
+
+                    model_type = getattr(self._model.model, "tts_model_type", "base")
+                    languages = [getattr(self.config, "language", "English")] * len(texts)
+
+                    if model_type == "base":
+                        voice_files = [vr or self.config.voice_file for vr in voice_refs]
+                        wav_data_list, sr = self._model.generate_voice_clone(
+                            text=texts,
+                            language=languages,
+                            ref_audio=voice_files,
+                            x_vector_only_mode=True,
+                            temperature=self.config.temperature,
+                            top_p=self.config.top_p,
+                        )
+                    elif model_type == "custom_voice":
+                        speakers = [self.config.tts_timbre or "serena"] * len(texts)
+                        instructs = [self.config.tts_instruct] * len(texts)
+                        wav_data_list, sr = self._model.generate_custom_voice(
+                            text=texts,
+                            speaker=speakers,
+                            language=languages,
+                            instruct=instructs,
+                            temperature=self.config.temperature,
+                            top_p=self.config.top_p,
+                        )
+                    elif model_type == "voice_design":
+                        instructs = [self.config.tts_instruct] * len(texts)
+                        wav_data_list, sr = self._model.generate_voice_design(
+                            text=texts,
+                            instruct=instructs,
+                            language=languages,
+                            temperature=self.config.temperature,
+                            top_p=self.config.top_p,
+                        )
+                    else:
+                        raise ValueError(f"Unknown model type: {model_type}")
+
+                    processed_wavs = []
+                    for wav_data in wav_data_list:
+                        audio = wav_data[0] if isinstance(wav_data, (list, tuple)) else wav_data
+                        if hasattr(audio, "ndim") and audio.ndim > 1:
+                            audio = audio[0]
+                        if isinstance(audio, torch.Tensor):
+                            audio = audio.cpu().float().numpy()
+                        processed_wavs.append(audio)
+
+                # ── Save WAV files outside the lock ──
+                for i, (audio, out_path) in enumerate(zip(processed_wavs, out_paths)):
+                    sf.write(out_path, audio, sr)
+                    durations[i] = len(audio) / sr
+                
+                return durations
+
+            except torch.cuda.OutOfMemoryError as e:
+                print("    [QwenTTS] CUDA OOM encountered during batch synthesis. Attempting recovery...")
+                self.cleanup()
+                raise RuntimeError("CUDA Out of Memory in batch synthesis. Try reducing worker_count (batch size).") from e
+            except Exception as e:
+                if attempt < max_retries:
+                    print(f"    [QwenTTS] Batch synthesis failed ({e}). Retrying ({attempt+1}/{max_retries})...")
+                    import time
+                    time.sleep(1)
+                    continue
+                raise
+
     def cleanup(self) -> None:
         import torch
         import gc
