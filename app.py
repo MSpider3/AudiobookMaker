@@ -999,11 +999,47 @@ def build_app():
                                 cancel.task_id = task_id
                                 log_q.put(f"✅ Enqueued task successfully. Task ID: {task_id}")
                                 
-                                asyncio.run(listen_ws(task_id, log_q, prog_q))
+                                # Listen to WebSocket stream — errors here do NOT mean
+                                # generation failed; the backend is still running.
+                                try:
+                                    asyncio.run(listen_ws(task_id, log_q, prog_q))
+                                except Exception as ws_err:
+                                    # WebSocket dropped but the API task is still alive.
+                                    # Poll for completion instead of re-running locally.
+                                    log_q.put(f"⚠️ [WebSocket] Stream interrupted ({ws_err}). Polling API for completion...")
+                                    import time
+                                    while True:
+                                        try:
+                                            poll = requests.get(f"http://127.0.0.1:8000/api/v1/tasks/{task_id}", timeout=5)
+                                            if poll.ok:
+                                                st = poll.json()
+                                                if st["status"] == "completed":
+                                                    paths = ",".join(st.get("output_files", []))
+                                                    log_q.put(f"__DONE__::{paths}")
+                                                    break
+                                                elif st["status"] in ("failed", "cancelled"):
+                                                    log_q.put(f"❌ API task {st['status']}.")
+                                                    log_q.put("__DONE__::")
+                                                    break
+                                        except Exception:
+                                            pass
+                                        time.sleep(3)
                             except Exception as e:
-                                log_q.put(f"⚠️ API dispatch failed: {e}. Falling back to local generation...")
-                                out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
-                                log_q.put(f"__DONE__::{','.join(out_files)}")
+                                # Only fall back locally if the task was NEVER enqueued
+                                # (i.e., the error occurred before we got a task_id)
+                                if not getattr(cancel, "task_id", None):
+                                    log_q.put(f"⚠️ API dispatch failed: {e}. Falling back to local generation...")
+                                    out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
+                                    log_q.put(f"__DONE__::{','.join(out_files)}")
+                                else:
+                                    # Task was enqueued — cancel it cleanly so we don't
+                                    # have an orphaned GPU job and a local duplicate running.
+                                    log_q.put(f"⚠️ API error after task enqueue: {e}. Cancelling API task to avoid duplication.")
+                                    try:
+                                        requests.post(f"http://127.0.0.1:8000/api/v1/tasks/{cancel.task_id}/cancel", timeout=3)
+                                    except Exception:
+                                        pass
+                                    log_q.put("__DONE__::")
                         else:
                             out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
                             log_q.put(f"__DONE__::{','.join(out_files)}")
