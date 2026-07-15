@@ -216,6 +216,22 @@ with open('requirements.txt') as f:
 PYEOF
 success "All dependencies installed"
 
+# ── Step 4.5: Compile Rust Extension ──────────────────────────────────────────
+header "Step 4.5 — Building Rust acceleration extension"
+
+if command -v cargo &>/dev/null; then
+    info "Rust toolchain detected. Installing maturin and building audiobook_rust..."
+    pip install maturin --quiet
+    if maturin develop -r --manifest-path audiobook_rust/Cargo.toml; then
+        success "audiobook_rust compiled and installed successfully"
+    else
+        warn "Rust build failed. The app will fall back to legacy Python pipeline"
+    fi
+else
+    warn "Rust toolchain (cargo) not found. The app will run using the legacy Python fallback pipeline"
+    warn "To enable 5.5x faster audio mastering, install Rust from: https://rustup.rs"
+fi
+
 # ── Step 5: Install FFmpeg if missing ─────────────────────────────────────────
 header "Step 5 — Checking FFmpeg"
 

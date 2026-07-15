@@ -55,3 +55,11 @@ sentencex           # Language-aware sentence segmentation (text splitting befor
 chardet             # Encoding detection for TXT files
 pydub               # High-level audio manipulation fallback
 tensorboard         # Sometimes required by transformers logging
+maturin             # Build and publish Rust crates in python venv
+
+# ── API / Orchestration Server ────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+websockets
+
+

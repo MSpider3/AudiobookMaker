@@ -144,6 +144,24 @@ if !ERRORLEVEL! NEQ 0 (
 echo [OK]    All dependencies installed.
 echo.
 
+:: ── Step 4.5: Compile Rust Extension ─────────────────────────────────────────
+echo [Step 4.5] Building Rust acceleration extension...
+cargo --version >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo [INFO]  Rust toolchain detected. Installing maturin and building audiobook_rust...
+    pip install maturin --quiet
+    maturin develop -r --manifest-path audiobook_rust/Cargo.toml
+    if !ERRORLEVEL! EQU 0 (
+        echo [OK]    audiobook_rust compiled and installed successfully.
+    ) else (
+        echo [WARN]  Rust build failed. The app will fall back to legacy Python pipeline.
+    )
+) else (
+    echo [WARN]  Rust toolchain (cargo) not found. The app will run using the legacy Python fallback pipeline.
+    echo         To enable 5.5x faster audio mastering, install Rust from: https://rustup.rs/
+)
+echo.
+
 :: ── Step 5: Check FFmpeg ─────────────────────────────────────────────────────
 echo [Step 5] Checking FFmpeg...
 

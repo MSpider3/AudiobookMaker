@@ -8,12 +8,23 @@ try:
 except LookupError:
     nltk.download('punkt', quiet=True)
 
+try:
+    import audiobook_rust
+    _RUST_AVAILABLE = True
+except ImportError:
+    _RUST_AVAILABLE = False
+
 def normalize_text(text):
     """
     Sanitizes text *before* splitting.
     1. Fixes 'De-wrapping' (broken line breaks mid-sentence).
     2. Merges Drop Caps (e.g. "T" + "HERE" -> "THERE").
     """
+    if _RUST_AVAILABLE:
+        return audiobook_rust.normalize_text(text)
+    return _python_normalize_text(text)
+
+def _python_normalize_text(text):
     # 1. De-wrapping: Join lines if they don't look like distinct paragraphs.
     # Logic: If a line ends with non-punctuation and next starts with lowercase, it's a broken wrap.
     # Ex: "he is about to come, we\nwill prepare" -> "he is about to come, we will prepare"
@@ -43,9 +54,9 @@ def smart_sentence_splitter(text, max_len=399):
     Level 2: NLTK Sentences
     Level 3: Soft Split on Punctuation (if sentence > max_len)
     """
-    # 0. Normalize first
-    # (Optional: caller might have already normalized, but doing it again is cheap)
-    
+    if _RUST_AVAILABLE:
+        return audiobook_rust.split_sentences(text, max_len)
+        
     paragraphs = text.split('\n\n')
     final_chunks = []
 

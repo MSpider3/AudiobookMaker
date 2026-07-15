@@ -481,6 +481,13 @@ class TextNormalizer:
                 if repaired != ocr_txt:
                     text = text.replace(ocr_txt, repaired, 1)
 
+        # Try Rust compiled clean pipeline first for speed
+        try:
+            import audiobook_rust
+            return audiobook_rust.clean_text(text, title, is_pdf)
+        except ImportError:
+            pass
+
         # 2. PDF-specific noise (headers, footers, garbled OCR images)
         if is_pdf:
             text = self._strip_pdf_noise(text)

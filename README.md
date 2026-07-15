@@ -24,6 +24,8 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 - **Audiobookshelf-compatible output** — Zero-padded filenames + full ID3 tags (title, author, album, track) ready to drop into Audiobookshelf.
 - **Mastered Output & Single File Mode** — Output mastered MP3, FLAC, WAV, or M4B files. Optionally combine all chapters into a massive single unified file with one click.
 - **Live generation log & Decimal Progress** — Stream progress in real time with a **sub-chapter decimal progress bar** (e.g. 74.52%) and detailed live logs.
+- **FastAPI / WebSocket Orchestration Server** — Offloads heavy GPU jobs from Gradio to a detached FastAPI backend. Protects GPU VRAM limits via a sequential task queue while providing real-time log and rendering progress updates via WebSockets.
+- **`torch.compile()` Speed Optimization** — Enable kernel fusion rendering to compile Qwen3 TTS model via the GPU compiler, speeding up audio generation throughput on RTX GPUs.
 - **Modular TTS provider system** — Qwen3-TTS built-in; optimized with **Flash Attention 2** and async processing to keep your GPU at peak utilization.
 
 ---
@@ -55,6 +57,7 @@ AudiobookMaker/
 ├── run.sh / run.bat                 ← Start app + open browser automatically
 ├── app.py                           ← Gradio UI entry point
 ├── requirements.txt
+├── audiobook_rust/                  ← Rust PyO3 extension for SIMD sentence splitting and audio mastering
 ├── docs/
 │   └── preview/                     ← UI screenshots
 └── audiobook_factory/
@@ -62,13 +65,11 @@ AudiobookMaker/
     │                                   (DocumentIngestor, MLClassifier, TextNormalizer)
     ├── text_extractor.py            ← Public API: scan() + extract()
     ├── voice_preprocessor.py        ← 7-step voice audio cleaning pipeline
-    ├── pipeline.py                  ← Thread-safe audiobook generation orchestrator
-    ├── audio_processor.py           ← Backward-compat shim (delegates to tts_providers)
+    ├── pipeline.py                  ← Thread-safe audiobook generation orchestrator (uses audiobook_rust)
     ├── filename_sanitizer.py        ← Cross-platform, Audiobookshelf-compatible filenames
     ├── story_analyzer.py            ← BookNLP story/character analysis
     ├── text_processing.py           ← Sentence splitting + text normalization
     ├── ffmpeg_utils.py              ← FFmpeg encoding helpers
-    ├── config.py                    ← AudiobookConfig dataclass
     ├── utils.py                     ← Shared utilities
     └── tts_providers/               ← Modular TTS provider abstraction
         ├── base_tts_provider.py     ← BaseTTSProvider ABC + get_tts_provider() factory
@@ -101,6 +102,7 @@ The installer automatically:
 - Creates a **virtual environment**
 - Detects your **GPU** and installs the correct PyTorch (CUDA 12.1, CUDA 11.8, or CPU)
 - Installs all **dependencies** from `requirements.txt`
+- Detects if the **Rust toolchain (cargo)** is installed, compiling the high-performance PyO3 extension (`audiobook_rust`) in release mode (with fallback to pure Python if Rust is not present)
 - Installs **FFmpeg** if missing
 
 ### Windows

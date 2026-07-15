@@ -32,6 +32,12 @@ import numpy as np
 import soundfile as sf
 
 # ── project root & temp folder ────────────────────────────────────────────────
+try:
+    import audiobook_rust
+    _has_rust = True
+except ImportError:
+    _has_rust = False
+
 _ROOT = Path(__file__).resolve().parent.parent
 _TEMP_DIR = _ROOT / "temp"
 _TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,6 +63,7 @@ class AudiobookConfig:
     author:              str   = "Unknown Author"
     language:            str   = "English"
     cover_image:         str | None = None
+    book_path:           str   = ""
 
     # ── Output ────────────────────────────────────────────────────────────────
     output_dir:          str   = "./output"
@@ -108,6 +115,7 @@ class AudiobookConfig:
     # ── Misc ──────────────────────────────────────────────────────────────────
     force_reprocess:     bool  = False
     sample_rate:         int   = 24000
+    torch_compile:       bool  = False
 
 
 
@@ -246,8 +254,46 @@ def run_pipeline(
 
     # We only initialize with the output path first, then copy to temp
     chapters_data = [{"num": i, "title": ch.title} for i, ch in tasks]
-    progress_data = load_or_create_progress_file(prog_path_out, chapters_data, config.book_title)
     
+    # Convert config dataclass to dict for settings
+    from dataclasses import asdict
+    settings_dict = {}
+    try:
+        # Ignore fields that are not JSON serializable or too large
+        for k, v in asdict(config).items():
+            if k not in ("pronunciation_map",):
+                settings_dict[k] = v
+    except Exception as e:
+        print(f"Error serializing config: {e}")
+
+    progress_data = load_or_create_progress_file(
+        prog_path_out,
+        chapters_data,
+        config.book_title,
+        book_path=getattr(config, "book_path", ""),
+        voice_file=getattr(config, "voice_file", ""),
+        settings=settings_dict
+    )
+
+    # Ensure settings, book_path, voice_file are up to date in the progress data
+    dirty = False
+    if "book_path" not in progress_data or not progress_data["book_path"]:
+        progress_data["book_path"] = getattr(config, "book_path", "")
+        dirty = True
+    if "voice_file" not in progress_data or not progress_data["voice_file"]:
+        progress_data["voice_file"] = getattr(config, "voice_file", "")
+        dirty = True
+    if "settings" not in progress_data or not progress_data["settings"]:
+        progress_data["settings"] = settings_dict
+        dirty = True
+        
+    if dirty:
+        try:
+            with open(prog_path_out, "w", encoding="utf-8") as f:
+                json.dump(progress_data, f, indent=4)
+        except Exception as e:
+            print(f"Error writing updated progress json settings: {e}")
+            
     # Sync to temp for user visibility
     try:
         with open(prog_path_tmp, "w", encoding="utf-8") as f:
@@ -449,7 +495,9 @@ def _process_chapter(
         use_parallel_chunks = (getattr(config, "parallel_mode", "chunks") == "chunks" and config.worker_count > 1)
 
         if use_parallel_chunks:
-            batch_size = config.worker_count
+            # Batch size for GPU inference — can be larger than worker_count
+            # since batched TTS runs in a single model forward pass
+            batch_size = max(config.worker_count, 4)
             for batch_start in range(0, len(tts_jobs), batch_size):
                 if cancel.is_cancelled:
                     break
@@ -557,68 +605,124 @@ def _process_chapter(
             except Exception as e:
                 log(f"  [Ch{idx}] WebVTT export failed: {e}")
 
-        # ── Build filelist for FFmpeg concat ──────────────────────────────────
+        # ── In-memory audio mastering (Rust first, Python fallback) ───────────
         if not any(chunk_paths):
             log(f"  [Ch{idx}] ❌ No audio chunks generated successfully. Skipping.")
             return None
 
-        sent_pause_path = os.path.join(temp_dir, "pause_sent.wav")
-        sf.write(
-            sent_pause_path,
-            np.zeros(int(config.pause * config.sample_rate)),
-            config.sample_rate,
-        )
-
-        filelist_path = os.path.join(temp_dir, "filelist.txt")
-        with open(filelist_path, "w", encoding="utf-8") as fh:
-            for i, p in enumerate(chunk_paths):
-                if p and os.path.exists(p):
-                    fh.write(f"file '{os.path.basename(p)}'\n")
-                    if i < len(chunk_paths) - 1:
-                        fh.write(f"file '{os.path.basename(sent_pause_path)}'\n")
-
-        # ── FFmpeg: concat raw WAV ────────────────────────────────────────────
-        raw_wav = os.path.join(temp_dir, "raw.wav")
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-             "-i", os.path.basename(filelist_path), "-c", "copy",
-             os.path.basename(raw_wav)],
-            check=True, capture_output=True, cwd=temp_dir,
-        )
-
-        if not os.path.exists(raw_wav) or os.path.getsize(raw_wav) == 0:
-            log(f"  [Ch{idx}] ❌ Failed to create raw audio. Skipping.")
-            return None
-
-        # ── FFmpeg: loudnorm mastering ────────────────────────────────────────
-        master_wav = os.path.join(temp_dir, "master.wav")
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", raw_wav,
-             "-af", f"loudnorm=I={config.lufs}:TP={config.true_peak}:LRA=11",
-             master_wav],
-            check=True, capture_output=True,
-        )
-
-        # ── FFmpeg: encode to final format ────────────────────────────────────
         safe_name  = make_safe_filename(chapter.title, idx, config.output_dir,
                                         f".{config.output_format}")
         out_path   = os.path.join(config.output_dir, safe_name)
+
+        if _has_rust:
+            valid_paths = [p for p in chunk_paths if p and os.path.exists(p)]
+            if not valid_paths:
+                log(f"  [Ch{idx}] ❌ No audio chunks found. Skipping.")
+                return None
+
+            try:
+                bitrate_kbps = getattr(config, "bitrate_kbps", 64)
+                has_cover = bool(config.cover_image and os.path.exists(config.cover_image))
+                use_pure_rust = (config.output_format in ("mp3", "wav")) and not has_cover
+
+                # If pure rust, write directly to final out_path.
+                # If cover image is specified or other container/codec (e.g. flac, m4b) is used,
+                # master to a temporary WAV first and use FFmpeg to do packaging and copy streams.
+                master_target = out_path if use_pure_rust else os.path.join(temp_dir, "mastered.wav")
+
+                audiobook_rust.master_audio(
+                    valid_paths,
+                    master_target,
+                    float(config.pause),
+                    int(config.sample_rate),
+                    float(config.lufs),
+                    float(config.true_peak),
+                    int(bitrate_kbps)
+                )
+
+                log(f"  [Ch{idx}] ⚡ Mastered {len(valid_paths)} segments via Rust to {os.path.basename(master_target)}")
+
+                if not use_pure_rust:
+                    audio_settings, _, _ = get_format_settings(config.output_format)[:3]
+                    ffmpeg_cmd = [
+                        "ffmpeg", "-y",
+                        "-i", master_target,
+                    ]
+                    if has_cover:
+                        ffmpeg_cmd += ["-i", config.cover_image]
+                    
+                    ffmpeg_cmd += audio_settings
+
+                    if has_cover:
+                        ffmpeg_cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy",
+                                       "-disposition:v", "attached_pic", "-id3v2_version", "3"]
+
+                    ffmpeg_cmd += [
+                        "-metadata", f"title={chapter.title}",
+                        "-metadata", f"artist={config.author}",
+                        "-metadata", f"album={config.book_title}",
+                        "-metadata", f"track={idx}",
+                        "-metadata", "genre=Audiobook",
+                        out_path,
+                    ]
+
+                    subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+                
+                return out_path
+
+            except Exception as rust_err:
+                log(f"  [Ch{idx}] ⚠ Rust mastering failed ({rust_err}). Falling back to Python/FFmpeg.")
+
+        # ── Python fallback: In-memory WAV concat ─────────────────────────────
+        # Build the silence pause array once
+        pause_samples = np.zeros(int(config.pause * config.sample_rate), dtype=np.float32)
+
+        # Concatenate all chunk WAVs + pauses in-memory (no disk I/O)
+        audio_segments: list[np.ndarray] = []
+        for i, p in enumerate(chunk_paths):
+            if p and os.path.exists(p):
+                try:
+                    chunk_audio, _ = sf.read(p, dtype="float32")
+                    audio_segments.append(chunk_audio)
+                    if i < len(chunk_paths) - 1:
+                        audio_segments.append(pause_samples)
+                except Exception:
+                    pass  # skip corrupt chunks
+
+        if not audio_segments:
+            log(f"  [Ch{idx}] ❌ No valid audio segments. Skipping.")
+            return None
+
+        raw_audio = np.concatenate(audio_segments)
+        log(f"  [Ch{idx}] Concatenated {len(audio_segments)} segments "
+            f"({len(raw_audio)/config.sample_rate:.1f}s) in-memory (python fallback)")
+
+        # ── Single FFmpeg call: loudnorm + encode (piped via stdin) ───────────
         audio_settings, _, _ = get_format_settings(config.output_format)[:3]
 
-        ffmpeg_cmd = ["ffmpeg", "-y", "-i", master_wav]
-        
+        # Build FFmpeg command: read raw PCM from stdin → loudnorm → encode
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-f", "f32le",                       # 32-bit float PCM input
+            "-ar", str(config.sample_rate),       # sample rate
+            "-ac", "1",                           # mono
+            "-i", "pipe:0",                       # read from stdin
+        ]
+
         # Add cover image if exists
         has_cover = False
         if config.cover_image and os.path.exists(config.cover_image):
             ffmpeg_cmd += ["-i", config.cover_image]
             has_cover = True
 
+        # Loudnorm filter (was a separate FFmpeg call before)
+        ffmpeg_cmd += ["-af", f"loudnorm=I={config.lufs}:TP={config.true_peak}:LRA=11"]
+
         ffmpeg_cmd += audio_settings
 
         if has_cover:
-            # Map audio from first input and video/image from second
-            # id3v2_version 3 for better compatibility
-            ffmpeg_cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy", "-disposition:v", "attached_pic", "-id3v2_version", "3"]
+            ffmpeg_cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy",
+                           "-disposition:v", "attached_pic", "-id3v2_version", "3"]
 
         ffmpeg_cmd += [
             "-metadata", f"title={chapter.title}",
@@ -628,8 +732,14 @@ def _process_chapter(
             "-metadata", "genre=Audiobook",
             out_path,
         ]
-        
-        subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+
+        # Pipe raw PCM bytes to FFmpeg stdin (no intermediate files)
+        proc = subprocess.run(
+            ffmpeg_cmd,
+            input=raw_audio.tobytes(),
+            check=True,
+            capture_output=True,
+        )
         return out_path
 
 

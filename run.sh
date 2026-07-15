@@ -37,7 +37,11 @@ fi
 source "$VENV_DIR/bin/activate"
 success "Virtual environment activated"
 
-# ── Start app.py in background ────────────────────────────────────────────────
+# ── Start API backend & app.py in background ───────────────────────────────────
+info "Starting API Orchestration Backend ..."
+python start_api.py &
+API_PID=$!
+
 info "Starting AudiobookMaker on $URL (VRAM-Safe Orchestration Enabled) ..."
 python "$APP" &
 APP_PID=$!
@@ -72,5 +76,5 @@ echo -e "${BOLD}  Press Ctrl+C to stop.${RESET}"
 echo ""
 
 # ── Keep running until user stops it ─────────────────────────────────────────
-trap "kill $APP_PID 2>/dev/null; echo ''; echo 'AudiobookMaker stopped.'" INT TERM
+trap "kill $APP_PID $API_PID 2>/dev/null; echo ''; echo 'AudiobookMaker stopped.'" INT TERM
 wait $APP_PID

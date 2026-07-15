@@ -42,7 +42,10 @@ if not exist "%APP%" (
 call %VENV_DIR%\Scripts\activate.bat
 echo [OK]    Virtual environment activated.
 
-:: ── Launch app.py ─────────────────────────────────────────────────────────────
+:: ── Launch app.py & API Backend ────────────────────────────────────────────────
+echo [INFO]  Launching API Orchestration Backend ...
+start /min "AudiobookMaker API Server" python start_api.py
+
 echo [INFO]  Starting AudiobookMaker on %URL% ...
 echo [INFO]  Press Ctrl+C in this window to stop the server.
 echo.

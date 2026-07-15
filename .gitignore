@@ -83,3 +83,11 @@ tmp/
 temp/
 *.tmp
 abm_ch*/          # Temp chapter processing dirs created by pipeline.py
+test_output_speed/  # Benchmark test output
+
+# ── Rust ──────────────────────────────────────────────────────────────────────
+audiobook_rust/target/
+audiobook_rust/**/*.rs.bk
+Cargo.lock
+.cargo/
+

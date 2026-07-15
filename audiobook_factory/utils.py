@@ -40,7 +40,7 @@ def update_progress_file(progress_path, chapter_num, status):
     with open(progress_path, 'w', encoding='utf-8') as f:
         json.dump(progress_data, f, indent=4)
 
-def load_or_create_progress_file(progress_path, chapters_data, book_title):
+def load_or_create_progress_file(progress_path, chapters_data, book_title, book_path="", voice_file="", settings=None):
     """Loads a progress file if it exists, otherwise creates a new one."""
     if os.path.exists(progress_path):
         print("Found existing progress file. Loading state.")
@@ -50,6 +50,9 @@ def load_or_create_progress_file(progress_path, chapters_data, book_title):
         print("No progress file found. Creating a new one.")
         progress_data = {
             "book_title": book_title,
+            "book_path": book_path,
+            "voice_file": voice_file,
+            "settings": settings or {},
             "chapters": [
                 {"num": c["num"], "title": c["title"], "status": "pending"} for c in chapters_data
             ]

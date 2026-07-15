@@ -37,6 +37,18 @@ from audiobook_factory.pipeline import (
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FastAPI orchestrator healthcheck helper
+# ══════════════════════════════════════════════════════════════════════════════
+def is_api_healthy() -> bool:
+    import requests
+    try:
+        r = requests.get("http://127.0.0.1:8000/api/v1/health", timeout=1.0)
+        return r.status_code == 200 and r.json().get("status") == "ok"
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Shared state (per-session in Gradio, so we use gr.State)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -354,8 +366,8 @@ def build_app():
                 with gr.Row():
                     worker_count_sl = gr.Slider(
                         label="Parallel workers count",
-                        info="Number of parallel workers. For 'chunks' mode, process chunks of the same chapter at once.",
-                        minimum=1, maximum=4, value=1, step=1,
+                        info="Enables batch TTS mode. Higher = larger GPU batches = faster (needs more VRAM). Minimum 2 to enable.",
+                        minimum=1, maximum=8, value=2, step=1,
                     )
                     parallel_mode_dd = gr.Dropdown(
                         label="Parallelism level",
@@ -373,9 +385,10 @@ def build_app():
                         interactive=True,
                     )
                 with gr.Row():
-                    epub_ocr_chk    = gr.Checkbox(label="Enable EasyOCR for EPUB image text", value=False)
-                    force_repro_chk = gr.Checkbox(label="Force re-process (ignore saved progress)", value=False)
-                    export_text_chk = gr.Checkbox(label="Export chapter text as .txt", value=False)
+                    epub_ocr_chk      = gr.Checkbox(label="Enable EasyOCR for EPUB image text", value=False)
+                    force_repro_chk   = gr.Checkbox(label="Force re-process (ignore saved progress)", value=False)
+                    export_text_chk   = gr.Checkbox(label="Export chapter text as .txt", value=False)
+                    torch_compile_chk = gr.Checkbox(label="Enable GPU compile (torch.compile)", value=False)
                 gr.Markdown("#### Pronunciation fixes")
                 gr.HTML('<div class="warn-box">ℹ️ Upload a plain text file with one fix per line: <code>search==replace</code> (regex supported). Lines starting with # are comments.</div>')
                 pronunciation_file = gr.File(
@@ -609,11 +622,44 @@ def build_app():
                 resample=resamp,                 target_sample_rate=int(target_sr),
             )
 
-            with open(raw_audio_path, "rb") as f:
-                in_bytes = f.read()
+            out_bytes = None
+            if is_api_healthy():
+                try:
+                    import requests
+                    url = "http://127.0.0.1:8000/api/v1/preprocess"
+                    with open(raw_audio_path, "rb") as f:
+                        files = {"audio_file": (os.path.basename(raw_audio_path), f, "audio/wav")}
+                        data = {
+                            "noise_reduce": str(noise_reduce).lower(),
+                            "noise_reduce_strength": float(noise_strength),
+                            "noise_gate": str(gate).lower(),
+                            "noise_gate_threshold_db": float(gate_db),
+                            "highpass_filter": str(hp).lower(),
+                            "highpass_cutoff_hz": float(hp_hz),
+                            "silence_removal": str(sil).lower(),
+                            "silence_threshold_db": float(sil_db),
+                            "min_segment_ms": int(sil_min),
+                            "max_silence_kept_ms": int(sil_keep),
+                            "normalize_volume": str(norm).lower(),
+                            "normalize_target_dbfs": float(norm_db),
+                            "formant_shift": str(formant).lower(),
+                            "formant_quefrency": float(quefrency),
+                            "formant_timbre": float(timbre),
+                            "resample": str(resamp).lower(),
+                            "target_sample_rate": int(target_sr)
+                        }
+                        r = requests.post(url, data=data, files=files)
+                        r.raise_for_status()
+                        out_bytes = r.content
+                except Exception as e:
+                    print(f"⚠️ [UI Fallback] Preprocessor API failed: {e}. Running locally.")
 
-            logs = []
-            out_bytes = voice_preprocess(in_bytes, cfg, log_fn=logs.append)
+            if out_bytes is None:
+                with open(raw_audio_path, "rb") as f:
+                    in_bytes = f.read()
+                logs = []
+                out_bytes = voice_preprocess(in_bytes, cfg, log_fn=logs.append)
+
             sr, audio = _bytes_to_gradio_audio(out_bytes)
             return (sr, audio), "✅ Preprocessing complete!", out_bytes
 
@@ -633,17 +679,35 @@ def build_app():
         )
 
         # ── Save processed voice → Voice Studio ──────────────────────────────
-        def save_processed_voice(wav_bytes):
+        def save_processed_voice(wav_bytes, raw_audio_path):
             if wav_bytes is None:
                 return "⚠️ Run preprocessing first.", None
-            save_path = os.path.join(_OUTPUT_DIR, "narrator_voice_processed.wav")
-            with open(save_path, "wb") as f:
-                f.write(wav_bytes)
-            return "✅ Voice saved! You can also load it in Voice Studio →", save_path
+            if not raw_audio_path:
+                # Fallback if raw path is missing
+                save_path = os.path.join(_OUTPUT_DIR, "narrator_voice_processed.wav")
+            else:
+                orig_dir = os.path.dirname(raw_audio_path)
+                orig_name = os.path.splitext(os.path.basename(raw_audio_path))[0]
+                save_path = os.path.join(orig_dir, f"{orig_name}_processed.wav")
+
+            try:
+                with open(save_path, "wb") as f:
+                    f.write(wav_bytes)
+                return f"✅ Voice saved to: {os.path.basename(save_path)} (in original folder)", save_path
+            except Exception as e:
+                # Fallback to output dir if directory is not writable
+                try:
+                    orig_name = os.path.splitext(os.path.basename(raw_audio_path))[0] if raw_audio_path else "narrator_voice"
+                    fallback_path = os.path.join(_OUTPUT_DIR, f"{orig_name}_processed.wav")
+                    with open(fallback_path, "wb") as f:
+                        f.write(wav_bytes)
+                    return f"✅ Saved to fallback output folder: {os.path.basename(fallback_path)}", fallback_path
+                except Exception as ex:
+                    return f"❌ Failed to save: {e} | Fallback failed: {ex}", None
 
         save_voice_btn.click(
             save_processed_voice,
-            inputs=[preproc_state],
+            inputs=[preproc_state, voice_raw_upload],
             outputs=[preprocess_status, voice_studio_upload],
         )
 
@@ -665,7 +729,24 @@ def build_app():
                 tts_timbre=timbre.split()[-1] if timbre else "",
                 tts_instruct=instruct
             )
-            wav_bytes = preview_tts(text, cfg)
+
+            wav_bytes = None
+            if is_api_healthy():
+                try:
+                    import requests
+                    import dataclasses
+                    url = "http://127.0.0.1:8000/api/v1/voice-test"
+                    config_dict = dataclasses.asdict(cfg)
+                    payload = {"config": config_dict, "text": text}
+                    r = requests.post(url, json=payload)
+                    r.raise_for_status()
+                    wav_bytes = r.content
+                except Exception as e:
+                    print(f"⚠️ [UI Fallback] Voice test API failed: {e}. Running locally.")
+
+            if wav_bytes is None:
+                wav_bytes = preview_tts(text, cfg)
+
             if wav_bytes is None:
                 return None, "❌ TTS generation failed — check your voice file and TTS model."
             sr, audio = _bytes_to_gradio_audio(wav_bytes)
@@ -750,6 +831,7 @@ def build_app():
             worker_count, parallel_mode, export_text, pron_file_obj, progress_file_obj, tts_provider,
             mname, timbre, instruct,
             single_file, export_lrc, export_srt, export_vtt,
+            torch_compile,
             progress=gr.Progress(track_tqdm=False)
         ):
             if file_obj is None:
@@ -819,6 +901,7 @@ def build_app():
 
             cfg = AudiobookConfig(
                 book_title=book_title,
+                book_path=path,
                 author=author,
                 language=book_language,
                 cover_image=cover_path,
@@ -844,12 +927,38 @@ def build_app():
                 single_file_mode=single_file,
                 export_lrc=export_lrc,
                 export_srt=export_srt,
-                export_vtt=export_vtt
+                export_vtt=export_vtt,
+                torch_compile=bool(torch_compile)
             )
 
             log_q  = queue.Queue()
             prog_q = queue.Queue()
             cancel = CancelToken()
+
+            async def listen_ws(task_id, log_q, prog_q):
+                import websockets
+                import json
+                url = f"ws://127.0.0.1:8000/api/v1/ws/{task_id}"
+                try:
+                    async with websockets.connect(url) as ws:
+                        while True:
+                            msg = await ws.recv()
+                            data = json.loads(msg)
+                            if data["type"] == "log":
+                                log_q.put(data["message"])
+                            elif data["type"] == "progress":
+                                prog_val = data["progress"]
+                                prog_q.put((int(prog_val * 100), 100))
+                            elif data["type"] == "status":
+                                status = data["status"]
+                                if status in ("failed", "cancelled"):
+                                    break
+                            elif data["type"] == "completed":
+                                paths = ",".join(data["files"])
+                                log_q.put(f"__DONE__::{paths}")
+                                break
+                except Exception as e:
+                    log_q.put(f"⚠️ [WebSocket Error] Disconnected or failed to connect to API server: {e}")
 
             def _runner():
                 try:
@@ -862,9 +971,42 @@ def build_app():
                         log_fn=log_q.put,
                     )
                     if chapters:
-                        # Generate
-                        out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
-                        log_q.put(f"__DONE__::{','.join(out_files)}")
+                        if is_api_healthy():
+                            try:
+                                import requests
+                                import dataclasses
+                                import asyncio
+                                
+                                log_q.put("📡 Dispatching task to FastAPI orchestrator...")
+                                config_dict = dataclasses.asdict(cfg)
+                                chapters_list = [
+                                    {
+                                        "num": ch.num,
+                                        "title": ch.title,
+                                        "text": ch.text,
+                                        "sentences": ch.sentences
+                                    } for ch in chapters
+                                ]
+                                
+                                payload = {
+                                    "config": config_dict,
+                                    "chapters": chapters_list
+                                }
+                                r = requests.post("http://127.0.0.1:8000/api/v1/generate", json=payload)
+                                r.raise_for_status()
+                                task_id = r.json()["task_id"]
+                                
+                                cancel.task_id = task_id
+                                log_q.put(f"✅ Enqueued task successfully. Task ID: {task_id}")
+                                
+                                asyncio.run(listen_ws(task_id, log_q, prog_q))
+                            except Exception as e:
+                                log_q.put(f"⚠️ API dispatch failed: {e}. Falling back to local generation...")
+                                out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
+                                log_q.put(f"__DONE__::{','.join(out_files)}")
+                        else:
+                            out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
+                            log_q.put(f"__DONE__::{','.join(out_files)}")
                     else:
                         log_q.put("__DONE__::")
                 except Exception as e:
@@ -934,7 +1076,8 @@ def build_app():
                 epub_ocr_chk, force_repro_chk,
                 worker_count_sl, parallel_mode_dd, export_text_chk, pronunciation_file, progress_file_upload, tts_provider_dd,
                 tts_model_name, tts_timbre, tts_instruct,
-                single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk
+                single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
+                torch_compile_chk
             ],
             outputs=[log_box, prog_html, download_col, download_files, cancel_state],
         )
@@ -948,38 +1091,137 @@ def build_app():
 
         def on_progress_upload(file_obj):
             if file_obj is None:
-                return "", gr.update()
+                return ["", gr.update()] + [gr.update() for _ in range(26)]
             path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                
                 title = data.get("book_title", "")
+                book_path = data.get("book_path", "")
+                voice_file = data.get("voice_file", "")
+                settings = data.get("settings", {})
+                
+                # Check for existence of book and voice files
+                book_found_msg = ""
+                if book_path:
+                    if os.path.exists(book_path):
+                        book_found_msg = f"  - ✅ Found book file at: `{book_path}`\n"
+                    else:
+                        book_found_msg = f"  - ⚠️ Book file not found at: `{book_path}`\n"
+                
+                voice_found_msg = ""
+                if voice_file:
+                    if os.path.exists(voice_file):
+                        voice_found_msg = f"  - ✅ Found voice file at: `{voice_file}`\n"
+                    else:
+                        voice_found_msg = f"  - ⚠️ Voice file not found at: `{voice_file}`\n"
+
                 chapters = data.get("chapters", [])
                 completed = sum(1 for c in chapters if c.get("status") in ("completed", "complete"))
                 total = len(chapters)
+                
                 msg = (
                     f"### ✅ Progress File Loaded Successfully!\n"
                     f"- **Book:** {title}\n"
                     f"- **Total Chapters:** {total}\n"
-                    f"- **Completed Chunks/Chapters:** {completed}\n"
-                    f"The Book title has been set to match the progress file."
+                    f"- **Completed:** {completed}\n"
+                    f"**Paths Checked:**\n"
+                    f"{book_found_msg}"
+                    f"{voice_found_msg}"
+                    f"Settings and files have been restored to the UI."
                 )
-                if title:
-                    return msg, gr.update(value=title)
-                return msg, gr.update()
+
+                def val(key, default_fallback):
+                    return settings.get(key, default_fallback) if settings else default_fallback
+
+                # Let's map settings values
+                author_val = val("author", "")
+                lang_val = val("language", "English")
+                out_fmt_val = val("output_format", "mp3")
+                lufs_val = val("lufs", -18)
+                temp_val = val("temperature", 0.3)
+                topp_val = val("top_p", 0.8)
+                pause_val = val("pause", 0.5)
+                para_pause_val = val("para_pause", 1.2)
+                
+                mname_val = val("tts_model_name", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+                timbre_val = val("tts_timbre", "[English] ryan")
+                instruct_val = val("tts_instruct", "")
+                
+                max_len_val = val("max_len", 399)
+                true_peak_val = val("true_peak", -1.5)
+                worker_count_val = val("worker_count", 2)
+                parallel_mode_val = val("parallel_mode", "chunks")
+                tts_provider_val = val("tts_provider_name", "qwen")
+                
+                ocr_val = val("docling_ocr", False) or val("epub_ocr", False)
+                force_val = val("force_reprocess", False)
+                exp_txt_val = val("export_text", False)
+                single_file_val = val("single_file_mode", False) or val("single_file", False)
+                exp_lrc_val = val("export_lrc", True)
+                exp_srt_val = val("export_srt", False)
+                exp_vtt_val = val("export_vtt", False)
+                torch_compile_val = val("torch_compile", False)
+
+                return (
+                    msg,
+                    gr.update(value=title) if title else gr.update(),
+                    gr.update(value=book_path) if book_path and os.path.exists(book_path) else gr.update(),
+                    gr.update(value=voice_file) if voice_file and os.path.exists(voice_file) else gr.update(),
+                    gr.update(value=author_val),
+                    gr.update(value=lang_val),
+                    gr.update(value=out_fmt_val),
+                    gr.update(value=lufs_val),
+                    gr.update(value=temp_val),
+                    gr.update(value=topp_val),
+                    gr.update(value=pause_val),
+                    gr.update(value=para_pause_val),
+                    gr.update(value=mname_val),
+                    gr.update(value=timbre_val),
+                    gr.update(value=instruct_val),
+                    gr.update(value=max_len_val),
+                    gr.update(value=true_peak_val),
+                    gr.update(value=worker_count_val),
+                    gr.update(value=parallel_mode_val),
+                    gr.update(value=tts_provider_val),
+                    gr.update(value=ocr_val),
+                    gr.update(value=force_val),
+                    gr.update(value=exp_txt_val),
+                    gr.update(value=single_file_val),
+                    gr.update(value=exp_lrc_val),
+                    gr.update(value=exp_srt_val),
+                    gr.update(value=exp_vtt_val),
+                    gr.update(value=torch_compile_val)
+                )
             except Exception as e:
-                return f"❌ Failed to parse progress file: {e}", gr.update()
+                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(26)]
 
         progress_file_upload.upload(
             on_progress_upload,
             inputs=[progress_file_upload],
-            outputs=[progress_upload_status, book_title_box]
+            outputs=[
+                progress_upload_status, book_title_box, book_file, voice_studio_upload,
+                book_author_box, book_language_dd, output_format, lufs_slider,
+                temp_slider, topp_slider, sent_pause_sl, para_pause_sl, tts_model_name,
+                tts_timbre, tts_instruct, max_len_sl, lufs_adv, worker_count_sl,
+                parallel_mode_dd, tts_provider_dd, epub_ocr_chk, force_repro_chk,
+                export_text_chk, single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
+                torch_compile_chk
+            ]
         )
 
         # ── Cancel ────────────────────────────────────────────────────────────
         def on_cancel(cancel_tok):
             if cancel_tok:
                 cancel_tok.cancel()
+                if hasattr(cancel_tok, "task_id") and cancel_tok.task_id:
+                    try:
+                        import requests
+                        requests.post(f"http://127.0.0.1:8000/api/v1/tasks/{cancel_tok.task_id}/cancel")
+                        print(f"[UI] Cancelled API task: {cancel_tok.task_id}")
+                    except Exception as e:
+                        print(f"[UI] Failed to cancel API task: {e}")
             return "⛔ Cancellation requested..."
 
         cancel_btn.click(on_cancel, inputs=[cancel_state], outputs=[log_box])
