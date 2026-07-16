@@ -3,8 +3,9 @@
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue)
 ![UI](https://img.shields.io/badge/UI-Gradio-orange)
+![Colab](https://img.shields.io/badge/Google%20Colab-Supported-yellow?logo=googlecolab)
 
-An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, clone a narrator voice, clean it up, and generate a chapterized, mastered audiobook — all locally, no cloud APIs needed.
+An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, clone a narrator voice, clean it up, and generate a chapterized, mastered audiobook — all locally or in **Google Colab/.ipynb file**, no cloud APIs needed.
 
 ---
 
@@ -12,6 +13,7 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 
 - **Multi-format book support** — EPUB, MOBI, PDF, DOCX, ODT, TXT
 - **Smart chapter detection** — EPUB/MOBI use a TOC-based chapter checklist; PDF/DOCX/ODT let you split by page ranges
+- **Chapter selection memory** — Selected chapters are saved into `generation_progress.json` and automatically restored when you resume a session — no need to re-select every time.
 - **AI text extraction** — 5-phase pipeline (Docling + OCR + ML classification + heuristic normalization) produces clean, TTS-ready text
 - **EPUB image OCR** — EasyOCR reads text embedded in images inside EPUBs
 - **Voice Design & Cloning** — Clone from a reference WAV or prompt an entire new voice using Qwen3-TTS. Supports **8 languages** (English, Chinese, Japanese, Korean, French, Spanish, Italian, German).
@@ -20,13 +22,16 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 - **Preview mode** — See chapter list with character + word counts before committing to a full audiobook run.
 - **Pronunciation fixes** — Upload a `.txt` file with `search==replace` pairs to fix how the TTS pronounces specific words.
 - **Parallel processing with Shared VRAM** — Process multiple chapters simultaneously using a **Global Shared Provider**. This allows worker counts up to 4 without multiplying VRAM usage, utilizing a thread-safe GPU lock with asynchronous disk I/O for maximum performance.
-- **Synced Lyrics Export** — Automatically generates `.lrc` timed lyrics files perfect for Audiobookshelf syncing. 
+- **Synced Lyrics Export** — Automatically generates `.lrc` timed lyrics files perfect for Audiobookshelf syncing.
 - **Audiobookshelf-compatible output** — Zero-padded filenames + full ID3 tags (title, author, album, track) ready to drop into Audiobookshelf.
 - **Mastered Output & Single File Mode** — Output mastered MP3, FLAC, WAV, or M4B files. Optionally combine all chapters into a massive single unified file with one click.
 - **Live generation log & Decimal Progress** — Stream progress in real time with a **sub-chapter decimal progress bar** (e.g. 74.52%) and detailed live logs.
 - **FastAPI / WebSocket Orchestration Server** — Offloads heavy GPU jobs from Gradio to a detached FastAPI backend. Protects GPU VRAM limits via a sequential task queue while providing real-time log and rendering progress updates via WebSockets.
 - **`torch.compile()` Speed Optimization** — Enable kernel fusion rendering to compile Qwen3 TTS model via the GPU compiler, speeding up audio generation throughput on RTX GPUs.
-- **Modular TTS provider system** — Qwen3-TTS built-in; optimized with **Flash Attention 2** and async processing to keep your GPU at peak utilization.
+- **Smart Attention Backend** — Automatically detects whether `flash_attn` is installed. Uses **Flash Attention 2** if available, otherwise gracefully falls back to PyTorch's built-in **SDPA** — no crashes on T4 or other GPUs that don't have `flash_attn`.
+- **Re-generate missing files control** — New checkbox on the Generate tab lets you decide whether chapters marked "completed" but missing audio should be re-generated or silently skipped.
+- **Modular TTS provider system** — Qwen3-TTS built-in; async processing keeps your GPU at peak utilization.
+- **Google Colab support** — Full end-to-end pipeline works directly in Google Colab via the included `AudiobookMaker_Colab.ipynb` notebook with a public shareable Gradio link.
 
 ---
 
@@ -53,27 +58,32 @@ An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, 
 
 ```
 AudiobookMaker/
-├── install.sh / install.bat         ← One-click installer (detects OS + GPU)
-├── run.sh / run.bat                 ← Start app + open browser automatically
-├── app.py                           ← Gradio UI entry point
+├── install.sh / install.bat              ← One-click installer (detects OS + GPU)
+├── run.sh / run.bat                      ← Start app + open browser automatically
+├── app.py                                ← Gradio UI entry point
+├── start_api.py                          ← FastAPI orchestration server launcher
 ├── requirements.txt
-├── audiobook_rust/                  ← Rust PyO3 extension for SIMD sentence splitting and audio mastering
+├── AudiobookMaker_Colab.ipynb            ← Google Colab notebook (full pipeline, shareable link)
+├── audiobook_rust/                       ← Rust PyO3 extension for SIMD sentence splitting and audio mastering
 ├── docs/
-│   └── preview/                     ← UI screenshots
+│   └── preview/                          ← UI screenshots
+├── api/
+│   ├── server.py                         ← FastAPI server (task queue, WebSocket progress streaming)
+│   └── worker.py                         ← Background task consumer (sequential GPU queue)
 └── audiobook_factory/
-    ├── extractor_engine.py          ← Core AI text extraction engine
-    │                                   (DocumentIngestor, MLClassifier, TextNormalizer)
-    ├── text_extractor.py            ← Public API: scan() + extract()
-    ├── voice_preprocessor.py        ← 7-step voice audio cleaning pipeline
-    ├── pipeline.py                  ← Thread-safe audiobook generation orchestrator (uses audiobook_rust)
-    ├── filename_sanitizer.py        ← Cross-platform, Audiobookshelf-compatible filenames
-    ├── story_analyzer.py            ← BookNLP story/character analysis
-    ├── text_processing.py           ← Sentence splitting + text normalization
-    ├── ffmpeg_utils.py              ← FFmpeg encoding helpers
-    ├── utils.py                     ← Shared utilities
-    └── tts_providers/               ← Modular TTS provider abstraction
-        ├── base_tts_provider.py     ← BaseTTSProvider ABC + get_tts_provider() factory
-        └── qwen_provider.py         ← Qwen3-TTS implementation (genesis + X-vector cloning)
+    ├── extractor_engine.py               ← Core AI text extraction engine
+    │                                        (DocumentIngestor, MLClassifier, TextNormalizer)
+    ├── text_extractor.py                 ← Public API: scan() + extract()
+    ├── voice_preprocessor.py             ← 7-step voice audio cleaning pipeline
+    ├── pipeline.py                       ← Thread-safe audiobook generation orchestrator
+    │                                        (AudiobookConfig, CancelToken, run_pipeline)
+    ├── filename_sanitizer.py             ← Cross-platform, Audiobookshelf-compatible filenames
+    ├── text_processing.py                ← Sentence splitting + NLTK auto-download + normalization
+    ├── ffmpeg_utils.py                   ← FFmpeg encoding helpers
+    ├── utils.py                          ← Shared utilities (progress file management)
+    └── tts_providers/                    ← Modular TTS provider abstraction
+        ├── base_tts_provider.py          ← BaseTTSProvider ABC + get_tts_provider() factory
+        └── qwen_provider.py              ← Qwen3-TTS (Flash Attention 2 / SDPA auto-detect, X-vector cloning)
 ```
 
 ---
@@ -84,6 +94,8 @@ AudiobookMaker/
 - **NVIDIA GPU with 6 GB+ VRAM** (strongly recommended — CPU is very slow for Qwen3-TTS)
 - **CUDA Toolkit 11.8+**
 - **FFmpeg** — the installer tries to handle this automatically
+
+> **Note:** Flash Attention 2 is optional. If the `flash_attn` package is not installed (e.g. on **T4 GPUs** in Colab), the app automatically falls back to PyTorch SDPA — no manual action needed.
 
 ---
 
@@ -137,6 +149,37 @@ Your browser will open at **http://localhost:7860** automatically.
 
 ---
 
+## ☁️ Google Colab
+
+You can run AudiobookMaker entirely in **Google Colab** — no local GPU or installation required.
+
+### Quick Start
+
+1. **Open** [`AudiobookMaker_Colab.ipynb`](AudiobookMaker_Colab.ipynb) in Google Colab (or upload it manually).
+2. **Enable a GPU runtime:** Go to **Runtime → Change runtime type → T4 GPU** → Save.
+3. **Run all cells in order.** The notebook will:
+   - ✅ Check GPU availability (`nvidia-smi`)
+   - 📁 Clone the AudiobookMaker repository automatically
+   - 🦀 Install the Rust compiler toolchain (`rustup`)
+   - 📦 Install FFmpeg + all Python requirements
+   - ⚙️ Compile the `audiobook_rust` PyO3 extension with `maturin` (with graceful Python fallback if compilation fails)
+   - 🚀 Start the **FastAPI orchestration server** in the background
+   - 🎨 Launch the **Gradio Web UI** with a public `gradio.live` shareable link
+
+4. **Click the generated `gradio.live` link** to open the UI.
+
+### Notes on Colab Environment
+
+| Behaviour | Detail |
+|-----------|--------|
+| **Flash Attention** | T4 GPUs don't have `flash_attn` pre-installed. The app auto-detects this and uses PyTorch SDPA — generation still works. |
+| **NLTK punkt_tab** | NLTK 3.9+ requires the `punkt_tab` resource. AudiobookMaker downloads both `punkt` and `punkt_tab` automatically on first run. |
+| **Rust module fallback** | If `maturin` compile fails, the pipeline gracefully falls back to pure Python text cleaning — audiobooks will still generate. |
+| **Session persistence** | Upload your `generation_progress.json` to resume a previous run — all settings, chapter selection, and voice are restored automatically. |
+| **Runtime limit** | Free Colab sessions disconnect after ~12h. Use the progress file to resume where you left off. |
+
+---
+
 ## 📋 Step-by-Step Usage
 
 ### 1. 📚 Book Tab
@@ -146,6 +189,8 @@ Your browser will open at **http://localhost:7860** automatically.
 4. **TXT** → No page structure; the whole file becomes one audio file automatically.
 5. **Language Selection** → Choose the language of your book from the dropdown. This tells the TTS engine which phonetic dictionary to use.
 6. Fill in book title, author, choose output format and LUFS loudness target.
+
+> **Tip:** Your chapter selection is automatically saved to `generation_progress.json` when generation starts. Upload that file later to restore your exact chapter picks without re-selecting.
 
 ### 2. 🎧 Voice Preprocessing Tab *(recommended before cloning)*
 Upload your raw voice WAV and run any combination of these steps:
@@ -183,13 +228,17 @@ Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as nar
   N\.E\.==north east
   Dr\.==Doctor
   ```
+- **Resume / Sync Progress** — Upload an existing `generation_progress.json` to resume a previous session. All settings (voice, model, format, chapter selection) are automatically restored to the UI.
 
 ### 5. 🚀 Generate Tab
 1. Click **🔍 Preview Chapters** to see a table of chapter titles, character counts, word counts, and sentence counts — without generating any audio. Great for checking your chapter selections.
 2. Click **🎧 Generate Audiobook** to start the full pipeline.
 3. Watch the **Live Decimal Progress Bar** and log stream.
 4. Use **⛔ Cancel** to stop at any time.
-5. When complete, download individual chapter files or use **⬇ Download All (ZIP)**
+5. **🔄 Re-generate completed chapters whose audio file is missing** *(new checkbox)*:
+   - **Checked (default):** If a chapter is marked `completed` in the progress JSON but the audio file is missing on disk, it will be automatically re-generated.
+   - **Unchecked:** Chapters marked completed but with missing files are silently skipped — useful when files exist in a different location.
+6. When complete, download individual chapter files or use **⬇ Download All (ZIP)**
 
 ---
 
@@ -239,7 +288,7 @@ Edit `audiobook_factory/voice_preprocessor.py`:
 ## 📦 Supported Input Formats
 
 | Format | Chapter Detection | Fallback |
-|--------|-----------------|---------|
+|--------|-----------------|---------| 
 | EPUB | ✅ TOC chapter list | — |
 | MOBI | ✅ Try TOC | Page-range picker |
 | PDF | ❌ | Page-range picker |
@@ -277,6 +326,23 @@ Output filenames follow the `{NNNN}_{Chapter_Title}.mp3` format Audiobookshelf e
 Modern versions of Gradio implement sandbox security checks that restrict browsers from loading server-generated files directly. To ensure seamless operation, AudiobookMaker automatically whitelists the project root directory using `allowed_paths=[_ROOT]` inside `app.py`. This enables:
 - Transferring processed audio from the **Voice Preprocessing** tab directly to the **Voice Studio** tab without errors.
 - Viewing and downloading final generated output audio/ZIP chapter packages directly from the web interface.
+
+---
+
+## 📝 Recent Changes
+
+### Session & Resume Improvements
+- **Chapter selection is now persisted** in `generation_progress.json`. When you upload a progress file to resume generation, the **chapter checkbox list is automatically restored** to the exact same selection — no need to manually re-select chapters each time.
+- **New "Re-generate missing files" checkbox** on the Generate tab gives you control over what happens when a chapter is marked `completed` but its audio file is missing on disk.
+
+### Robustness & Stability Fixes
+- **Flash Attention 2 auto-detection**: The TTS model loader no longer requires `flash_attn` to be pre-installed. It detects availability at runtime and gracefully falls back to PyTorch SDPA — preventing crashes on T4 GPUs in Colab and other environments.
+- **NLTK `punkt_tab` auto-download**: NLTK 3.9+ requires a new `punkt_tab` resource for sentence tokenization. AudiobookMaker now automatically checks for and downloads both `punkt` and `punkt_tab` on startup, preventing pipeline crashes on fresh environments.
+- **`CancelToken` attribute fix**: Resolved an `AttributeError` in the API worker that caused the cancellation flow to crash (`'CancelToken' object has no attribute 'cancelled'` → fixed to use `.is_cancelled`).
+- **Rust module graceful fallback**: Added `hasattr()` guards around all Rust extension calls (`clean_text`, `normalize_text`, `split_sentences`, `master_audio`). The pipeline continues with pure-Python implementations if the Rust module was compiled without certain functions.
+
+### Google Colab Support
+- Added `AudiobookMaker_Colab.ipynb` — a step-by-step notebook that installs the full environment (Rust toolchain, FFmpeg, Python deps, PyO3 compilation) and launches the Gradio UI with a public shareable link, all within a Google Colab session.
 
 ---
 
