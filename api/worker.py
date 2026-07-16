@@ -127,7 +127,7 @@ async def worker_loop():
             out_files = await future
             await monitor  # wait for leftover queue frames
             
-            if task.cancel_token.cancelled:
+            if task.cancel_token.is_cancelled:
                 await task.update_status("cancelled")
                 await task.add_log("⛔ Generation task cancelled by user.")
             else:

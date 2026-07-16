@@ -117,6 +117,16 @@ class AudiobookConfig:
     sample_rate:         int   = 24000
     torch_compile:       bool  = False
 
+    # ── Resume / selection ────────────────────────────────────────────────────
+    # Raw chapter labels chosen in the UI (e.g. "1. Chapter 1 (~500 words)")
+    # Stored in progress JSON so the user doesn't have to re-select on resume.
+    selected_chapters:   list  = field(default_factory=list)
+
+    # When True (default), chapters marked 'completed' in the progress JSON
+    # but whose audio file is missing on disk will be automatically re-generated.
+    # When False, such chapters are logged and silently skipped.
+    regen_missing:       bool  = True
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -339,6 +349,10 @@ def run_pipeline(
                 with _lock:
                     output_files.append(existing_path)
                 return existing_path
+            # File is missing — check user's preference
+            if not getattr(config, "regen_missing", True):
+                log(f"  [Ch{idx}] ⚠ Warning: Marked 'completed' but file not found. Skipping (regen_missing=False).")
+                return None
             log(f"  [Ch{idx}] ⚠ Warning: Marked 'completed' but file not found. Re-generating.")
 
         log(f"\n[Chapter {idx}/{total}] '{chapter.title}'")

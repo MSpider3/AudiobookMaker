@@ -422,6 +422,13 @@ def build_app():
                     export_srt_chk   = gr.Checkbox(label="🎬 Generate SRT subtitles", value=False)
                     export_vtt_chk   = gr.Checkbox(label="WebVTT Generate WebVTT subtitles", value=False)
 
+                with gr.Row():
+                    regen_missing_chk = gr.Checkbox(
+                        label="**🔄 Re-generate completed chapters whose audio file is missing**",
+                        value=True,
+                        info="When ON (default): if a chapter is marked 'completed' in the progress JSON but the audio file is gone, it will be re-generated automatically. Turn OFF to skip those chapters entirely."
+                    )
+
                 preview_table = gr.Dataframe(
                     headers=["#", "Chapter", "Chars", "Words", "Sentences"],
                     datatype=["number", "str", "number", "number", "number"],
@@ -831,7 +838,7 @@ def build_app():
             worker_count, parallel_mode, export_text, pron_file_obj, progress_file_obj, tts_provider,
             mname, timbre, instruct,
             single_file, export_lrc, export_srt, export_vtt,
-            torch_compile,
+            torch_compile, regen_missing,
             progress=gr.Progress(track_tqdm=False)
         ):
             if file_obj is None:
@@ -928,7 +935,9 @@ def build_app():
                 export_lrc=export_lrc,
                 export_srt=export_srt,
                 export_vtt=export_vtt,
-                torch_compile=bool(torch_compile)
+                torch_compile=bool(torch_compile),
+                selected_chapters=selected_chapters or [],
+                regen_missing=bool(regen_missing),
             )
 
             log_q  = queue.Queue()
@@ -1113,7 +1122,7 @@ def build_app():
                 worker_count_sl, parallel_mode_dd, export_text_chk, pronunciation_file, progress_file_upload, tts_provider_dd,
                 tts_model_name, tts_timbre, tts_instruct,
                 single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
-                torch_compile_chk
+                torch_compile_chk, regen_missing_chk
             ],
             outputs=[log_box, prog_html, download_col, download_files, cancel_state],
         )
@@ -1127,7 +1136,7 @@ def build_app():
 
         def on_progress_upload(file_obj):
             if file_obj is None:
-                return ["", gr.update()] + [gr.update() for _ in range(26)]
+                return ["", gr.update()] + [gr.update() for _ in range(27)]
             path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -1215,6 +1224,10 @@ def build_app():
                 exp_srt_val = val("export_srt", False)
                 exp_vtt_val = val("export_vtt", False)
                 torch_compile_val = val("torch_compile", False)
+                regen_missing_val = val("regen_missing", True)
+
+                # Restore saved chapter selections (raw labels) if present
+                saved_chapters = val("selected_chapters", [])
 
                 return (
                     msg,
@@ -1244,10 +1257,12 @@ def build_app():
                     gr.update(value=exp_lrc_val),
                     gr.update(value=exp_srt_val),
                     gr.update(value=exp_vtt_val),
-                    gr.update(value=torch_compile_val)
+                    gr.update(value=torch_compile_val),
+                    gr.update(value=regen_missing_val),
+                    gr.update(value=saved_chapters) if saved_chapters else gr.update(),
                 )
             except Exception as e:
-                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(26)]
+                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(27)]
 
         progress_file_upload.upload(
             on_progress_upload,
@@ -1259,7 +1274,7 @@ def build_app():
                 tts_timbre, tts_instruct, max_len_sl, lufs_adv, worker_count_sl,
                 parallel_mode_dd, tts_provider_dd, epub_ocr_chk, force_repro_chk,
                 export_text_chk, single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
-                torch_compile_chk
+                torch_compile_chk, regen_missing_chk, chapter_check
             ]
         )
 

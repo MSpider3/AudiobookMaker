@@ -268,13 +268,24 @@ class QwenTTSProvider(BaseTTSProvider):
             sys.stderr = orig_stderr
 
         print(f"    [QwenTTS] Loading model: {self.config.tts_model_name}…")
-        
-        # We explicitly supply torch_dtype to fix the Flash Attention warning
+
+        # Auto-detect whether flash_attn is installed.
+        # flash_attention_2 requires the separate `flash_attn` package which is not
+        # available on every GPU (e.g. T4 in free Colab). Fall back to PyTorch's
+        # built-in SDPA which is fast and always available.
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+            print("    [QwenTTS] flash_attn detected → using FlashAttention 2.")
+        except ImportError:
+            attn_impl = "sdpa"
+            print("    [QwenTTS] flash_attn not found → falling back to SDPA attention.")
+
         self._model = Qwen3TTSModel.from_pretrained(
             self.config.tts_model_name,
             device_map=self.config.device,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
         )
         self._loaded_model_name = self.config.tts_model_name
 
