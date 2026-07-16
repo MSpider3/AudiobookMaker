@@ -4,9 +4,20 @@ from nltk.tokenize import sent_tokenize
 
 # Ensure NLTK data is ready
 try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+except Exception as e:
+    print(f"[WARNING] Failed to load/download NLTK punkt tokenizer: {e}")
+
+try:
+    try:
+        nltk.data.find('tokenizers/punkt_tab')
+    except LookupError:
+        nltk.download('punkt_tab', quiet=True)
+except Exception as e:
+    print(f"[WARNING] Failed to load/download NLTK punkt_tab: {e}")
 
 try:
     import audiobook_rust
