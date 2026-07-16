@@ -34,7 +34,7 @@ import soundfile as sf
 # ── project root & temp folder ────────────────────────────────────────────────
 try:
     import audiobook_rust
-    _has_rust = True
+    _has_rust = hasattr(audiobook_rust, "master_audio")
 except ImportError:
     _has_rust = False
 

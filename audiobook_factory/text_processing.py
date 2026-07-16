@@ -10,7 +10,7 @@ except LookupError:
 
 try:
     import audiobook_rust
-    _RUST_AVAILABLE = True
+    _RUST_AVAILABLE = hasattr(audiobook_rust, "normalize_text") and hasattr(audiobook_rust, "split_sentences")
 except ImportError:
     _RUST_AVAILABLE = False
 

@@ -484,7 +484,8 @@ class TextNormalizer:
         # Try Rust compiled clean pipeline first for speed
         try:
             import audiobook_rust
-            return audiobook_rust.clean_text(text, title, is_pdf)
+            if hasattr(audiobook_rust, "clean_text"):
+                return audiobook_rust.clean_text(text, title, is_pdf)
         except ImportError:
             pass
 
