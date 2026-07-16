@@ -1183,6 +1183,22 @@ def build_app():
                 
                 mname_val = val("tts_model_name", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
                 timbre_val = val("tts_timbre", "[English] ryan")
+                _valid_timbres = [
+                    "[Chinese] vivian",
+                    "[Chinese] serena",
+                    "[Chinese] uncle_fu",
+                    "[Chinese (Beijing Dialect)] dylan",
+                    "[Chinese (Sichuan Dialect)] eric",
+                    "[English] ryan",
+                    "[English] aiden",
+                    "[Japanese] ono_anna",
+                    "[Korean] sohee"
+                ]
+                if timbre_val and timbre_val not in _valid_timbres:
+                    for _choice in _valid_timbres:
+                        if _choice.endswith(timbre_val.strip()) or _choice.split()[-1] == timbre_val.strip():
+                            timbre_val = _choice
+                            break
                 instruct_val = val("tts_instruct", "")
                 
                 max_len_val = val("max_len", 399)
