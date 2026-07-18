@@ -32,11 +32,20 @@ import numpy as np
 import soundfile as sf
 
 # ── project root & temp folder ────────────────────────────────────────────────
-try:
-    import audiobook_rust
-    _has_rust = hasattr(audiobook_rust, "master_audio")
-except ImportError:
-    _has_rust = False
+# NOTE: _has_rust is checked lazily at call time (not import time).
+# This is important for environments like Kaggle/Colab where the Rust
+# extension may be compiled *after* this module is first imported.
+# Calling _check_rust() on each chapter ensures the freshly-compiled
+# .so is found without needing a kernel restart.
+def _check_rust() -> bool:
+    """Return True if audiobook_rust.master_audio is importable right now."""
+    try:
+        import importlib
+        importlib.invalidate_caches()
+        import audiobook_rust
+        return hasattr(audiobook_rust, "master_audio")
+    except ImportError:
+        return False
 
 _ROOT = Path(__file__).resolve().parent.parent
 _TEMP_DIR = _ROOT / "temp"
@@ -628,7 +637,8 @@ def _process_chapter(
                                         f".{config.output_format}")
         out_path   = os.path.join(config.output_dir, safe_name)
 
-        if _has_rust:
+        if _check_rust():
+            import audiobook_rust as _audiobook_rust  # fresh local import
             valid_paths = [p for p in chunk_paths if p and os.path.exists(p)]
             if not valid_paths:
                 log(f"  [Ch{idx}] ❌ No audio chunks found. Skipping.")
@@ -644,7 +654,7 @@ def _process_chapter(
                 # master to a temporary WAV first and use FFmpeg to do packaging and copy streams.
                 master_target = out_path if use_pure_rust else os.path.join(temp_dir, "mastered.wav")
 
-                audiobook_rust.master_audio(
+                _audiobook_rust.master_audio(
                     valid_paths,
                     master_target,
                     float(config.pause),
