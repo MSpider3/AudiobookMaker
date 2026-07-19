@@ -210,9 +210,29 @@ class QwenTTSProvider(BaseTTSProvider):
                 return durations
 
             except torch.cuda.OutOfMemoryError as e:
-                print("    [QwenTTS] CUDA OOM encountered during batch synthesis. Attempting recovery...")
-                self.cleanup()
-                raise RuntimeError("CUDA Out of Memory in batch synthesis. Try reducing worker_count (batch size).") from e
+                print("    [QwenTTS] CUDA OOM during batch synthesis. Flushing GPU cache and retrying one-by-one...")
+                import gc
+                torch.cuda.empty_cache()
+                gc.collect()
+                # Retry each text individually so the GPU has minimal memory pressure.
+                # Items that succeed are saved; items that still OOM raise so the
+                # caller can log them as failed chunks.
+                one_by_one_failed = False
+                for i, (text, voice_ref, out_path) in enumerate(zip(texts, voice_refs, out_paths)):
+                    try:
+                        self.synthesize(text, voice_ref, out_path)
+                        if out_path:
+                            import soundfile as _sf
+                            info = _sf.info(out_path)
+                            durations[i] = info.frames / info.samplerate
+                    except Exception as inner_e:
+                        print(f"    [QwenTTS] ⚠ Chunk {i} failed even in one-by-one mode: {inner_e}")
+                        one_by_one_failed = True
+                        # Leave out_path absent (not written) so pipeline treats it as None
+                if one_by_one_failed:
+                    # Partial success — return what we have; caller checks file existence
+                    print("    [QwenTTS] ⚠ Some chunks could not be recovered. Returning partial results.")
+                return durations
             except Exception as e:
                 if attempt < max_retries:
                     print(f"    [QwenTTS] Batch synthesis failed ({e}). Retrying ({attempt+1}/{max_retries})...")

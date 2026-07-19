@@ -123,8 +123,23 @@ def build_app():
         cancel_state    = gr.State(None)     # CancelToken
         preproc_state   = gr.State(None)     # processed voice bytes
         all_chapter_choices_state = gr.State([]) # full list of chapter labels
+        # Saved chapter selections from an uploaded progress JSON.
+        # on_book_upload reads this and selects only the matching chapters.
+        json_selected_chapters_state = gr.State(None)  # list[str] | None
+
+        # ── Resume from Progress JSON (top-level, before tabs) ────────────────
+        with gr.Accordion("🔄 Resume from Progress JSON", open=False):
+            gr.HTML('<div class="warn-box">💡 <strong>Start here if you are resuming.</strong> Upload your <code>generation_progress.json</code> to restore all settings and chapter selections automatically. Then upload your book file (in the Book tab) — only needed for cover-image extraction when text is already cached in the JSON.</div>')
+            with gr.Row():
+                progress_file_upload = gr.File(
+                    label="Upload existing generation_progress.json",
+                    file_types=[".json"],
+                    file_count="single",
+                )
+            progress_upload_status = gr.Markdown("")
 
         with gr.Tabs() as tabs:
+
 
             # ═══════════════════════════════════════════════════════════════ #
             # TAB 1 — BOOK                                                    #
@@ -397,13 +412,7 @@ def build_app():
                     file_count="single",
                 )
                 gr.Markdown("#### Resume / Sync Progress")
-                gr.HTML('<div class="warn-box">ℹ️ Upload an existing <code>generation_progress.json</code> file to resume progress. Uploading will automatically pre-fill the Book title.</div>')
-                progress_file_upload = gr.File(
-                    label="Upload existing generation_progress.json",
-                    file_types=[".json"],
-                    file_count="single",
-                )
-                progress_upload_status = gr.Markdown("")
+                gr.HTML('<div class="warn-box">ℹ️ The progress JSON upload has moved to the top of the page (above all tabs) for a faster resume workflow.</div>')
 
             # ═══════════════════════════════════════════════════════════════ #
             # TAB 5 — GENERATE                                                #
@@ -412,9 +421,10 @@ def build_app():
                 gr.Markdown("### Generate Audiobook")
 
                 with gr.Row():
-                    preview_btn  = gr.Button("🔍 Preview Chapters",   variant="secondary", scale=1)
-                    generate_btn = gr.Button("🎧 Generate Audiobook", variant="primary",   scale=3)
-                    cancel_btn   = gr.Button("⛔ Cancel",              variant="stop",      scale=1)
+                    preview_btn     = gr.Button("🔍 Preview Chapters",   variant="secondary", scale=1)
+                    generate_btn    = gr.Button("🎧 Generate Audiobook", variant="primary",   scale=3)
+                    export_cfg_btn  = gr.Button("📋 Export Config JSON", variant="secondary", scale=1)
+                    cancel_btn      = gr.Button("⛔ Cancel",              variant="stop",      scale=1)
 
                 with gr.Row():
                     single_file_mode = gr.Checkbox(label="📦 Combine into single file", value=False)
@@ -446,6 +456,15 @@ def build_app():
                     interactive=False,
                     max_lines=200,
                 )
+
+                with gr.Accordion("📋 Export Config JSON", open=False) as export_cfg_accordion:
+                    gr.HTML('<div class="warn-box">ℹ️ Click <strong>Export Config JSON</strong> above to parse the book and save all settings + chapter text into a single JSON file. You can then use this file with the CLI (<code>python cli.py config.json</code>) without needing Gradio.</div>')
+                    export_cfg_status  = gr.Markdown("")
+                    export_config_file = gr.File(
+                        label="Download generation_progress.json",
+                        interactive=False,
+                        visible=False,
+                    )
 
                 gr.Markdown("#### Download outputs")
                 download_col   = gr.Column(visible=False)
@@ -500,7 +519,11 @@ def build_app():
         # ══════════════════════════════════════════════════════════════════
 
         # ── Book upload ───────────────────────────────────────────────────
-        def on_book_upload(file_obj):
+        def on_book_upload(file_obj, json_sel):
+            """json_sel is the value of json_selected_chapters_state — a list of
+            raw chapter labels previously loaded from a progress JSON, or None.
+            When present, only those chapters are pre-selected in the checklist.
+            """
             if file_obj is None:
                 return (
                     gr.update(visible=False),  # epub_panel
@@ -513,6 +536,7 @@ def build_app():
                     None,
                     "",
                     [],
+                    json_sel,  # preserve state unchanged
                 )
 
             path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
@@ -541,17 +565,48 @@ def build_app():
             if result.has_toc and result.chapters:
                 choices = [f"{c.num}. {c.title}  (~{c.word_count:,} words)" for c in result.chapters]
                 status_parts.append(f"✅ **{len(result.chapters)} chapters found.**")
+                # ── Apply saved JSON chapter selections if present ──────────────
+                # json_sel is passed as an extra input from json_selected_chapters_state.
+                # It is a list of raw labels previously saved by on_progress_upload.
+                # We filter the choices list to only those that match so the user
+                # doesn't have to re-select chapters manually on resume.
+                def _match_json_selection(label, saved_labels):
+                    """Return True if label matches any entry in saved_labels."""
+                    if not saved_labels:
+                        return True
+                    for sl in saved_labels:
+                        if sl == label:
+                            return True
+                        # Fuzzy: same chapter number prefix
+                        try:
+                            if int(label.split(".")[0]) == int(sl.split(".")[0]):
+                                return True
+                        except (ValueError, IndexError):
+                            pass
+                    return False
+
+                if json_sel:
+                    selected_value = [c for c in choices if _match_json_selection(c, json_sel)]
+                    # Fallback: if nothing matched (label format changed), select all
+                    if not selected_value:
+                        selected_value = choices
+                    reset_json_sel = None   # consume the saved selection
+                else:
+                    selected_value = choices  # default: all selected
+                    reset_json_sel = None
+
                 return (
                     gr.update(visible=True),   # epub_panel
                     gr.update(visible=False),  # page_panel
                     gr.update(visible=False),  # txt_panel
                     "\n\n".join(status_parts),
-                    gr.update(choices=choices, value=choices),
+                    gr.update(choices=choices, value=selected_value),
                     title, author,
                     result,
                     "",
                     cover_path,
-                    choices
+                    choices,
+                    reset_json_sel,           # json_selected_chapters_state (consumed)
                 )
             elif result.file_type == "txt":
                 status_parts.append("ℹ️ No chapters — whole book mode.")
@@ -565,7 +620,8 @@ def build_app():
                     result,
                     "",
                     cover_path,
-                    []
+                    [],
+                    None,  # reset json_selected_chapters_state
                 )
             else:
                 pages_msg = f"**Total pages:** {result.page_count}" if result.page_count else ""
@@ -580,16 +636,17 @@ def build_app():
                     result,
                     pages_msg,
                     cover_path,
-                    []
+                    [],
+                    None,  # reset json_selected_chapters_state
                 )
 
         book_file.upload(
             on_book_upload,
-            inputs=[book_file],
+            inputs=[book_file, json_selected_chapters_state],
             outputs=[epub_panel, page_panel, txt_panel, scan_status,
                      chapter_check, book_title_box, book_author_box,
                      scan_state, total_pages_label, cover_image,
-                     all_chapter_choices_state],
+                     all_chapter_choices_state, json_selected_chapters_state],
         )
 
         # ── Select/Deselect All ───────────────────────────────────────────
@@ -1260,9 +1317,10 @@ def build_app():
                     gr.update(value=torch_compile_val),
                     gr.update(value=regen_missing_val),
                     gr.update(value=saved_chapters) if saved_chapters else gr.update(),
+                    saved_chapters or None,   # json_selected_chapters_state
                 )
             except Exception as e:
-                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(27)]
+                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(28)]
 
         progress_file_upload.upload(
             on_progress_upload,
@@ -1274,8 +1332,167 @@ def build_app():
                 tts_timbre, tts_instruct, max_len_sl, lufs_adv, worker_count_sl,
                 parallel_mode_dd, tts_provider_dd, epub_ocr_chk, force_repro_chk,
                 export_text_chk, single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
-                torch_compile_chk, regen_missing_chk, chapter_check
+                torch_compile_chk, regen_missing_chk, chapter_check,
+                json_selected_chapters_state,
             ]
+        )
+
+        # ── Export Config JSON ────────────────────────────────────────────────
+        def on_export_config(
+            scan_res, file_obj,
+            selected_chapters, page_ranges_str,
+            book_language, book_title, author, cover_path,
+            voice_path, output_fmt, lufs,
+            temp, top_p, pause, para_pause,
+            max_len, true_peak,
+            epub_ocr, force_repro,
+            worker_count, parallel_mode, export_text, pron_file_obj, tts_provider,
+            mname, timbre, instruct,
+            single_file, export_lrc, export_srt, export_vtt,
+            torch_compile, regen_missing,
+        ):
+            """Parse the book, cache chapter text, and write a self-contained
+            generation_progress.json — without starting TTS generation."""
+            if file_obj is None:
+                return (
+                    "⚠️ Please upload a book file first.",
+                    gr.update(visible=False),
+                )
+
+            path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+
+            # Build chapter selections
+            selections = None
+            page_ranges = None
+            if scan_res and scan_res.has_toc and selected_chapters:
+                import re as _re
+                selections = []
+                for lbl in selected_chapters:
+                    after_num = lbl.split(". ", 1)[-1]
+                    title = _re.sub(r'\s+\(~[\d,]+\s*words\)\s*$', '', after_num).strip()
+                    if title:
+                        selections.append(title)
+            elif scan_res and not scan_res.has_toc and scan_res.file_type != "txt":
+                page_ranges = []
+                for part in page_ranges_str.split(","):
+                    part = part.strip()
+                    if "-" in part:
+                        try:
+                            s, e = part.split("-")
+                            page_ranges.append((int(s.strip()), int(e.strip())))
+                        except ValueError:
+                            pass
+
+            # Extract chapters (with text + sentences)
+            try:
+                chapters, _ = extract(path, selections=selections or None,
+                                       enable_ocr=epub_ocr, page_ranges=page_ranges)
+            except Exception as exc:
+                return (
+                    f"❌ Book extraction failed: {exc}",
+                    gr.update(visible=False),
+                )
+
+            if not chapters:
+                return (
+                    "⚠️ No chapters extracted from the book.",
+                    gr.update(visible=False),
+                )
+
+            # Build output directory and config
+            book_out = os.path.join(
+                _OUTPUT_DIR,
+                re.sub(r'[\\/*?":"<>|]', "", book_title or "audiobook"),
+            )
+            os.makedirs(book_out, exist_ok=True)
+
+            import dataclasses
+            from audiobook_factory.utils import load_or_create_progress_file
+
+            cfg = AudiobookConfig(
+                book_title=book_title, book_path=path, author=author,
+                language=book_language, cover_image=cover_path, output_dir=book_out,
+                output_format=output_fmt, voice_file=voice_path,
+                temperature=temp, top_p=top_p, pause=pause, para_pause=para_pause,
+                max_len=int(max_len), lufs=int(lufs), true_peak=true_peak,
+                force_reprocess=force_repro, worker_count=int(worker_count),
+                parallel_mode=parallel_mode, export_text=bool(export_text),
+                tts_provider_name=tts_provider or "qwen", tts_model_name=mname,
+                tts_timbre=timbre.split()[-1] if timbre else "",
+                tts_instruct=instruct, single_file_mode=single_file,
+                export_lrc=export_lrc, export_srt=export_srt, export_vtt=export_vtt,
+                torch_compile=bool(torch_compile),
+                selected_chapters=selected_chapters or [],
+                regen_missing=bool(regen_missing),
+            )
+            settings_dict = {k: v for k, v in dataclasses.asdict(cfg).items()
+                             if k != "pronunciation_map"}
+
+            chapters_data = [
+                {"num": ch.num, "title": ch.title, "text": ch.text, "sentences": ch.sentences}
+                for ch in chapters
+            ]
+
+            prog_path = os.path.join(book_out, "generation_progress.json")
+            # Force fresh creation so text is always included
+            if os.path.exists(prog_path):
+                import json as _json
+                with open(prog_path, "r", encoding="utf-8") as f:
+                    existing = _json.load(f)
+                # Merge: preserve completed status, overwrite text
+                existing_by_num = {c["num"]: c for c in existing.get("chapters", [])}
+                merged_chapters = []
+                for cd in chapters_data:
+                    ec = existing_by_num.get(cd["num"], {})
+                    merged_chapters.append({
+                        "num": cd["num"],
+                        "title": cd["title"],
+                        "status": ec.get("status", "pending"),
+                        "text": cd["text"],
+                        "sentences": cd["sentences"],
+                    })
+                existing["settings"] = settings_dict
+                existing["book_path"] = path
+                existing["voice_file"] = voice_path or ""
+                existing["chapters"] = merged_chapters
+                with open(prog_path, "w", encoding="utf-8") as f:
+                    _json.dump(existing, f, indent=4)
+            else:
+                load_or_create_progress_file(
+                    prog_path, chapters_data, book_title,
+                    book_path=path, voice_file=voice_path or "",
+                    settings=settings_dict,
+                )
+
+            n_completed = sum(1 for cd in chapters_data
+                              if any(ec.get("status") in ("completed", "complete")
+                                     for ec in [existing_by_num.get(cd["num"], {})])
+                              ) if os.path.exists(prog_path) else 0
+
+            return (
+                f"✅ **Config exported!** {len(chapters)} chapters cached.\n\n"
+                f"File saved to:\n`{prog_path}`\n\n"
+                f"To generate without Gradio, run:\n"
+                f"```\npython cli.py \"{prog_path}\"\n```",
+                gr.update(value=prog_path, visible=True),
+            )
+
+        export_cfg_btn.click(
+            on_export_config,
+            inputs=[
+                scan_state, book_file,
+                chapter_check, page_ranges_box,
+                book_language_dd, book_title_box, book_author_box, cover_image,
+                voice_studio_upload, output_format, lufs_slider,
+                temp_slider, topp_slider, sent_pause_sl, para_pause_sl,
+                max_len_sl, lufs_adv,
+                epub_ocr_chk, force_repro_chk,
+                worker_count_sl, parallel_mode_dd, export_text_chk, pronunciation_file, tts_provider_dd,
+                tts_model_name, tts_timbre, tts_instruct,
+                single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
+                torch_compile_chk, regen_missing_chk,
+            ],
+            outputs=[export_cfg_status, export_config_file],
         )
 
         # ── Cancel ────────────────────────────────────────────────────────────

@@ -47,11 +47,37 @@ def update_progress_file(progress_path, chapter_num, status):
             json.dump(progress_data, f, indent=4)
 
 def load_or_create_progress_file(progress_path, chapters_data, book_title, book_path="", voice_file="", settings=None):
-    """Loads a progress file if it exists, otherwise creates a new one."""
+    """Loads a progress file if it exists, otherwise creates a new one.
+
+    chapters_data entries may optionally contain 'text' and 'sentences' keys.
+    When creating a new file these are persisted so the CLI can bypass book
+    re-parsing on resume.  When loading an existing file that lacks those keys
+    (older format) we backfill from chapters_data if available.
+    """
     if os.path.exists(progress_path):
         print("Found existing progress file. Loading state.")
         with open(progress_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+
+        # Backfill text/sentences for chapters that are missing them (old format)
+        existing_by_num = {c["num"]: c for c in data.get("chapters", [])}
+        dirty = False
+        for cd in chapters_data:
+            ch = existing_by_num.get(cd["num"])
+            if ch is not None:
+                if "text" not in ch and cd.get("text"):
+                    ch["text"] = cd["text"]
+                    dirty = True
+                if "sentences" not in ch and cd.get("sentences"):
+                    ch["sentences"] = cd["sentences"]
+                    dirty = True
+        if dirty:
+            try:
+                with open(progress_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4)
+            except Exception as e:
+                print(f"Warning: could not backfill text cache into progress file: {e}")
+        return data
     else:
         print("No progress file found. Creating a new one.")
         progress_data = {
@@ -60,12 +86,20 @@ def load_or_create_progress_file(progress_path, chapters_data, book_title, book_
             "voice_file": voice_file,
             "settings": settings or {},
             "chapters": [
-                {"num": c["num"], "title": c["title"], "status": "pending"} for c in chapters_data
-            ]
+                {
+                    "num": c["num"],
+                    "title": c["title"],
+                    "status": "pending",
+                    "text": c.get("text", ""),
+                    "sentences": c.get("sentences", []),
+                }
+                for c in chapters_data
+            ],
         }
         with open(progress_path, 'w', encoding='utf-8') as f:
             json.dump(progress_data, f, indent=4)
         return progress_data
+
 
 def format_lrc_timestamp(seconds):
     """

@@ -268,7 +268,10 @@ def run_pipeline(
     tasks = list(enumerate(chapters, 1))
 
     # We only initialize with the output path first, then copy to temp
-    chapters_data = [{"num": i, "title": ch.title} for i, ch in tasks]
+    chapters_data = [
+        {"num": i, "title": ch.title, "text": ch.text, "sentences": ch.sentences}
+        for i, ch in tasks
+    ]
     
     # Convert config dataclass to dict for settings
     from dataclasses import asdict

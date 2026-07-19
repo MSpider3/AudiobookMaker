@@ -5,15 +5,19 @@
 ![UI](https://img.shields.io/badge/UI-Gradio-orange)
 ![Colab](https://img.shields.io/badge/Google%20Colab-Supported-yellow?logo=googlecolab)
 
-An end-to-end AI audiobook generator with a **Gradio web UI**. Upload any book, clone a narrator voice, clean it up, and generate a chapterized, mastered audiobook — all locally or in **Google Colab/.ipynb file**, no cloud APIs needed.
+An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless CLI pipeline**. Upload any book, clone a narrator voice, clean it up, and generate a chapterized, mastered audiobook — all locally or in **Google Colab / Kaggle**, no cloud APIs needed.
 
 ---
 
 ## ✨ Features
 
+- **Headless CLI generation (`cli.py`)** — Run audiobook generation headless in cloud environments (Kaggle/Colab) or terminal without launching or maintaining a web browser interface.
+- **Cached Book Extraction** — `generation_progress.json` now caches fully extracted and segmented chapter text. Re-parsing large books on session resume is completely eliminated!
+- **Export Config JSON** — Configure voice and chapters in Gradio, then click **'📋 Export Config JSON'** to save settings and cached text into a self-contained JSON ready for CLI execution.
 - **Multi-format book support** — EPUB, MOBI, PDF, DOCX, ODT, TXT
 - **Smart chapter detection** — EPUB/MOBI use a TOC-based chapter checklist; PDF/DOCX/ODT let you split by page ranges
-- **Chapter selection memory** — Selected chapters are saved into `generation_progress.json` and automatically restored when you resume a session — no need to re-select every time.
+- **Chapter selection memory** — Selected chapters are saved into `generation_progress.json` and automatically restored when you resume a session — no need to re-select every time. Uploading a book after restoring JSON settings preserves your selected chapter subset automatically.
+- **JSON-First UI Workflow** — Progress file upload placed at the very top of the app interface for immediate session restore before touching book uploads.
 - **AI text extraction** — 5-phase pipeline (Docling + OCR + ML classification + heuristic normalization) produces clean, TTS-ready text
 - **EPUB image OCR** — EasyOCR reads text embedded in images inside EPUBs
 - **Voice Design & Cloning** — Clone from a reference WAV or prompt an entire new voice using Qwen3-TTS. Supports **8 languages** (English, Chinese, Japanese, Korean, French, Spanish, Italian, German).
@@ -146,6 +150,41 @@ chmod +x run.sh
 ```
 
 Your browser will open at **http://localhost:7860** automatically.
+
+---
+
+## ⚡ Headless CLI Generation (`cli.py`)
+
+For faster generation or execution in cloud environments (Google Colab / Kaggle notebooks) where Gradio tunnels might disconnect, you can run generation headless via `cli.py`:
+
+### Quick CLI Usage
+
+```bash
+# Basic run with progress JSON (uses cached chapter text):
+python cli.py audiobook_output/MyBook/generation_progress.json
+
+# Override book path (for cover image extraction) and narrator voice:
+python cli.py generation_progress.json \
+    --book-path /path/to/book.epub \
+    --voice-file /path/to/voice.wav
+
+# Override generation parameters on the fly:
+python cli.py generation_progress.json \
+    --worker-count 4 \
+    --output-format mp3 \
+    --output-dir ./my_output
+
+# Force re-processing all chapters:
+python cli.py generation_progress.json --force-reprocess
+```
+
+### CLI Workflow
+
+1. Configure your settings, narrator voice, and chapter selections in the Gradio Web UI.
+2. In the **Generate** tab, click **📋 Export Config JSON**. This saves `generation_progress.json` containing all settings and embedded chapter text.
+3. Close or stop the Gradio app.
+4. Run `python cli.py generation_progress.json` in your terminal or cloud notebook.
+
 
 ---
 
