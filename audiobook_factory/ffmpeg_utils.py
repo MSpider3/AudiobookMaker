@@ -1,6 +1,9 @@
 def get_format_settings(fmt):
-    
-    audio_settings = ['-ar', '44100', '-ac', '2']
+    # NOTE: We deliberately do NOT set -ar or -ac here.
+    # The pipeline already pipes the correct sample rate and channel count
+    # (24000 Hz mono for Qwen3-TTS) via its own FFmpeg arguments.
+    # Adding -ar/-ac here would override those and cause unnecessary resampling.
+    audio_settings = []
     video_settings = []
     subtitle_codec = 'mov_text'
     subtitle_type = None  # By default, a format has no subtitle/lyric file.

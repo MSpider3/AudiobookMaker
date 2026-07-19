@@ -27,18 +27,24 @@ def seconds_to_vtt_time(seconds):
     ms = ms % 1000
     return f"{hours:02d}:{minutes:02d}:{seconds % 60:02d}.{ms:03d}"
 
+import threading as _threading
+_progress_lock = _threading.Lock()
+
 def update_progress_file(progress_path, chapter_num, status):
     """
     Updates the progress JSON file for a specific chapter.
+    Thread-safe: uses a module-level lock to prevent race conditions
+    when multiple chapter workers complete simultaneously.
     """
-    with open(progress_path, 'r', encoding='utf-8') as f:
-        progress_data = json.load(f)
-    for chapter in progress_data["chapters"]:
-        if chapter["num"] == chapter_num:
-            chapter["status"] = status
-            break
-    with open(progress_path, 'w', encoding='utf-8') as f:
-        json.dump(progress_data, f, indent=4)
+    with _progress_lock:
+        with open(progress_path, 'r', encoding='utf-8') as f:
+            progress_data = json.load(f)
+        for chapter in progress_data["chapters"]:
+            if chapter["num"] == chapter_num:
+                chapter["status"] = status
+                break
+        with open(progress_path, 'w', encoding='utf-8') as f:
+            json.dump(progress_data, f, indent=4)
 
 def load_or_create_progress_file(progress_path, chapters_data, book_title, book_path="", voice_file="", settings=None):
     """Loads a progress file if it exists, otherwise creates a new one."""

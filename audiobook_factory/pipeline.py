@@ -99,14 +99,6 @@ class AudiobookConfig:
     worker_count:        int   = 1       # chapters/chunks in parallel
     parallel_mode:       str   = "chunks" # "chapters" | "chunks"
 
-    # ── Modes ─────────────────────────────────────────────────────────────────
-    preview_mode:        bool  = False   # show stats, no TTS
-    export_text:         bool  = False   # write .txt per chapter
-
-    # ── Pronunciation fixes ───────────────────────────────────────────────────
-    # { regex_pattern: replacement }  applied before TTS
-    pronunciation_map:   dict  = field(default_factory=dict)
-
     # ── Multi-Model Qwen3 ─────────────────────────────────────────────────────
     device:              str   = "cuda"
     tts_model_name:      str   = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
@@ -125,6 +117,10 @@ class AudiobookConfig:
     force_reprocess:     bool  = False
     sample_rate:         int   = 24000
     torch_compile:       bool  = False
+
+    # ── Pronunciation fixes ───────────────────────────────────────────────────
+    # { regex_pattern: replacement }  applied before TTS
+    pronunciation_map:   dict  = field(default_factory=dict)
 
     # ── Resume / selection ────────────────────────────────────────────────────
     # Raw chapter labels chosen in the UI (e.g. "1. Chapter 1 (~500 words)")
@@ -534,17 +530,33 @@ def _process_chapter(
                     durations = provider.synthesize_batch(batch_texts, batch_voice_refs, batch_out_paths)
                     for idx_chunk, out_wav in enumerate(batch_out_paths):
                         i = batch_start + idx_chunk
-                        chunk_paths[i] = out_wav
-                        if config.export_lrc:
-                            chunk_durations[i] = durations[idx_chunk]
+                        # Only record path if the file was actually written
+                        if os.path.exists(out_wav) and os.path.getsize(out_wav) > 0:
+                            chunk_paths[i] = out_wav
+                            if config.export_lrc:
+                                chunk_durations[i] = durations[idx_chunk]
                 except Exception as e:
                     import traceback
                     error_trace = traceback.format_exc()
-                    log(f"  [Ch{idx}] Batch starting at chunk {batch_start} failed: {e}")
-                    log(f"  [Ch{idx}] Traceback saved to chapter output dir.")
+                    log(f"  [Ch{idx}] Batch starting at chunk {batch_start} failed ({type(e).__name__}): {e}")
+                    log(f"  [Ch{idx}] Retrying batch chunks one-by-one...")
                     err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_batch_{batch_start}.txt")
                     with open(err_log_path, "w", encoding="utf-8") as err_f:
                         err_f.write(error_trace)
+
+                    # ── One-by-one fallback for failed batch ──────────────────
+                    recovered = 0
+                    for sub_i, (chunk_text, out_wav) in enumerate(zip(batch_texts, batch_out_paths)):
+                        global_i = batch_start + sub_i
+                        try:
+                            provider.synthesize(chunk_text, config.voice_file, out_wav)
+                            chunk_paths[global_i] = out_wav
+                            if config.export_lrc:
+                                chunk_durations[global_i] = _get_wav_duration(out_wav)
+                            recovered += 1
+                        except Exception as sub_e:
+                            log(f"  [Ch{idx}] ⚠ Chunk {global_i} failed even in single mode: {sub_e}")
+                    log(f"  [Ch{idx}] One-by-one recovery: {recovered}/{len(batch_texts)} chunks saved.")
                 
                 if prog_cb:
                     prog_cb(batch_end / len(tts_jobs))
@@ -553,22 +565,28 @@ def _process_chapter(
                 if cancel.is_cancelled:
                     return None
                 out_wav = os.path.join(temp_dir, f"s_{i:04d}.wav")
-                try:
-                    # Provider.synthesize should ideally take care of the model type internally
-                    provider.synthesize(chunk_text, config.voice_file, out_wav)
-                    chunk_paths[i] = out_wav
-                    # Get duration for LRC
-                    if config.export_lrc:
-                        chunk_durations[i] = _get_wav_duration(out_wav)
-                except Exception as e:
-                    import traceback
-                    error_trace = traceback.format_exc()
-                    log(f"  [Ch{idx}] chunk {i} failed: {e}")
-                    log(f"  [Ch{idx}] Traceback saved to chapter output dir.")
-                    err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_{i}.txt")
-                    with open(err_log_path, "w", encoding="utf-8") as err_f:
-                        err_f.write(error_trace)
-                
+                # Retry once on transient failures (e.g. brief GPU hiccup)
+                for attempt in range(2):
+                    try:
+                        provider.synthesize(chunk_text, config.voice_file, out_wav)
+                        if os.path.exists(out_wav) and os.path.getsize(out_wav) > 0:
+                            chunk_paths[i] = out_wav
+                            if config.export_lrc:
+                                chunk_durations[i] = _get_wav_duration(out_wav)
+                        break  # success
+                    except Exception as e:
+                        if attempt == 0:
+                            import time as _time
+                            log(f"  [Ch{idx}] chunk {i} failed ({e}), retrying...")
+                            _time.sleep(1)
+                        else:
+                            import traceback
+                            error_trace = traceback.format_exc()
+                            log(f"  [Ch{idx}] chunk {i} failed after retry: {e}")
+                            err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_{i}.txt")
+                            with open(err_log_path, "w", encoding="utf-8") as err_f:
+                                err_f.write(error_trace)
+
                 if prog_cb:
                     prog_cb((i + 1) / len(tts_jobs))
 
@@ -702,13 +720,16 @@ def _process_chapter(
         pause_samples = np.zeros(int(config.pause * config.sample_rate), dtype=np.float32)
 
         # Concatenate all chunk WAVs + pauses in-memory (no disk I/O)
+        # Determine the last valid chunk index so we don't add a trailing silence
+        valid_indices = [i for i, p in enumerate(chunk_paths) if p and os.path.exists(p)]
+        last_valid_idx = valid_indices[-1] if valid_indices else -1
         audio_segments: list[np.ndarray] = []
         for i, p in enumerate(chunk_paths):
             if p and os.path.exists(p):
                 try:
                     chunk_audio, _ = sf.read(p, dtype="float32")
                     audio_segments.append(chunk_audio)
-                    if i < len(chunk_paths) - 1:
+                    if i != last_valid_idx:  # no trailing silence after last real chunk
                         audio_segments.append(pause_samples)
                 except Exception:
                     pass  # skip corrupt chunks
