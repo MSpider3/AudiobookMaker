@@ -1418,144 +1418,170 @@ def build_app():
         ):
             """Parse the book, cache chapter text, and write a self-contained
             generation_progress.json — without starting TTS generation."""
-            if file_obj is None:
-                return (
-                    "⚠️ Please upload a book file first.",
-                    gr.update(visible=False),
+            try:
+                path = file_obj.name if hasattr(file_obj, "name") else (str(file_obj) if file_obj else "")
+                
+                # Build output directory and config first
+                book_out = os.path.join(
+                    _OUTPUT_DIR,
+                    re.sub(r'[\\/*?":"<>|]', "", book_title or "audiobook"),
                 )
+                os.makedirs(book_out, exist_ok=True)
+                prog_path = os.path.join(book_out, "generation_progress.json")
 
-            path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+                # Check if progress JSON already has cached chapter text
+                chapters = _load_cached_chapters_if_available(prog_path, selected_chapters)
 
-            # Build chapter selections
-            selections = None
-            page_ranges = None
-            if scan_res and scan_res.has_toc and selected_chapters:
-                import re as _re
-                selections = []
-                for lbl in selected_chapters:
-                    after_num = lbl.split(". ", 1)[-1]
-                    title = _re.sub(r'\s+\(~[\d,]+\s*words\)\s*$', '', after_num).strip()
-                    if title:
-                        selections.append(title)
-            elif scan_res and not scan_res.has_toc and scan_res.file_type != "txt":
-                page_ranges = []
-                for part in page_ranges_str.split(","):
-                    part = part.strip()
-                    if "-" in part:
-                        try:
-                            s, e = part.split("-")
-                            page_ranges.append((int(s.strip()), int(e.strip())))
-                        except ValueError:
-                            pass
+                if not chapters:
+                    if not path or not os.path.exists(path):
+                        return (
+                            "⚠️ Please upload a book file first.",
+                            gr.update(visible=False),
+                            gr.update(open=True),
+                        )
 
-            # Build output directory and config
-            book_out = os.path.join(
-                _OUTPUT_DIR,
-                re.sub(r'[\\/*?":"<>|]', "", book_title or "audiobook"),
-            )
-            os.makedirs(book_out, exist_ok=True)
+                    # Build chapter selections
+                    selections = None
+                    page_ranges = None
+                    if scan_res and scan_res.has_toc and selected_chapters:
+                        import re as _re
+                        selections = []
+                        for lbl in selected_chapters:
+                            after_num = lbl.split(". ", 1)[-1]
+                            title = _re.sub(r'\s+\(~[\d,]+\s*words\)\s*$', '', after_num).strip()
+                            if title:
+                                selections.append(title)
+                    elif scan_res and not scan_res.has_toc and scan_res.file_type != "txt":
+                        page_ranges = []
+                        for part in page_ranges_str.split(","):
+                            part = part.strip()
+                            if "-" in part:
+                                try:
+                                    s, e = part.split("-")
+                                    page_ranges.append((int(s.strip()), int(e.strip())))
+                                except ValueError:
+                                    pass
 
-            # Check if progress JSON already has cached chapter text
-            prog_path = os.path.join(book_out, "generation_progress.json")
-            chapters = _load_cached_chapters_if_available(prog_path, selected_chapters)
+                    # Extract chapters (with text + sentences) from book file
+                    try:
+                        chapters, _ = extract(path, selections=selections or None,
+                                               enable_ocr=epub_ocr, page_ranges=page_ranges)
+                    except Exception as exc:
+                        return (
+                            f"❌ Book extraction failed: {exc}",
+                            gr.update(visible=False),
+                            gr.update(open=True),
+                        )
 
-            if not chapters:
-                # Extract chapters (with text + sentences) from book file
-                try:
-                    chapters, _ = extract(path, selections=selections or None,
-                                           enable_ocr=epub_ocr, page_ranges=page_ranges)
-                except Exception as exc:
+                if not chapters:
                     return (
-                        f"❌ Book extraction failed: {exc}",
+                        "⚠️ No chapters extracted from the book.",
                         gr.update(visible=False),
+                        gr.update(open=True),
                     )
 
-            if not chapters:
+                # Parse pronunciation file if provided
+                pron_map = {}
+                if pron_file_obj is not None:
+                    pf_path = pron_file_obj.name if hasattr(pron_file_obj, "name") else str(pron_file_obj)
+                    try:
+                        with open(pf_path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith("#") or "==" not in line:
+                                    continue
+                                search, repl = line.split("==", 1)
+                                pron_map[search.strip()] = repl.strip()
+                    except OSError:
+                        pass
+
+                # Sanitize paths / types
+                cover_image_path = None
+                if cover_path:
+                    if isinstance(cover_path, str):
+                        cover_image_path = cover_path
+                    elif isinstance(cover_path, dict) and "path" in cover_path:
+                        cover_image_path = cover_path["path"]
+
+                voice_file_path = ""
+                if voice_path:
+                    if hasattr(voice_path, "name"):
+                        voice_file_path = voice_path.name
+                    elif isinstance(voice_path, str):
+                        voice_file_path = voice_path
+
+                cfg = AudiobookConfig(
+                    book_title=book_title, book_path=path, author=author,
+                    language=book_language, cover_image=cover_image_path, output_dir=book_out,
+                    output_format=output_fmt, voice_file=voice_file_path,
+                    temperature=temp, top_p=top_p, pause=pause, para_pause=para_pause,
+                    max_len=int(max_len), lufs=int(lufs), true_peak=true_peak,
+                    force_reprocess=force_repro, worker_count=int(worker_count),
+                    parallel_mode=parallel_mode, export_text=bool(export_text),
+                    pronunciation_map=pron_map,
+                    tts_provider_name=tts_provider or "qwen", tts_model_name=mname,
+                    tts_timbre=timbre.split()[-1] if timbre else "",
+                    tts_instruct=instruct, single_file_mode=single_file,
+                    export_lrc=export_lrc, export_srt=export_srt, export_vtt=export_vtt,
+                    torch_compile=bool(torch_compile),
+                    selected_chapters=selected_chapters or [],
+                    regen_missing=bool(regen_missing),
+                )
+                settings_dict = dataclasses.asdict(cfg)
+
+                chapters_data = [
+                    {"num": ch.num, "title": ch.title, "text": ch.text, "sentences": ch.sentences}
+                    for ch in chapters
+                ]
+
+                if os.path.exists(prog_path):
+                    try:
+                        with open(prog_path, "r", encoding="utf-8") as f:
+                            existing = json.load(f)
+                        existing_by_num = {c["num"]: c for c in existing.get("chapters", [])}
+                    except Exception:
+                        existing_by_num = {}
+                        existing = {}
+
+                    merged_chapters = []
+                    for cd in chapters_data:
+                        ec = existing_by_num.get(cd["num"], {})
+                        merged_chapters.append({
+                            "num": cd["num"],
+                            "title": cd["title"],
+                            "status": ec.get("status", "pending"),
+                            "text": cd["text"],
+                            "sentences": cd["sentences"],
+                        })
+                    existing["settings"] = settings_dict
+                    existing["book_path"] = path
+                    existing["voice_file"] = voice_file_path
+                    existing["chapters"] = merged_chapters
+                    with open(prog_path, "w", encoding="utf-8") as f:
+                        json.dump(existing, f, indent=4)
+                else:
+                    load_or_create_progress_file(
+                        prog_path, chapters_data, book_title,
+                        book_path=path, voice_file=voice_file_path,
+                        settings=settings_dict,
+                    )
+
                 return (
-                    "⚠️ No chapters extracted from the book.",
+                    f"✅ **Config exported!** {len(chapters)} chapters cached.\n\n"
+                    f"File saved to:\n`{prog_path}`\n\n"
+                    f"To generate without Gradio, run:\n"
+                    f"```\npython cli.py \"{prog_path}\"\n```",
+                    gr.update(value=prog_path, visible=True),
+                    gr.update(open=True),
+                )
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                return (
+                    f"❌ **Config export failed:** {exc}",
                     gr.update(visible=False),
+                    gr.update(open=True),
                 )
-
-            # Parse pronunciation file if provided
-            pron_map = {}
-            if pron_file_obj is not None:
-                pf_path = pron_file_obj.name if hasattr(pron_file_obj, "name") else str(pron_file_obj)
-                try:
-                    with open(pf_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line or line.startswith("#") or "==" not in line:
-                                continue
-                            search, repl = line.split("==", 1)
-                            pron_map[search.strip()] = repl.strip()
-                except OSError:
-                    pass
-
-            cfg = AudiobookConfig(
-                book_title=book_title, book_path=path, author=author,
-                language=book_language, cover_image=cover_path, output_dir=book_out,
-                output_format=output_fmt, voice_file=voice_path,
-                temperature=temp, top_p=top_p, pause=pause, para_pause=para_pause,
-                max_len=int(max_len), lufs=int(lufs), true_peak=true_peak,
-                force_reprocess=force_repro, worker_count=int(worker_count),
-                parallel_mode=parallel_mode, export_text=bool(export_text),
-                pronunciation_map=pron_map,
-                tts_provider_name=tts_provider or "qwen", tts_model_name=mname,
-                tts_timbre=timbre.split()[-1] if timbre else "",
-                tts_instruct=instruct, single_file_mode=single_file,
-                export_lrc=export_lrc, export_srt=export_srt, export_vtt=export_vtt,
-                torch_compile=bool(torch_compile),
-                selected_chapters=selected_chapters or [],
-                regen_missing=bool(regen_missing),
-            )
-            settings_dict = dataclasses.asdict(cfg)
-
-            chapters_data = [
-                {"num": ch.num, "title": ch.title, "text": ch.text, "sentences": ch.sentences}
-                for ch in chapters
-            ]
-
-            prog_path = os.path.join(book_out, "generation_progress.json")
-            # Force fresh creation so text is always included
-            if os.path.exists(prog_path):
-                try:
-                    with open(prog_path, "r", encoding="utf-8") as f:
-                        existing = json.load(f)
-                    existing_by_num = {c["num"]: c for c in existing.get("chapters", [])}
-                except Exception:
-                    existing_by_num = {}
-                    existing = {}
-
-                merged_chapters = []
-                for cd in chapters_data:
-                    ec = existing_by_num.get(cd["num"], {})
-                    merged_chapters.append({
-                        "num": cd["num"],
-                        "title": cd["title"],
-                        "status": ec.get("status", "pending"),
-                        "text": cd["text"],
-                        "sentences": cd["sentences"],
-                    })
-                existing["settings"] = settings_dict
-                existing["book_path"] = path
-                existing["voice_file"] = voice_path or ""
-                existing["chapters"] = merged_chapters
-                with open(prog_path, "w", encoding="utf-8") as f:
-                    json.dump(existing, f, indent=4)
-            else:
-                load_or_create_progress_file(
-                    prog_path, chapters_data, book_title,
-                    book_path=path, voice_file=voice_path or "",
-                    settings=settings_dict,
-                )
-
-            return (
-                f"✅ **Config exported!** {len(chapters)} chapters cached.\n\n"
-                f"File saved to:\n`{prog_path}`\n\n"
-                f"To generate without Gradio, run:\n"
-                f"```\npython cli.py \"{prog_path}\"\n```",
-                gr.update(value=prog_path, visible=True),
-            )
 
         export_cfg_btn.click(
             on_export_config,
@@ -1572,7 +1598,7 @@ def build_app():
                 single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
                 torch_compile_chk, regen_missing_chk,
             ],
-            outputs=[export_cfg_status, export_config_file],
+            outputs=[export_cfg_status, export_config_file, export_cfg_accordion],
         )
 
         # ── Cancel ────────────────────────────────────────────────────────────
