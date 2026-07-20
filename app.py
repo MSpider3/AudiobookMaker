@@ -37,6 +37,9 @@ from audiobook_factory.voice_preprocessor import (
 from audiobook_factory.pipeline import (
     AudiobookConfig, CancelToken, run_pipeline, preview_tts, preview_chapters,
 )
+from audiobook_factory.utils import (
+    load_or_create_progress_file, update_progress_file,
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FastAPI orchestrator healthcheck helper
@@ -1515,10 +1518,9 @@ def build_app():
             prog_path = os.path.join(book_out, "generation_progress.json")
             # Force fresh creation so text is always included
             if os.path.exists(prog_path):
-                import json as _json
                 try:
                     with open(prog_path, "r", encoding="utf-8") as f:
-                        existing = _json.load(f)
+                        existing = json.load(f)
                     existing_by_num = {c["num"]: c for c in existing.get("chapters", [])}
                 except Exception:
                     existing_by_num = {}
@@ -1539,7 +1541,7 @@ def build_app():
                 existing["voice_file"] = voice_path or ""
                 existing["chapters"] = merged_chapters
                 with open(prog_path, "w", encoding="utf-8") as f:
-                    _json.dump(existing, f, indent=4)
+                    json.dump(existing, f, indent=4)
             else:
                 load_or_create_progress_file(
                     prog_path, chapters_data, book_title,
