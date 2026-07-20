@@ -145,6 +145,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override the TTS model variant (e.g. Qwen/Qwen3-TTS-12Hz-1.7B-Base).",
     )
     p.add_argument(
+        "--cover-image",
+        metavar="PATH",
+        default=None,
+        help="Override or supply the cover image file (PNG, JPG, WEBP).",
+    )
+    p.add_argument(
+        "--embed-cover-only",
+        action="store_true",
+        default=False,
+        help="Instantly embed the cover image into all existing audio files in output_dir without running TTS generation.",
+    )
+    p.add_argument(
         "--force-reprocess",
         action="store_true",
         default=False,
@@ -187,6 +199,8 @@ def _load_config(args) -> tuple[dict, dict, list[dict]]:
         meta["book_path"] = args.book_path
     if args.voice_file:
         meta["voice_file"] = args.voice_file
+    if args.cover_image:
+        settings["cover_image"] = args.cover_image
     if args.output_dir:
         settings["output_dir"] = args.output_dir
     if args.output_format:
@@ -225,8 +239,11 @@ def _build_audiobook_config(meta: dict, settings: dict) -> "AudiobookConfig":
     cover_image = settings.get("cover_image", None)
     cover_b64 = settings.get("cover_image_b64", None) or meta.get("cover_image_b64", None)
 
-    # Strategy 1: Decode base64 embedded cover data directly from JSON if present
-    if cover_b64:
+    # Strategy 1: Explicit CLI / setting cover_image if exists on disk
+    if cover_image and os.path.exists(cover_image):
+        pass
+    # Strategy 2: Decode base64 embedded cover data directly from JSON if present
+    elif cover_b64:
         try:
             import base64
             cov_bytes = base64.b64decode(cover_b64)
@@ -237,10 +254,6 @@ def _build_audiobook_config(meta: dict, settings: dict) -> "AudiobookConfig":
             cover_image = cov_path
         except Exception as e:
             print(f"⚠ Warning: Failed to decode base64 cover image: {e}")
-
-    # Strategy 2: Validate existing cover_image path
-    if cover_image and os.path.exists(cover_image):
-        pass
     else:
         # Strategy 3: Check for cover.jpg / cover.png in output_dir
         cov_in_out = os.path.join(output_dir, "cover.jpg")
@@ -252,7 +265,16 @@ def _build_audiobook_config(meta: dict, settings: dict) -> "AudiobookConfig":
         # Strategy 4: Check directory containing JSON file
         elif meta.get("_json_dir") and os.path.exists(os.path.join(meta["_json_dir"], "cover.jpg")):
             cover_image = os.path.join(meta["_json_dir"], "cover.jpg")
-        # Strategy 5: Re-extract from EPUB if book_path exists
+        # Strategy 5: Check current working directory for cover.jpg, cover.png, cover.jpeg, cover.webp
+        elif os.path.exists("cover.jpg"):
+            cover_image = os.path.abspath("cover.jpg")
+        elif os.path.exists("cover.png"):
+            cover_image = os.path.abspath("cover.png")
+        elif os.path.exists("cover.jpeg"):
+            cover_image = os.path.abspath("cover.jpeg")
+        elif os.path.exists("cover.webp"):
+            cover_image = os.path.abspath("cover.webp")
+        # Strategy 6: Re-extract from EPUB if book_path exists
         elif book_path and os.path.exists(book_path):
             try:
                 from audiobook_factory.text_extractor import scan
@@ -473,9 +495,55 @@ def main():
     print(f"  {_h('Output:')}   {cfg.output_dir}")
     print(f"  {_h('Format:')}   {cfg.output_format}")
     print(f"  {_h('Workers:')}  {cfg.worker_count}")
+    print(f"  {_h('CoverImg:')} {cfg.cover_image or '(none found)'}")
     print(f"  {_h('TextCache:')} {'✅ yes (fast resume)' if has_text else '⚠️  no  (book will be re-parsed)'}")
     print(_h("━" * 50))
     print()
+
+    # ── Handle --embed-cover-only ──────────────────────────────────────────────
+    if getattr(args, "embed_cover_only", False):
+        if not cfg.cover_image or not os.path.exists(cfg.cover_image):
+            print(_err("❌ No cover image specified or found on disk. Upload a cover file or pass --cover-image /path/to/cover.jpg"))
+            sys.exit(1)
+        
+        print(_info(f"🎨 Embedding cover image ({cfg.cover_image}) into all existing audio files in {cfg.output_dir}..."))
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        count = 0
+        import glob
+        import shutil as _shutil
+        import subprocess
+        from audiobook_factory.pipeline import _get_cover_flags, _ensure_valid_cover_image
+        
+        import tempfile
+        t_dir = tempfile.mkdtemp()
+        valid_cov = _ensure_valid_cover_image(cfg.cover_image, t_dir)
+        
+        audio_files = glob.glob(os.path.join(cfg.output_dir, f"*.{cfg.output_format}"))
+        if not audio_files:
+            # Also search for m4b, mp3, flac, wav
+            for ext in ("m4b", "mp3", "flac", "wav"):
+                audio_files.extend(glob.glob(os.path.join(cfg.output_dir, f"*.{ext}")))
+            audio_files = list(set(audio_files))
+
+        for af in sorted(audio_files):
+            try:
+                fmt = os.path.splitext(af)[1].lstrip(".").lower()
+                temp_out = os.path.join(t_dir, f"embedded_{os.path.basename(af)}")
+                flags = _get_cover_flags(fmt, True)
+                cmd = ["ffmpeg", "-y", "-i", af, "-i", valid_cov, "-c:a", "copy"] + flags + [temp_out]
+                res = subprocess.run(cmd, capture_output=True)
+                if res.returncode == 0:
+                    _shutil.move(temp_out, af)
+                    print(_ok(f"  ✓ Embedded cover into: {os.path.basename(af)}"))
+                    count += 1
+                else:
+                    err_msg = res.stderr.decode("utf-8", errors="replace")[:200]
+                    print(_warn(f"  ⚠️ Could not embed cover into {os.path.basename(af)}: {err_msg}"))
+            except Exception as e:
+                print(_warn(f"  ⚠️ Failed {os.path.basename(af)}: {e}"))
+        
+        print(_ok(f"🎉 Done! Embedded cover image into {count} audio files."))
+        sys.exit(0)
 
     # ── Load chapters ─────────────────────────────────────────────────────────
     chapters = _load_chapters(chapters_raw, meta, cfg)

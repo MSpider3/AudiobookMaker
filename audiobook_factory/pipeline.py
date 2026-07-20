@@ -676,6 +676,36 @@ def _process_chapter(
             except Exception as e:
                 log(f"  [Ch{idx}] WebVTT export failed: {e}")
 
+        # ── Ensure cover image is in valid format (e.g. JPEG/PNG) ────────────
+        raw_cover = config.cover_image
+        valid_cover = ""
+        if raw_cover and os.path.exists(raw_cover):
+            try:
+                ext = os.path.splitext(raw_cover)[1].lower()
+                if ext in (".jpg", ".jpeg", ".png"):
+                    valid_cover = raw_cover
+                else:
+                    from PIL import Image
+                    img = Image.open(raw_cover)
+                    if img.mode in ("RGBA", "P", "LA"):
+                        img = img.convert("RGB")
+                    conv_path = os.path.join(temp_dir, "cover_converted.jpg")
+                    img.save(conv_path, format="JPEG", quality=95)
+                    valid_cover = conv_path
+            except Exception:
+                valid_cover = raw_cover if os.path.exists(raw_cover) else ""
+
+        def _get_cover_flags(fmt: str, include_cover: bool) -> list[str]:
+            if not include_cover or not valid_cover:
+                return []
+            f = (fmt or "").lower()
+            if f == "mp3":
+                return ["-map", "0:a", "-map", "1:v", "-c:v", "copy", "-disposition:v", "attached_pic", "-id3v2_version", "3"]
+            elif f in ("m4b", "m4a", "mp4", "flac"):
+                return ["-map", "0:a", "-map", "1:v", "-c:v", "copy", "-disposition:v", "attached_pic"]
+            else:
+                return ["-map", "0:a", "-map", "1:v", "-c:v", "copy"]
+
         # ── In-memory audio mastering (Rust first, Python fallback) ───────────
         if not any(chunk_paths):
             log(f"  [Ch{idx}] ❌ No audio chunks generated successfully. Skipping.")
@@ -694,12 +724,9 @@ def _process_chapter(
 
             try:
                 bitrate_kbps = getattr(config, "bitrate_kbps", 64)
-                has_cover = bool(config.cover_image and os.path.exists(config.cover_image))
+                has_cover = bool(valid_cover and os.path.exists(valid_cover))
                 use_pure_rust = (config.output_format in ("mp3", "wav")) and not has_cover
 
-                # If pure rust, write directly to final out_path.
-                # If cover image is specified or other container/codec (e.g. flac, m4b) is used,
-                # master to a temporary WAV first and use FFmpeg to do packaging and copy streams.
                 master_target = out_path if use_pure_rust else os.path.join(temp_dir, "mastered.wav")
 
                 _audiobook_rust.master_audio(
@@ -719,12 +746,10 @@ def _process_chapter(
                     
                     def _build_cmd(include_cover: bool):
                         cmd = ["ffmpeg", "-y", "-i", master_target]
-                        if include_cover:
-                            cmd += ["-i", config.cover_image]
+                        if include_cover and valid_cover:
+                            cmd += ["-i", valid_cover]
                         cmd += audio_settings
-                        if include_cover:
-                            cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy",
-                                    "-disposition:v", "attached_pic", "-id3v2_version", "3"]
+                        cmd += _get_cover_flags(config.output_format, include_cover)
                         cmd += [
                             "-metadata", f"title={chapter.title}",
                             "-metadata", f"artist={config.author}",
@@ -741,7 +766,7 @@ def _process_chapter(
                     except subprocess.CalledProcessError as e:
                         stderr_log = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
                         if has_cover:
-                            log(f"  [Ch{idx}] ⚠ Cover embedding failed ({e}). Retrying without cover image...")
+                            log(f"  [Ch{idx}] ⚠ Cover embedding failed ({stderr_log[:200]}). Retrying without cover image...")
                             try:
                                 cmd_no_cover = _build_cmd(False)
                                 res = subprocess.run(cmd_no_cover, check=True, capture_output=True)
@@ -791,13 +816,11 @@ def _process_chapter(
                 "-ac", "1",
                 "-i", "pipe:0",
             ]
-            if include_cover:
-                cmd += ["-i", config.cover_image]
+            if include_cover and valid_cover:
+                cmd += ["-i", valid_cover]
             cmd += ["-af", f"loudnorm=I={config.lufs}:TP={config.true_peak}:LRA=11"]
             cmd += audio_settings
-            if include_cover:
-                cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy",
-                        "-disposition:v", "attached_pic", "-id3v2_version", "3"]
+            cmd += _get_cover_flags(config.output_format, include_cover)
             cmd += [
                 "-metadata", f"title={chapter.title}",
                 "-metadata", f"artist={config.author}",
@@ -808,7 +831,7 @@ def _process_chapter(
             ]
             return cmd
 
-        has_cover = bool(config.cover_image and os.path.exists(config.cover_image))
+        has_cover = bool(valid_cover and os.path.exists(valid_cover))
         raw_bytes = raw_audio.tobytes()
 
         try:
@@ -817,7 +840,7 @@ def _process_chapter(
         except subprocess.CalledProcessError as e:
             stderr_log = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
             if has_cover:
-                log(f"  [Ch{idx}] ⚠ Cover image encoding failed ({e}). Retrying without cover image...")
+                log(f"  [Ch{idx}] ⚠ Cover image encoding failed ({stderr_log[:200]}). Retrying without cover image...")
                 try:
                     cmd_no_cover = _build_py_cmd(False)
                     proc = subprocess.run(cmd_no_cover, input=raw_bytes, check=True, capture_output=True)
