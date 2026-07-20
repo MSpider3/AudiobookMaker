@@ -1437,10 +1437,14 @@ def build_app():
             # Force fresh creation so text is always included
             if os.path.exists(prog_path):
                 import json as _json
-                with open(prog_path, "r", encoding="utf-8") as f:
-                    existing = _json.load(f)
-                # Merge: preserve completed status, overwrite text
-                existing_by_num = {c["num"]: c for c in existing.get("chapters", [])}
+                try:
+                    with open(prog_path, "r", encoding="utf-8") as f:
+                        existing = _json.load(f)
+                    existing_by_num = {c["num"]: c for c in existing.get("chapters", [])}
+                except Exception:
+                    existing_by_num = {}
+                    existing = {}
+
                 merged_chapters = []
                 for cd in chapters_data:
                     ec = existing_by_num.get(cd["num"], {})
@@ -1463,11 +1467,6 @@ def build_app():
                     book_path=path, voice_file=voice_path or "",
                     settings=settings_dict,
                 )
-
-            n_completed = sum(1 for cd in chapters_data
-                              if any(ec.get("status") in ("completed", "complete")
-                                     for ec in [existing_by_num.get(cd["num"], {})])
-                              ) if os.path.exists(prog_path) else 0
 
             return (
                 f"✅ **Config exported!** {len(chapters)} chapters cached.\n\n"
