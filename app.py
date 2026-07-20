@@ -1538,20 +1538,37 @@ def build_app():
                     try:
                         with open(prog_path, "r", encoding="utf-8") as f:
                             existing = json.load(f)
-                        existing_by_num = {c["num"]: c for c in existing.get("chapters", [])}
+                        existing_chapters = existing.get("chapters", [])
+                        existing_by_num = {c["num"]: c for c in existing_chapters if "num" in c}
+                        existing_by_num_str = {str(c["num"]): c for c in existing_chapters if "num" in c}
+                        existing_by_title = {c.get("title", "").strip().lower(): c for c in existing_chapters if c.get("title")}
+                        existing_by_clean_title = {
+                            re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower(): c
+                            for c in existing_chapters if c.get("title")
+                        }
                     except Exception:
                         existing_by_num = {}
+                        existing_by_num_str = {}
+                        existing_by_title = {}
+                        existing_by_clean_title = {}
                         existing = {}
 
                     merged_chapters = []
                     for cd in chapters_data:
-                        ec = existing_by_num.get(cd["num"], {})
+                        title_clean = re.sub(r'\(~[\d,]+\s*words\)', '', cd.get("title", "")).strip().lower()
+                        ec = (
+                            existing_by_title.get(cd.get("title", "").strip().lower())
+                            or existing_by_clean_title.get(title_clean)
+                            or existing_by_num.get(cd.get("num"))
+                            or existing_by_num_str.get(str(cd.get("num")))
+                            or {}
+                        )
                         merged_chapters.append({
                             "num": cd["num"],
                             "title": cd["title"],
                             "status": ec.get("status", "pending"),
-                            "text": cd["text"],
-                            "sentences": cd["sentences"],
+                            "text": cd.get("text") or ec.get("text", ""),
+                            "sentences": cd.get("sentences") or ec.get("sentences", []),
                         })
                     existing["settings"] = settings_dict
                     existing["book_path"] = path

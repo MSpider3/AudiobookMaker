@@ -60,15 +60,29 @@ def load_or_create_progress_file(progress_path, chapters_data, book_title, book_
             data = json.load(f)
 
         # Backfill text/sentences for chapters that are missing them (old format)
-        existing_by_num = {c["num"]: c for c in data.get("chapters", [])}
+        existing_chapters = data.get("chapters", [])
+        existing_by_num = {c["num"]: c for c in existing_chapters if "num" in c}
+        existing_by_num_str = {str(c["num"]): c for c in existing_chapters if "num" in c}
+        existing_by_title = {c.get("title", "").strip().lower(): c for c in existing_chapters if c.get("title")}
+        existing_by_clean_title = {
+            re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower(): c
+            for c in existing_chapters if c.get("title")
+        }
+
         dirty = False
         for cd in chapters_data:
-            ch = existing_by_num.get(cd["num"])
+            title_clean = re.sub(r'\(~[\d,]+\s*words\)', '', cd.get("title", "")).strip().lower()
+            ch = (
+                existing_by_title.get(cd.get("title", "").strip().lower())
+                or existing_by_clean_title.get(title_clean)
+                or existing_by_num.get(cd.get("num"))
+                or existing_by_num_str.get(str(cd.get("num")))
+            )
             if ch is not None:
-                if "text" not in ch and cd.get("text"):
+                if ("text" not in ch or not ch["text"]) and cd.get("text"):
                     ch["text"] = cd["text"]
                     dirty = True
-                if "sentences" not in ch and cd.get("sentences"):
+                if ("sentences" not in ch or not ch["sentences"]) and cd.get("sentences"):
                     ch["sentences"] = cd["sentences"]
                     dirty = True
         if dirty:
