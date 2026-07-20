@@ -1529,6 +1529,35 @@ def build_app():
                 )
                 settings_dict = dataclasses.asdict(cfg)
 
+                # ── Embed cover image in Base64 and save local cover.jpg ──────
+                cover_bytes = None
+                if cover_image_path and os.path.exists(cover_image_path):
+                    try:
+                        with open(cover_image_path, "rb") as f_cov:
+                            cover_bytes = f_cov.read()
+                    except Exception:
+                        pass
+                if not cover_bytes and path and os.path.exists(path):
+                    try:
+                        from audiobook_factory.text_extractor import scan
+                        s_res = scan(path)
+                        cover_bytes = s_res.cover_data
+                    except Exception:
+                        pass
+
+                if cover_bytes:
+                    os.makedirs(out_dir, exist_ok=True)
+                    local_cov = os.path.join(out_dir, "cover.jpg")
+                    try:
+                        with open(local_cov, "wb") as f_cov:
+                            f_cov.write(cover_bytes)
+                        settings_dict["cover_image"] = local_cov
+                    except Exception:
+                        pass
+                    import base64
+                    b64_cov = base64.b64encode(cover_bytes).decode("utf-8")
+                    settings_dict["cover_image_b64"] = b64_cov
+
                 chapters_data = [
                     {"num": ch.num, "title": ch.title, "text": ch.text, "sentences": ch.sentences}
                     for ch in chapters
@@ -1588,6 +1617,8 @@ def build_app():
                     existing["settings"] = settings_dict
                     existing["book_path"] = path
                     existing["voice_file"] = voice_file_path
+                    if settings_dict.get("cover_image_b64"):
+                        existing["cover_image_b64"] = settings_dict["cover_image_b64"]
                     existing["chapters"] = merged_chapters
                     with open(prog_path, "w", encoding="utf-8") as f:
                         json.dump(existing, f, indent=4)

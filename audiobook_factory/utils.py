@@ -156,6 +156,7 @@ def load_or_create_progress_file(progress_path, chapters_data, book_title, book_
             "book_title": book_title,
             "book_path": book_path,
             "voice_file": voice_file,
+            "cover_image_b64": (settings or {}).get("cover_image_b64", ""),
             "settings": settings or {},
             "chapters": [
                 {

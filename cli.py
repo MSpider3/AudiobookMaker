@@ -176,6 +176,8 @@ def _load_config(args) -> tuple[dict, dict, list[dict]]:
         "book_title":  data.get("book_title", "Audiobook"),
         "book_path":   data.get("book_path", ""),
         "voice_file":  data.get("voice_file", ""),
+        "cover_image_b64": data.get("cover_image_b64", ""),
+        "_json_dir":   os.path.dirname(path),
     }
     settings = data.get("settings", {})
     chapters_raw = data.get("chapters", [])
@@ -221,22 +223,52 @@ def _build_audiobook_config(meta: dict, settings: dict) -> "AudiobookConfig":
         output_dir = os.path.join(_ROOT, "audiobook_output", safe_title)
 
     cover_image = settings.get("cover_image", None)
-    if cover_image and not os.path.exists(cover_image) and book_path and os.path.exists(book_path):
+    cover_b64 = settings.get("cover_image_b64", None) or meta.get("cover_image_b64", None)
+
+    # Strategy 1: Decode base64 embedded cover data directly from JSON if present
+    if cover_b64:
         try:
-            from audiobook_factory.text_extractor import scan
-            scan_res = scan(book_path)
-            if scan_res.cover_data:
-                os.makedirs(output_dir, exist_ok=True)
-                extracted_cov_path = os.path.join(output_dir, "cover.jpg")
-                with open(extracted_cov_path, "wb") as f_cov:
-                    f_cov.write(scan_res.cover_data)
-                cover_image = extracted_cov_path
-            else:
+            import base64
+            cov_bytes = base64.b64decode(cover_b64)
+            os.makedirs(output_dir, exist_ok=True)
+            cov_path = os.path.join(output_dir, "cover.jpg")
+            with open(cov_path, "wb") as f_cov:
+                f_cov.write(cov_bytes)
+            cover_image = cov_path
+        except Exception as e:
+            print(f"⚠ Warning: Failed to decode base64 cover image: {e}")
+
+    # Strategy 2: Validate existing cover_image path
+    if cover_image and os.path.exists(cover_image):
+        pass
+    else:
+        # Strategy 3: Check for cover.jpg / cover.png in output_dir
+        cov_in_out = os.path.join(output_dir, "cover.jpg")
+        cov_in_out_png = os.path.join(output_dir, "cover.png")
+        if os.path.exists(cov_in_out):
+            cover_image = cov_in_out
+        elif os.path.exists(cov_in_out_png):
+            cover_image = cov_in_out_png
+        # Strategy 4: Check directory containing JSON file
+        elif meta.get("_json_dir") and os.path.exists(os.path.join(meta["_json_dir"], "cover.jpg")):
+            cover_image = os.path.join(meta["_json_dir"], "cover.jpg")
+        # Strategy 5: Re-extract from EPUB if book_path exists
+        elif book_path and os.path.exists(book_path):
+            try:
+                from audiobook_factory.text_extractor import scan
+                scan_res = scan(book_path)
+                if scan_res.cover_data:
+                    os.makedirs(output_dir, exist_ok=True)
+                    extracted_cov_path = os.path.join(output_dir, "cover.jpg")
+                    with open(extracted_cov_path, "wb") as f_cov:
+                        f_cov.write(scan_res.cover_data)
+                    cover_image = extracted_cov_path
+                else:
+                    cover_image = None
+            except Exception:
                 cover_image = None
-        except Exception:
+        else:
             cover_image = None
-    elif cover_image and not os.path.exists(cover_image):
-        cover_image = None
 
     return AudiobookConfig(
         book_title        = book_title,
