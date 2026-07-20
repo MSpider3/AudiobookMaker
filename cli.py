@@ -274,23 +274,31 @@ def _build_audiobook_config(meta: dict, settings: dict) -> "AudiobookConfig":
             cover_image = os.path.abspath("cover.jpeg")
         elif os.path.exists("cover.webp"):
             cover_image = os.path.abspath("cover.webp")
-        # Strategy 6: Re-extract from EPUB if book_path exists
-        elif book_path and os.path.exists(book_path):
-            try:
-                from audiobook_factory.text_extractor import scan
-                scan_res = scan(book_path)
-                if scan_res.cover_data:
-                    os.makedirs(output_dir, exist_ok=True)
-                    extracted_cov_path = os.path.join(output_dir, "cover.jpg")
-                    with open(extracted_cov_path, "wb") as f_cov:
-                        f_cov.write(scan_res.cover_data)
-                    cover_image = extracted_cov_path
-                else:
-                    cover_image = None
-            except Exception:
-                cover_image = None
+        # Strategy 6: Re-extract from EPUB if book_path exists or search working directory for any .epub file
         else:
-            cover_image = None
+            epub_candidate = book_path if (book_path and os.path.exists(book_path)) else None
+            if not epub_candidate:
+                import glob
+                epubs = glob.glob("*.epub") or glob.glob("*/*.epub") or glob.glob("/kaggle/working/*.epub")
+                if epubs:
+                    epub_candidate = os.path.abspath(epubs[0])
+            
+            if epub_candidate and os.path.exists(epub_candidate):
+                try:
+                    from audiobook_factory.text_extractor import scan
+                    scan_res = scan(epub_candidate)
+                    if scan_res.cover_data:
+                        os.makedirs(output_dir, exist_ok=True)
+                        extracted_cov_path = os.path.join(output_dir, "cover.jpg")
+                        with open(extracted_cov_path, "wb") as f_cov:
+                            f_cov.write(scan_res.cover_data)
+                        cover_image = extracted_cov_path
+                    else:
+                        cover_image = None
+                except Exception:
+                    cover_image = None
+            else:
+                cover_image = None
 
     return AudiobookConfig(
         book_title        = book_title,
