@@ -6,10 +6,12 @@ Opens: http://localhost:7860
 """
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -846,6 +848,47 @@ def build_app():
                     out.append(title)
             return out or None
 
+        def _load_cached_chapters_if_available(prog_json_path: str, selected_chapters_labels: list[str] | None = None, log_fn=None):
+            """If prog_json_path exists and has cached text for chapters, return list of ExtractedChapter objects.
+            Otherwise return None."""
+            if not os.path.exists(prog_json_path):
+                return None
+            try:
+                with open(prog_json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                ch_list = data.get("chapters", [])
+                if not ch_list or not all(c.get("text", "").strip() for c in ch_list):
+                    return None
+                
+                selected_titles = _parse_chapter_titles(selected_chapters_labels) if selected_chapters_labels else None
+                
+                chapters = []
+                for c in ch_list:
+                    title = c.get("title", "")
+                    num = c.get("num", 0)
+                    if selected_titles:
+                        matched = False
+                        for st in selected_titles:
+                            if st and (st == title or st in title):
+                                matched = True
+                                break
+                        if not matched:
+                            continue
+                    chapters.append(ExtractedChapter(
+                        num=num,
+                        title=title,
+                        text=c["text"],
+                        sentences=c.get("sentences") or []
+                    ))
+                if chapters:
+                    if log_fn:
+                        log_fn("📦 Using cached chapter text from progress JSON (skipping book re-parsing).")
+                    return chapters
+            except Exception as e:
+                if log_fn:
+                    log_fn(f"⚠️ Could not load cached text from progress JSON: {e}")
+            return None
+
         def on_preview(scan_res, file_obj, selected_chapters, page_ranges_str, epub_ocr):
             if file_obj is None:
                 yield "", gr.update(visible=False)
@@ -1028,14 +1071,19 @@ def build_app():
 
             def _runner():
                 try:
-                    # Extract
-                    chapters, _ = extract(
-                        path,
-                        selections=selections,
-                        enable_ocr=epub_ocr,
-                        page_ranges=page_ranges,
-                        log_fn=log_q.put,
-                    )
+                    # Check if progress JSON already has cached chapter text
+                    prog_json_path = os.path.join(book_out, "generation_progress.json")
+                    chapters = _load_cached_chapters_if_available(prog_json_path, selected_chapters, log_q.put)
+                    
+                    if not chapters:
+                        # Extract from book file
+                        chapters, _ = extract(
+                            path,
+                            selections=selections,
+                            enable_ocr=epub_ocr,
+                            page_ranges=page_ranges,
+                            log_fn=log_q.put,
+                        )
                     if chapters:
                         if is_api_healthy():
                             try:
@@ -1397,28 +1445,33 @@ def build_app():
                         except ValueError:
                             pass
 
-            # Extract chapters (with text + sentences)
-            try:
-                chapters, _ = extract(path, selections=selections or None,
-                                       enable_ocr=epub_ocr, page_ranges=page_ranges)
-            except Exception as exc:
-                return (
-                    f"❌ Book extraction failed: {exc}",
-                    gr.update(visible=False),
-                )
-
-            if not chapters:
-                return (
-                    "⚠️ No chapters extracted from the book.",
-                    gr.update(visible=False),
-                )
-
             # Build output directory and config
             book_out = os.path.join(
                 _OUTPUT_DIR,
                 re.sub(r'[\\/*?":"<>|]', "", book_title or "audiobook"),
             )
             os.makedirs(book_out, exist_ok=True)
+
+            # Check if progress JSON already has cached chapter text
+            prog_path = os.path.join(book_out, "generation_progress.json")
+            chapters = _load_cached_chapters_if_available(prog_path, selected_chapters)
+
+            if not chapters:
+                # Extract chapters (with text + sentences) from book file
+                try:
+                    chapters, _ = extract(path, selections=selections or None,
+                                           enable_ocr=epub_ocr, page_ranges=page_ranges)
+                except Exception as exc:
+                    return (
+                        f"❌ Book extraction failed: {exc}",
+                        gr.update(visible=False),
+                    )
+
+            if not chapters:
+                return (
+                    "⚠️ No chapters extracted from the book.",
+                    gr.update(visible=False),
+                )
 
             # Parse pronunciation file if provided
             pron_map = {}
