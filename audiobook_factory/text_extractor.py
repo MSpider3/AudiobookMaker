@@ -94,14 +94,46 @@ def _epub_metadata(book) -> tuple[str, str, bytes | None]:
     title  = (book.get_metadata("DC", "title")  or [("Unknown Title",  {})])[0][0]
     author = (book.get_metadata("DC", "creator") or [("Unknown Author", {})])[0][0]
     cover_data = None
-    cover = book.get_item_with_id("cover")
-    if cover:
-        cover_data = cover.get_content()
-    else:
+
+    # Strategy 1: Check standard item IDs
+    for cover_id in ["cover", "cover-image", "cover.jpg", "cover.png", "cover.jpeg", "cover-img"]:
+        try:
+            cover = book.get_item_with_id(cover_id)
+            if cover:
+                cover_data = cover.get_content()
+                if cover_data:
+                    break
+        except Exception:
+            pass
+
+    # Strategy 2: Check ITEM_IMAGE properties
+    if not cover_data:
         for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
             if "cover-image" in item.get_properties():
                 cover_data = item.get_content()
-                break
+                if cover_data:
+                    break
+
+    # Strategy 3: Check image filenames containing 'cover'
+    if not cover_data:
+        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+            name = (getattr(item, "file_name", "") or getattr(item, "name", "") or "").lower()
+            if "cover" in name:
+                cover_data = item.get_content()
+                if cover_data:
+                    break
+
+    # Strategy 4: Fallback to the first substantial image item
+    if not cover_data:
+        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+            try:
+                content = item.get_content()
+                if content and len(content) > 1000:
+                    cover_data = content
+                    break
+            except Exception:
+                pass
+
     return title, author, cover_data
 
 

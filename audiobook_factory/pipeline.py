@@ -404,7 +404,7 @@ def run_pipeline(
                 # Update checkpoint files
                 for p in [prog_path_out, prog_path_tmp]:
                     try:
-                        update_progress_file(p, idx, "completed")
+                        update_progress_file(p, idx, "completed", chapter_title=chapter.title)
                     except:
                         pass
             return path
@@ -716,29 +716,40 @@ def _process_chapter(
 
                 if not use_pure_rust:
                     audio_settings, _, _ = get_format_settings(config.output_format)[:3]
-                    ffmpeg_cmd = [
-                        "ffmpeg", "-y",
-                        "-i", master_target,
-                    ]
-                    if has_cover:
-                        ffmpeg_cmd += ["-i", config.cover_image]
                     
-                    ffmpeg_cmd += audio_settings
+                    def _build_cmd(include_cover: bool):
+                        cmd = ["ffmpeg", "-y", "-i", master_target]
+                        if include_cover:
+                            cmd += ["-i", config.cover_image]
+                        cmd += audio_settings
+                        if include_cover:
+                            cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy",
+                                    "-disposition:v", "attached_pic", "-id3v2_version", "3"]
+                        cmd += [
+                            "-metadata", f"title={chapter.title}",
+                            "-metadata", f"artist={config.author}",
+                            "-metadata", f"album={config.book_title}",
+                            "-metadata", f"track={idx}",
+                            "-metadata", "genre=Audiobook",
+                            out_path,
+                        ]
+                        return cmd
 
-                    if has_cover:
-                        ffmpeg_cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy",
-                                       "-disposition:v", "attached_pic", "-id3v2_version", "3"]
-
-                    ffmpeg_cmd += [
-                        "-metadata", f"title={chapter.title}",
-                        "-metadata", f"artist={config.author}",
-                        "-metadata", f"album={config.book_title}",
-                        "-metadata", f"track={idx}",
-                        "-metadata", "genre=Audiobook",
-                        out_path,
-                    ]
-
-                    subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+                    try:
+                        cmd = _build_cmd(has_cover)
+                        res = subprocess.run(cmd, check=True, capture_output=True)
+                    except subprocess.CalledProcessError as e:
+                        stderr_log = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
+                        if has_cover:
+                            log(f"  [Ch{idx}] ⚠ Cover embedding failed ({e}). Retrying without cover image...")
+                            try:
+                                cmd_no_cover = _build_cmd(False)
+                                res = subprocess.run(cmd_no_cover, check=True, capture_output=True)
+                            except subprocess.CalledProcessError as e2:
+                                stderr_log2 = e2.stderr.decode("utf-8", errors="replace") if e2.stderr else str(e2)
+                                raise RuntimeError(f"FFmpeg encoding failed: {stderr_log2}")
+                        else:
+                            raise RuntimeError(f"FFmpeg encoding failed: {stderr_log}")
                 
                 return out_path
 
@@ -746,11 +757,8 @@ def _process_chapter(
                 log(f"  [Ch{idx}] ⚠ Rust mastering failed ({rust_err}). Falling back to Python/FFmpeg.")
 
         # ── Python fallback: In-memory WAV concat ─────────────────────────────
-        # Build the silence pause array once
         pause_samples = np.zeros(int(config.pause * config.sample_rate), dtype=np.float32)
 
-        # Concatenate all chunk WAVs + pauses in-memory (no disk I/O)
-        # Determine the last valid chunk index so we don't add a trailing silence
         valid_indices = [i for i, p in enumerate(chunk_paths) if p and os.path.exists(p)]
         last_valid_idx = valid_indices[-1] if valid_indices else -1
         audio_segments: list[np.ndarray] = []
@@ -759,10 +767,10 @@ def _process_chapter(
                 try:
                     chunk_audio, _ = sf.read(p, dtype="float32")
                     audio_segments.append(chunk_audio)
-                    if i != last_valid_idx:  # no trailing silence after last real chunk
+                    if i != last_valid_idx:
                         audio_segments.append(pause_samples)
                 except Exception:
-                    pass  # skip corrupt chunks
+                    pass
 
         if not audio_segments:
             log(f"  [Ch{idx}] ❌ No valid audio segments. Skipping.")
@@ -775,46 +783,50 @@ def _process_chapter(
         # ── Single FFmpeg call: loudnorm + encode (piped via stdin) ───────────
         audio_settings, _, _ = get_format_settings(config.output_format)[:3]
 
-        # Build FFmpeg command: read raw PCM from stdin → loudnorm → encode
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-f", "f32le",                       # 32-bit float PCM input
-            "-ar", str(config.sample_rate),       # sample rate
-            "-ac", "1",                           # mono
-            "-i", "pipe:0",                       # read from stdin
-        ]
+        def _build_py_cmd(include_cover: bool):
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "f32le",
+                "-ar", str(config.sample_rate),
+                "-ac", "1",
+                "-i", "pipe:0",
+            ]
+            if include_cover:
+                cmd += ["-i", config.cover_image]
+            cmd += ["-af", f"loudnorm=I={config.lufs}:TP={config.true_peak}:LRA=11"]
+            cmd += audio_settings
+            if include_cover:
+                cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy",
+                        "-disposition:v", "attached_pic", "-id3v2_version", "3"]
+            cmd += [
+                "-metadata", f"title={chapter.title}",
+                "-metadata", f"artist={config.author}",
+                "-metadata", f"album={config.book_title}",
+                "-metadata", f"track={idx}",
+                "-metadata", "genre=Audiobook",
+                out_path,
+            ]
+            return cmd
 
-        # Add cover image if exists
-        has_cover = False
-        if config.cover_image and os.path.exists(config.cover_image):
-            ffmpeg_cmd += ["-i", config.cover_image]
-            has_cover = True
+        has_cover = bool(config.cover_image and os.path.exists(config.cover_image))
+        raw_bytes = raw_audio.tobytes()
 
-        # Loudnorm filter (was a separate FFmpeg call before)
-        ffmpeg_cmd += ["-af", f"loudnorm=I={config.lufs}:TP={config.true_peak}:LRA=11"]
+        try:
+            cmd = _build_py_cmd(has_cover)
+            proc = subprocess.run(cmd, input=raw_bytes, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            stderr_log = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
+            if has_cover:
+                log(f"  [Ch{idx}] ⚠ Cover image encoding failed ({e}). Retrying without cover image...")
+                try:
+                    cmd_no_cover = _build_py_cmd(False)
+                    proc = subprocess.run(cmd_no_cover, input=raw_bytes, check=True, capture_output=True)
+                except subprocess.CalledProcessError as e2:
+                    stderr_log2 = e2.stderr.decode("utf-8", errors="replace") if e2.stderr else str(e2)
+                    raise RuntimeError(f"FFmpeg python fallback encoding failed: {stderr_log2}")
+            else:
+                raise RuntimeError(f"FFmpeg python fallback encoding failed: {stderr_log}")
 
-        ffmpeg_cmd += audio_settings
-
-        if has_cover:
-            ffmpeg_cmd += ["-map", "0:a", "-map", "1:v", "-c:v", "copy",
-                           "-disposition:v", "attached_pic", "-id3v2_version", "3"]
-
-        ffmpeg_cmd += [
-            "-metadata", f"title={chapter.title}",
-            "-metadata", f"artist={config.author}",
-            "-metadata", f"album={config.book_title}",
-            "-metadata", f"track={idx}",
-            "-metadata", "genre=Audiobook",
-            out_path,
-        ]
-
-        # Pipe raw PCM bytes to FFmpeg stdin (no intermediate files)
-        proc = subprocess.run(
-            ffmpeg_cmd,
-            input=raw_audio.tobytes(),
-            check=True,
-            capture_output=True,
-        )
         return out_path
 
 

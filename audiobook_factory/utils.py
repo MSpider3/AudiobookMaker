@@ -30,21 +30,51 @@ def seconds_to_vtt_time(seconds):
 import threading as _threading
 _progress_lock = _threading.Lock()
 
-def update_progress_file(progress_path, chapter_num, status):
+def update_progress_file(progress_path, chapter_num, status, chapter_title=""):
     """
     Updates the progress JSON file for a specific chapter.
     Thread-safe: uses a module-level lock to prevent race conditions
     when multiple chapter workers complete simultaneously.
+    Supports title priority matching so off-by-one numeric index shifts do not target wrong chapters.
     """
     with _progress_lock:
-        with open(progress_path, 'r', encoding='utf-8') as f:
-            progress_data = json.load(f)
-        for chapter in progress_data["chapters"]:
-            if chapter["num"] == chapter_num:
-                chapter["status"] = status
-                break
-        with open(progress_path, 'w', encoding='utf-8') as f:
-            json.dump(progress_data, f, indent=4)
+        if not os.path.exists(progress_path):
+            return
+        try:
+            with open(progress_path, 'r', encoding='utf-8') as f:
+                progress_data = json.load(f)
+
+            found = False
+            if chapter_title:
+                ch_title_raw = chapter_title.strip().lower()
+                ch_clean = re.sub(r'\(~[\d,]+\s*words\)', '', chapter_title).strip().lower()
+                ch_num_ext, ch_core = normalize_chapter_title_for_matching(chapter_title)
+
+                for chapter in progress_data.get("chapters", []):
+                    c_title_raw = chapter.get("title", "").strip().lower()
+                    c_clean = re.sub(r'\(~[\d,]+\s*words\)', '', chapter.get("title", "")).strip().lower()
+                    c_num_ext, c_core = normalize_chapter_title_for_matching(chapter.get("title", ""))
+
+                    if (
+                        (c_title_raw and c_title_raw == ch_title_raw)
+                        or (c_clean and c_clean == ch_clean)
+                        or (c_core and ch_core and c_core == ch_core)
+                        or (c_num_ext is not None and ch_num_ext is not None and c_num_ext == ch_num_ext and c_core == ch_core)
+                    ):
+                        chapter["status"] = status
+                        found = True
+                        break
+
+            if not found:
+                for chapter in progress_data.get("chapters", []):
+                    if chapter.get("num") == chapter_num or str(chapter.get("num")) == str(chapter_num):
+                        chapter["status"] = status
+                        break
+
+            with open(progress_path, 'w', encoding='utf-8') as f:
+                json.dump(progress_data, f, indent=4)
+        except Exception as e:
+            print(f"Warning: Failed to update progress file {progress_path}: {e}")
 
 def normalize_chapter_title_for_matching(title: str):
     if not title:
