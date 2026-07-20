@@ -345,6 +345,8 @@ def run_pipeline(
         ch_clean_norm = re.sub(r'\(~[\d,]+\s*words\)', '', chapter.title).strip().lower()
         ch_num_extracted, ch_core = normalize_chapter_title_for_matching(chapter.title)
 
+        found_match = False
+        # Phase 1: High priority Title Matching
         for c in progress_data.get("chapters", []):
             c_title_norm = c.get("title", "").strip().lower()
             c_clean_norm = re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower()
@@ -353,14 +355,24 @@ def run_pipeline(
             if (
                 (c_title_norm and c_title_norm == ch_title_norm)
                 or (c_clean_norm and c_clean_norm == ch_clean_norm)
-                or (c_num_extracted is not None and ch_num_extracted is not None and c_num_extracted == ch_num_extracted and c_core == ch_core)
                 or (c_core and ch_core and c_core == ch_core)
-                or (c_num_extracted is not None and ch_num_extracted is not None and c_num_extracted == ch_num_extracted)
-                or c.get("num") == idx
-                or (hasattr(chapter, "num") and str(c.get("num")) == str(chapter.num))
+                or (c_num_extracted is not None and ch_num_extracted is not None and c_num_extracted == ch_num_extracted and c_core == ch_core)
             ):
                 ch_status = c.get("status", "pending")
+                found_match = True
                 break
+
+        # Phase 2: Fallback Index Matching if no title match was found
+        if not found_match:
+            for c in progress_data.get("chapters", []):
+                c_num_extracted, _ = normalize_chapter_title_for_matching(c.get("title", ""))
+                if (
+                    c.get("num") == idx
+                    or (hasattr(chapter, "num") and str(c.get("num")) == str(chapter.num))
+                    or (c_num_extracted is not None and ch_num_extracted is not None and c_num_extracted == ch_num_extracted)
+                ):
+                    ch_status = c.get("status", "pending")
+                    break
         
         if ch_status == "completed" and not config.force_reprocess:
             log(f"[Chapter {idx}/{total}] ⏩ Already completed. Skipping.")

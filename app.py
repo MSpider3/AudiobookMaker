@@ -1551,6 +1551,7 @@ def build_app():
                         cd_num_extracted, cd_core = normalize_chapter_title_for_matching(cd.get("title", ""))
 
                         ec = {}
+                        # Phase 1: High Priority Title Matching
                         for c in existing_chapters:
                             c_title_raw = c.get("title", "").strip().lower()
                             c_clean = re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower()
@@ -1559,14 +1560,23 @@ def build_app():
                             if (
                                 (c_title_raw and c_title_raw == cd_title_raw)
                                 or (c_clean and c_clean == cd_clean)
-                                or (c_num_extracted is not None and cd_num_extracted is not None and c_num_extracted == cd_num_extracted and c_core == cd_core)
                                 or (c_core and cd_core and c_core == cd_core)
-                                or (c_num_extracted is not None and cd_num_extracted is not None and c_num_extracted == cd_num_extracted)
-                                or (c.get("num") is not None and c.get("num") == cd.get("num"))
-                                or (c.get("num") is not None and str(c.get("num")) == str(cd.get("num")))
+                                or (c_num_extracted is not None and cd_num_extracted is not None and c_num_extracted == cd_num_extracted and c_core == cd_core)
                             ):
                                 ec = c
                                 break
+
+                        # Phase 2: Fallback Index Matching if no title match was found
+                        if not ec:
+                            for c in existing_chapters:
+                                c_num_extracted, _ = normalize_chapter_title_for_matching(c.get("title", ""))
+                                if (
+                                    (c.get("num") is not None and c.get("num") == cd.get("num"))
+                                    or (c.get("num") is not None and str(c.get("num")) == str(cd.get("num")))
+                                    or (c_num_extracted is not None and cd_num_extracted is not None and c_num_extracted == cd_num_extracted)
+                                ):
+                                    ec = c
+                                    break
 
                         merged_chapters.append({
                             "num": cd["num"],
