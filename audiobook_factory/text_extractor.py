@@ -78,14 +78,43 @@ class ExtractedChapter:
 
 def _detect_type(path: str) -> str:
     ext = Path(path).suffix.lower()
-    return {
+    detected = {
         ".epub": "epub",
         ".mobi": "mobi",
         ".pdf":  "pdf",
         ".docx": "docx",
         ".odt":  "odt",
         ".txt":  "txt",
-    }.get(ext, "unknown")
+    }.get(ext, "")
+    if detected:
+        return detected
+
+    # Content-based magic detection fallback if file lacks extension
+    if os.path.exists(path) and os.path.isfile(path):
+        try:
+            with open(path, "rb") as f:
+                head = f.read(2048)
+            if head.startswith(b"%PDF"):
+                return "pdf"
+            if b"BOOKMOBI" in head or b"TEXtREAG" in head:
+                return "mobi"
+        except Exception:
+            pass
+
+        import zipfile
+        if zipfile.is_zipfile(path):
+            try:
+                with zipfile.ZipFile(path, "r") as z:
+                    names = z.namelist()
+                    if "META-INF/container.xml" in names or "mimetype" in names:
+                        return "epub"
+                    if "word/document.xml" in names:
+                        return "docx"
+                    if "content.xml" in names:
+                        return "odt"
+            except Exception:
+                pass
+    return "unknown"
 
 
 def _epub_metadata(book) -> tuple[str, str, bytes | None]:
@@ -134,7 +163,31 @@ def _epub_metadata(book) -> tuple[str, str, bytes | None]:
             except Exception:
                 pass
 
+    # Strategy 5: Raw zipfile extraction fallback if book has file_name
+    if not cover_data:
+        book_file_path = getattr(book, "file_name", None)
+        if book_file_path and os.path.exists(book_file_path):
+            cover_data = extract_epub_cover_fallback(book_file_path)
+
     return title, author, cover_data
+
+
+def extract_epub_cover_fallback(epub_path: str) -> bytes | None:
+    """Raw zipfile fallback to extract cover image from an EPUB file."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(epub_path, "r") as z:
+            for name in z.namelist():
+                lname = name.lower()
+                if ("cover" in lname) and lname.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    return z.read(name)
+            images = [n for n in z.namelist() if n.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
+            if images:
+                images.sort(key=lambda n: z.getinfo(n).file_size, reverse=True)
+                return z.read(images[0])
+    except Exception:
+        pass
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
