@@ -339,9 +339,26 @@ def run_pipeline(
             return None
 
         # Check checkpoint
+        from audiobook_factory.utils import normalize_chapter_title_for_matching
         ch_status = "pending"
+        ch_title_norm = chapter.title.strip().lower()
+        ch_clean_norm = re.sub(r'\(~[\d,]+\s*words\)', '', chapter.title).strip().lower()
+        ch_num_extracted, ch_core = normalize_chapter_title_for_matching(chapter.title)
+
         for c in progress_data.get("chapters", []):
-            if c["num"] == idx:
+            c_title_norm = c.get("title", "").strip().lower()
+            c_clean_norm = re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower()
+            c_num_extracted, c_core = normalize_chapter_title_for_matching(c.get("title", ""))
+
+            if (
+                (c_title_norm and c_title_norm == ch_title_norm)
+                or (c_clean_norm and c_clean_norm == ch_clean_norm)
+                or (c_num_extracted is not None and ch_num_extracted is not None and c_num_extracted == ch_num_extracted and c_core == ch_core)
+                or (c_core and ch_core and c_core == ch_core)
+                or (c_num_extracted is not None and ch_num_extracted is not None and c_num_extracted == ch_num_extracted)
+                or c.get("num") == idx
+                or (hasattr(chapter, "num") and str(c.get("num")) == str(chapter.num))
+            ):
                 ch_status = c.get("status", "pending")
                 break
         

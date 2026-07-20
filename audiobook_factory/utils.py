@@ -46,6 +46,16 @@ def update_progress_file(progress_path, chapter_num, status):
         with open(progress_path, 'w', encoding='utf-8') as f:
             json.dump(progress_data, f, indent=4)
 
+def normalize_chapter_title_for_matching(title: str):
+    if not title:
+        return None, ""
+    cleaned = re.sub(r'\(~[\d,]+\s*words\)', '', str(title)).strip().lower()
+    num_match = re.search(r'^(?:chapter|chap|ch\.?)?\s*(\d+)\b', cleaned, re.IGNORECASE)
+    ch_num = int(num_match.group(1)) if num_match else None
+    core_text = re.sub(r'^(?:chapter|chap|ch\.?)?\s*\d+[:.\-\s]*', '', cleaned).strip()
+    return ch_num, core_text or cleaned
+
+
 def load_or_create_progress_file(progress_path, chapters_data, book_title, book_path="", voice_file="", settings=None):
     """Loads a progress file if it exists, otherwise creates a new one.
 
@@ -61,23 +71,31 @@ def load_or_create_progress_file(progress_path, chapters_data, book_title, book_
 
         # Backfill text/sentences for chapters that are missing them (old format)
         existing_chapters = data.get("chapters", [])
-        existing_by_num = {c["num"]: c for c in existing_chapters if "num" in c}
-        existing_by_num_str = {str(c["num"]): c for c in existing_chapters if "num" in c}
-        existing_by_title = {c.get("title", "").strip().lower(): c for c in existing_chapters if c.get("title")}
-        existing_by_clean_title = {
-            re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower(): c
-            for c in existing_chapters if c.get("title")
-        }
 
         dirty = False
         for cd in chapters_data:
-            title_clean = re.sub(r'\(~[\d,]+\s*words\)', '', cd.get("title", "")).strip().lower()
-            ch = (
-                existing_by_title.get(cd.get("title", "").strip().lower())
-                or existing_by_clean_title.get(title_clean)
-                or existing_by_num.get(cd.get("num"))
-                or existing_by_num_str.get(str(cd.get("num")))
-            )
+            cd_title_raw = cd.get("title", "").strip().lower()
+            cd_clean = re.sub(r'\(~[\d,]+\s*words\)', '', cd.get("title", "")).strip().lower()
+            cd_num_extracted, cd_core = normalize_chapter_title_for_matching(cd.get("title", ""))
+
+            ch = None
+            for c in existing_chapters:
+                c_title_raw = c.get("title", "").strip().lower()
+                c_clean = re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower()
+                c_num_extracted, c_core = normalize_chapter_title_for_matching(c.get("title", ""))
+
+                if (
+                    (c_title_raw and c_title_raw == cd_title_raw)
+                    or (c_clean and c_clean == cd_clean)
+                    or (c_num_extracted is not None and cd_num_extracted is not None and c_num_extracted == cd_num_extracted and c_core == cd_core)
+                    or (c_core and cd_core and c_core == cd_core)
+                    or (c_num_extracted is not None and cd_num_extracted is not None and c_num_extracted == cd_num_extracted)
+                    or (c.get("num") is not None and c.get("num") == cd.get("num"))
+                    or (c.get("num") is not None and str(c.get("num")) == str(cd.get("num")))
+                ):
+                    ch = c
+                    break
+
             if ch is not None:
                 if ("text" not in ch or not ch["text"]) and cd.get("text"):
                     ch["text"] = cd["text"]

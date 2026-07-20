@@ -69,12 +69,19 @@ def _print_banner():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _is_api_healthy() -> bool:
-    try:
-        import requests
-        r = requests.get("http://127.0.0.1:8000/api/v1/health", timeout=1.5)
-        return r.status_code == 200 and r.json().get("status") == "ok"
-    except Exception:
-        return False
+    import requests
+    import time
+    urls = ["http://127.0.0.1:8000/api/v1/health", "http://localhost:8000/api/v1/health"]
+    for _ in range(3):
+        for url in urls:
+            try:
+                r = requests.get(url, timeout=4.0)
+                if r.status_code == 200 and r.json().get("status") == "ok":
+                    return True
+            except Exception:
+                pass
+        time.sleep(0.5)
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
