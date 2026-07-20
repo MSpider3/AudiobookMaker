@@ -277,10 +277,8 @@ def run_pipeline(
     from dataclasses import asdict
     settings_dict = {}
     try:
-        # Ignore fields that are not JSON serializable or too large
         for k, v in asdict(config).items():
-            if k not in ("pronunciation_map",):
-                settings_dict[k] = v
+            settings_dict[k] = v
     except Exception as e:
         print(f"Error serializing config: {e}")
 

@@ -244,6 +244,8 @@ def _build_audiobook_config(meta: dict, settings: dict) -> "AudiobookConfig":
         force_reprocess   = bool(settings.get("force_reprocess", False)),
         torch_compile     = bool(settings.get("torch_compile", False)),
         regen_missing     = bool(settings.get("regen_missing", True)),
+        pronunciation_map = settings.get("pronunciation_map", {}),
+        selected_chapters = settings.get("selected_chapters", []),
     )
 
 

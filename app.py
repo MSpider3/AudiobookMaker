@@ -1283,6 +1283,19 @@ def build_app():
                 torch_compile_val = val("torch_compile", False)
                 regen_missing_val = val("regen_missing", True)
 
+                # Restore pronunciation map if present
+                pron_map = val("pronunciation_map", {})
+                pron_file_update = gr.update()
+                if pron_map and isinstance(pron_map, dict):
+                    try:
+                        temp_pron_path = os.path.join(_OUTPUT_DIR, "restored_pronunciation_fixes.txt")
+                        with open(temp_pron_path, "w", encoding="utf-8") as pf:
+                            for search, repl in pron_map.items():
+                                pf.write(f"{search} == {repl}\n")
+                        pron_file_update = gr.update(value=temp_pron_path)
+                    except Exception:
+                        pass
+
                 # Restore saved chapter selections (raw labels) if present
                 saved_chapters = val("selected_chapters", [])
 
@@ -1316,11 +1329,12 @@ def build_app():
                     gr.update(value=exp_vtt_val),
                     gr.update(value=torch_compile_val),
                     gr.update(value=regen_missing_val),
+                    pron_file_update,
                     gr.update(value=saved_chapters) if saved_chapters else gr.update(),
                     saved_chapters or None,   # json_selected_chapters_state
                 )
             except Exception as e:
-                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(28)]
+                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(30)]
 
         progress_file_upload.upload(
             on_progress_upload,
@@ -1332,7 +1346,7 @@ def build_app():
                 tts_timbre, tts_instruct, max_len_sl, lufs_adv, worker_count_sl,
                 parallel_mode_dd, tts_provider_dd, epub_ocr_chk, force_repro_chk,
                 export_text_chk, single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
-                torch_compile_chk, regen_missing_chk, chapter_check,
+                torch_compile_chk, regen_missing_chk, pronunciation_file, chapter_check,
                 json_selected_chapters_state,
             ]
         )
@@ -1406,8 +1420,20 @@ def build_app():
             )
             os.makedirs(book_out, exist_ok=True)
 
-            import dataclasses
-            from audiobook_factory.utils import load_or_create_progress_file
+            # Parse pronunciation file if provided
+            pron_map = {}
+            if pron_file_obj is not None:
+                pf_path = pron_file_obj.name if hasattr(pron_file_obj, "name") else str(pron_file_obj)
+                try:
+                    with open(pf_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith("#") or "==" not in line:
+                                continue
+                            search, repl = line.split("==", 1)
+                            pron_map[search.strip()] = repl.strip()
+                except OSError:
+                    pass
 
             cfg = AudiobookConfig(
                 book_title=book_title, book_path=path, author=author,
@@ -1417,6 +1443,7 @@ def build_app():
                 max_len=int(max_len), lufs=int(lufs), true_peak=true_peak,
                 force_reprocess=force_repro, worker_count=int(worker_count),
                 parallel_mode=parallel_mode, export_text=bool(export_text),
+                pronunciation_map=pron_map,
                 tts_provider_name=tts_provider or "qwen", tts_model_name=mname,
                 tts_timbre=timbre.split()[-1] if timbre else "",
                 tts_instruct=instruct, single_file_mode=single_file,
@@ -1425,8 +1452,7 @@ def build_app():
                 selected_chapters=selected_chapters or [],
                 regen_missing=bool(regen_missing),
             )
-            settings_dict = {k: v for k, v in dataclasses.asdict(cfg).items()
-                             if k != "pronunciation_map"}
+            settings_dict = dataclasses.asdict(cfg)
 
             chapters_data = [
                 {"num": ch.num, "title": ch.title, "text": ch.text, "sentences": ch.sentences}
