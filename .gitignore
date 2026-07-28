@@ -74,6 +74,7 @@ desktop.ini
 .ipynb_checkpoints/
 *.ipynb
 !AudiobookMaker_Colab.ipynb
+!AudiobookMaker_Kaggle.ipynb
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 *.log

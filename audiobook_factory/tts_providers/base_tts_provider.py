@@ -76,10 +76,23 @@ class BaseTTSProvider(ABC):
     def cleanup(self) -> None:
         """Release resources. Override if the provider holds GPU models."""
 
+    @classmethod
+    def create_for_device(cls, device: str, config: "AudiobookConfig") -> "BaseTTSProvider":
+        """Factory classmethod: constructs a provider instance pinned to `device`.
+
+        Args:
+            device: Target torch device string, e.g. "cuda:0", "cuda:1", "cpu".
+            config: AudiobookConfig options.
+
+        Returns:
+            An instantiated BaseTTSProvider pinned to the device.
+        """
+        raise NotImplementedError("Subclasses must implement create_for_device")
+
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
-def get_tts_provider(name: str, config: "AudiobookConfig") -> BaseTTSProvider:
+def get_tts_provider(name: str, config: "AudiobookConfig", device: str | None = None) -> BaseTTSProvider:
     """
     Return an instantiated provider for *name*.
 
@@ -93,9 +106,12 @@ def get_tts_provider(name: str, config: "AudiobookConfig") -> BaseTTSProvider:
 
     if name in ("qwen", "qwen3", "qwen3-tts", ""):
         from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
+        if device is not None:
+            return QwenTTSProvider.create_for_device(device, config)
         return QwenTTSProvider(config)
 
     raise ValueError(
         f"Unknown TTS provider: '{name}'. "
         f"Currently supported: 'qwen'. More providers coming in a future release."
     )
+

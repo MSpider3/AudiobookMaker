@@ -45,12 +45,46 @@ async def startup_event():
     asyncio.create_task(worker_loop())
     print("[API Server] Background worker consumer task spawned successfully.")
 
+    def _warmup_gpu_pool():
+        try:
+            from audiobook_factory.gpu_pool import GPUPoolManager
+            from audiobook_factory.pipeline import AudiobookConfig
+            from audiobook_factory.tts_providers import get_tts_provider
+            cfg = AudiobookConfig()
+            GPUPoolManager.instance().get_pool(
+                provider_name=cfg.tts_provider_name,
+                provider_factory=lambda dev: get_tts_provider(cfg.tts_provider_name, cfg, device=dev),
+            )
+        except Exception as exc:
+            print(f"[API Server] GPU pool warmup warning: {exc}")
 
-# ── REST API Endpoints ────────────────────────────────────────────────────────
+    import threading
+    threading.Thread(target=_warmup_gpu_pool, daemon=True).start()
+
+
+from audiobook_factory.gpu_pool import GPUDetector, GPUPoolManager
+
 
 @app.get("/api/v1/health")
 async def health_check():
-    return {"status": "ok", "message": "AudiobookMaker API Server is active."}
+    detected = GPUDetector.detect_devices()
+    all_pools = GPUPoolManager.instance().all_pools()
+    pools_data = {}
+    for name, pool in all_pools.items():
+        dev_info_list = [GPUDetector.get_device_info(d) for d in pool.devices]
+        pools_data[name] = {
+            "device_count": pool.device_count,
+            "devices": dev_info_list,
+        }
+
+    return {
+        "status": "ok",
+        "message": "AudiobookMaker API Server is active.",
+        "gpu": {
+            "detected_devices": detected,
+            "provider_pools": pools_data,
+        },
+    }
 
 
 @app.post("/api/v1/generate")

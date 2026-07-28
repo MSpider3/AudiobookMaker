@@ -113,10 +113,23 @@ def build_app():
     with gr.Blocks(title="AudiobookMaker") as demo:
 
         # ── Header ────────────────────────────────────────────────────────────
-        gr.HTML("""
+        from audiobook_factory.gpu_pool import GPUDetector
+        _detected_devs = GPUDetector.detect_devices()
+        if _detected_devs == ["cpu"]:
+            _gpu_badge = "GPU: CPU (slow)"
+            _default_workers = 4
+        elif len(_detected_devs) == 1:
+            _gpu_badge = f"GPU: {_detected_devs[0]} (single)"
+            _default_workers = min(len(_detected_devs) * 4, 8)
+        else:
+            _gpu_badge = f"GPU: {' + '.join(_detected_devs)} ({len(_detected_devs)}× parallel)"
+            _default_workers = min(len(_detected_devs) * 4, 8)
+
+        gr.HTML(f"""
         <div class="header-banner">
           <h1>📖 AudiobookMaker</h1>
           <p>Convert any book into a high-quality narrated audiobook using AI voice cloning.</p>
+          <span style="background: rgba(255,255,255,0.15); padding: 4px 12px; border-radius: 12px; font-size: 0.9em; font-weight: bold; display: inline-block; margin-top: 6px;">{_gpu_badge}</span>
         </div>
         """)
 
@@ -387,7 +400,7 @@ def build_app():
                     worker_count_sl = gr.Slider(
                         label="Parallel workers count",
                         info="Enables batch TTS mode. Higher = larger GPU batches = faster (needs more VRAM). Minimum 2 to enable.",
-                        minimum=1, maximum=8, value=2, step=1,
+                        minimum=1, maximum=8, value=_default_workers, step=1,
                     )
                     parallel_mode_dd = gr.Dropdown(
                         label="Parallelism level",

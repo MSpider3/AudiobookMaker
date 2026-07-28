@@ -98,6 +98,7 @@ class AudiobookConfig:
     # ── Parallelism ───────────────────────────────────────────────────────────
     worker_count:        int   = 1       # chapters/chunks in parallel
     parallel_mode:       str   = "chunks" # "chapters" | "chunks"
+    gpu_count:           int   = 0       # 0 = auto-detect at runtime
 
     # ── Multi-Model Qwen3 ─────────────────────────────────────────────────────
     device:              str   = "cuda"
@@ -317,11 +318,18 @@ def run_pipeline(
     except:
         pass
 
-    # ── Shared TTS Provider Setup ─────────────────────────────────────────────
+    # ── Shared TTS Provider / GPU Pool Setup ──────────────────────────────────
+    from audiobook_factory.gpu_pool import GPUPoolManager
     from audiobook_factory.tts_providers import get_tts_provider
+    pool = None
     provider = None
     if not config.preview_mode:
-        provider = get_tts_provider(config.tts_provider_name, config)
+        pool = GPUPoolManager.instance().get_pool(
+            provider_name=config.tts_provider_name,
+            provider_factory=lambda dev: get_tts_provider(config.tts_provider_name, config, device=dev),
+            min_vram_gb=5.0,
+            gpu_count_override=config.gpu_count,
+        )
 
     output_files: list[str] = []
     _lock = threading.Lock()
@@ -393,7 +401,7 @@ def run_pipeline(
         log(f"\n[Chapter {idx}/{total}] '{chapter.title}'")
         try:
             path = _process_chapter(
-                config, chapter, idx, total, log, cancel, provider, 
+                config, chapter, idx, total, log, cancel, provider, pool=pool,
                 prog_cb=lambda f: _update_chapter_prog(idx, f)
             )
             if path:
@@ -496,6 +504,7 @@ def _process_chapter(
     log:     Callable,
     cancel:  CancelToken,
     provider: "BaseTTSProvider" = None,
+    pool: Any = None,
     prog_cb: Callable[[float], None] = None,
 ) -> str | None:
     """Generate audio for one chapter. Returns output file path."""
@@ -533,10 +542,25 @@ def _process_chapter(
 
         log(f"  [Ch{idx}] {len(tts_jobs)} TTS chunks…")
 
-        # ── Synthesise via provider ───────────────────────────────────────────
-        if provider is None:
-            # Fallback for manual calls bypassing run_pipeline
-            provider = get_tts_provider(config.tts_provider_name, config)
+        def _synth_batch(texts: list[str], voice_refs: list[str], out_paths: list[str]) -> list[float]:
+            if pool is not None:
+                with pool.acquire_context(cancel) as p:
+                    return p.synthesize_batch(texts, voice_refs, out_paths)
+            elif provider is not None:
+                return provider.synthesize_batch(texts, voice_refs, out_paths)
+            else:
+                p = get_tts_provider(config.tts_provider_name, config)
+                return p.synthesize_batch(texts, voice_refs, out_paths)
+
+        def _synth_single(t_text: str, v_ref: str, o_path: str) -> None:
+            if pool is not None:
+                with pool.acquire_context(cancel) as p:
+                    p.synthesize(t_text, v_ref, o_path)
+            elif provider is not None:
+                provider.synthesize(t_text, v_ref, o_path)
+            else:
+                p = get_tts_provider(config.tts_provider_name, config)
+                p.synthesize(t_text, v_ref, o_path)
 
         chunk_paths: list[str | None] = [None] * len(tts_jobs)
         chunk_durations: list[float] = [0.0] * len(tts_jobs)
@@ -557,7 +581,7 @@ def _process_chapter(
                 batch_out_paths = [os.path.join(temp_dir, f"s_{i:04d}.wav") for i in range(batch_start, batch_end)]
                 
                 try:
-                    durations = provider.synthesize_batch(batch_texts, batch_voice_refs, batch_out_paths)
+                    durations = _synth_batch(batch_texts, batch_voice_refs, batch_out_paths)
                     for idx_chunk, out_wav in enumerate(batch_out_paths):
                         i = batch_start + idx_chunk
                         # Only record path if the file was actually written
@@ -579,7 +603,7 @@ def _process_chapter(
                     for sub_i, (chunk_text, out_wav) in enumerate(zip(batch_texts, batch_out_paths)):
                         global_i = batch_start + sub_i
                         try:
-                            provider.synthesize(chunk_text, config.voice_file, out_wav)
+                            _synth_single(chunk_text, config.voice_file, out_wav)
                             chunk_paths[global_i] = out_wav
                             if config.export_lrc:
                                 chunk_durations[global_i] = _get_wav_duration(out_wav)
@@ -598,7 +622,7 @@ def _process_chapter(
                 # Retry once on transient failures (e.g. brief GPU hiccup)
                 for attempt in range(2):
                     try:
-                        provider.synthesize(chunk_text, config.voice_file, out_wav)
+                        _synth_single(chunk_text, config.voice_file, out_wav)
                         if os.path.exists(out_wav) and os.path.getsize(out_wav) > 0:
                             chunk_paths[i] = out_wav
                             if config.export_lrc:

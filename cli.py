@@ -482,6 +482,14 @@ def _consume_queues(log_q: queue.Queue, prog_q: queue.Queue, cancel, runner_thre
 
 def main():
     _print_banner()
+    from audiobook_factory.gpu_pool import GPUDetector
+    devices = GPUDetector.detect_devices()
+    if devices == ["cpu"]:
+        print(_info("[GPU] No CUDA GPU detected — running on CPU"))
+    else:
+        dev_str = ", ".join(devices)
+        print(_info(f"[GPU] Detected {len(devices)} GPU(s): {dev_str}"))
+
     parser = _build_parser()
     args = parser.parse_args()
 

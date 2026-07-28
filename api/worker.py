@@ -75,30 +75,25 @@ async def monitor_task(task: Task, log_q: queue.Queue, prog_q: queue.Queue, futu
         await asyncio.sleep(0.1)
 
 
-async def worker_loop():
-    """
-    Main background consumer queue loop executing generation tasks sequentially.
-    Guarantees only one task utilizes Qwen TTS on the GPU at any single time.
-    """
-    print("[API Worker] Central task worker queue consumer started.")
-    while True:
-        task_id = await task_queue.get()
+from audiobook_factory.gpu_pool import GPUDetector
+
+
+async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
+    async with sem:
         task = tasks.get(task_id)
         if not task:
             task_queue.task_done()
-            continue
-            
+            return
+
         if task.status == "cancelled":
             task_queue.task_done()
-            continue
-            
+            return
+
         await task.update_status("running")
         await task.add_log(f"🚀 Starting generation task: {task_id}")
-        
+
         try:
-            # Instantiate AudiobookConfig dataclass
             cfg = AudiobookConfig(**task.config_dict)
-            # Reconstruct list of ExtractedChapter dataclasses
             chapters = [
                 ExtractedChapter(
                     num=ch.get("num", idx + 1),
@@ -107,26 +102,21 @@ async def worker_loop():
                     sentences=ch.get("sentences", [])
                 ) for idx, ch in enumerate(task.chapters)
             ]
-            
+
             log_q = queue.Queue()
             prog_q = queue.Queue()
-            
-            # Setup thread executor to prevent blocking the async FastAPI event loop
+
             loop = asyncio.get_running_loop()
-            
+
             def run_sync_pipeline():
                 return run_pipeline(cfg, chapters, log_q, prog_q, task.cancel_token)
-                
-            # Submit to default ThreadPoolExecutor
+
             future = loop.run_in_executor(None, run_sync_pipeline)
-            
-            # Run loop monitoring task logs/progress
             monitor = asyncio.create_task(monitor_task(task, log_q, prog_q, future))
-            
-            # Await execution threads to complete
+
             out_files = await future
-            await monitor  # wait for leftover queue frames
-            
+            await monitor
+
             if task.cancel_token.is_cancelled:
                 await task.update_status("cancelled")
                 await task.add_log("⛔ Generation task cancelled by user.")
@@ -135,7 +125,7 @@ async def worker_loop():
                 await task.update_status("completed")
                 await task.add_log(f"✅ Generation complete. Processed {len(out_files)} files.")
                 await task.broadcast({"type": "completed", "files": out_files})
-                
+
         except Exception as e:
             import traceback
             err_msg = f"❌ Task crashed: {e}\n{traceback.format_exc()}"
@@ -143,6 +133,20 @@ async def worker_loop():
             task.error_message = str(e)
             await task.add_log(err_msg)
             await task.update_status("failed")
-            
+
         finally:
             task_queue.task_done()
+
+
+async def worker_loop():
+    """
+    Main background consumer queue loop executing generation tasks concurrently.
+    Allowed concurrency is bounded by available GPU count.
+    """
+    devices = GPUDetector.detect_devices()
+    max_concurrent = len(devices) if devices != ["cpu"] else 1
+    sem = asyncio.Semaphore(max_concurrent)
+    print(f"[API Worker] Central task worker queue consumer started (max_concurrent={max_concurrent}).")
+    while True:
+        task_id = await task_queue.get()
+        asyncio.create_task(_process_single_task(task_id, sem))
