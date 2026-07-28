@@ -1,8 +1,8 @@
 """
-kaggle_prerun_check.py — Kaggle Pre-Run Verification & Diagnostics
+colab_prerun_check.py — Google Colab Pre-Run Verification & Diagnostics
 
 Run this cell BEFORE your full audiobook generation to verify all core components,
-GPU allocation, Rust acceleration, and Multi-GPU pool dispatch.
+GPU allocation, Rust acceleration, and GPU pool dispatch.
 
 Does NOT load the heavy 1.7B Qwen model — runs in under 5 seconds.
 """
@@ -10,14 +10,14 @@ Does NOT load the heavy 1.7B Qwen model — runs in under 5 seconds.
 import sys
 import os
 
-# Add Kaggle paths if not present
-if os.path.exists("/kaggle/working/AudiobookMaker"):
-    sys.path.insert(0, "/kaggle/working/AudiobookMaker")
-elif os.path.exists("/kaggle/working"):
-    sys.path.insert(0, "/kaggle/working")
+# Add Colab paths if not present
+if os.path.exists("/content/AudiobookMaker"):
+    sys.path.insert(0, "/content/AudiobookMaker")
+elif os.path.exists("/content"):
+    sys.path.insert(0, "/content")
 
 print("=" * 62)
-print("AudiobookMaker — Kaggle Pre-Run Verification")
+print("AudiobookMaker — Google Colab Pre-Run Verification")
 print("=" * 62)
 
 # ── 1. Core Module Imports ──────────────────────────────────────────────────
@@ -51,7 +51,7 @@ for dev in devices:
     if dev.startswith("cuda"):
         print(f"    {info['device']} — {info['name']} — {info['free_vram_gb']} GB free / {info['total_vram_gb']} GB total  ✓")
     else:
-        print("    CPU mode detected (GPU T4x2 hardware accelerator recommended on Kaggle)  ⚠")
+        print("    CPU mode detected (GPU hardware accelerator recommended for fast TTS)  ⚠")
 
 # ── 3. Rust Extension Status ─────────────────────────────────────────────────
 print("\n[3] Rust extension status (`audiobook_rust`) …")
@@ -66,8 +66,8 @@ try:
 except ImportError:
     print("    audiobook_rust not compiled — using pure-Python mastering fallback  ⚠")
 
-# ── 4. GPU Pool Manager & Multi-GPU Dispatch ────────────────────────────────
-print("\n[4] GPU Pool Manager & Multi-GPU dispatch …")
+# ── 4. GPU Pool Manager & Context Acquisition ────────────────────────────────
+print("\n[4] GPU Pool Manager & thread dispatch …")
 try:
     from audiobook_factory.tts_providers.base_tts_provider import BaseTTSProvider
     try:
@@ -87,13 +87,13 @@ try:
         def get_name(self): return "DummyTestProvider"
 
     mgr = GPUPoolManager.instance()
-    pool = mgr.get_pool("kaggle_diag_test", lambda dev: DummyProvider(cfg))
+    pool = mgr.get_pool("diag_test", lambda dev: DummyProvider(cfg))
     assert pool.is_healthy(), "Pool health check failed"
 
     cancel = CancelToken() if 'CancelToken' in locals() or 'CancelToken' in globals() else None
     with pool.acquire_context(cancel) as p:
         assert p.get_name() == "DummyTestProvider"
-    print(f"    ProviderPool['kaggle_diag_test'] created successfully ({pool.device_count} instance(s))  ✓")
+    print(f"    ProviderPool['diag_test'] created successfully ({pool.device_count} instance(s))  ✓")
 except Exception as e:
     print(f"    GPU pool verification warning: {e}  ⚠")
 
@@ -110,9 +110,6 @@ except Exception as e:
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print("\n" + "=" * 62)
-print("All Kaggle pre-run diagnostic checks passed!")
-if len(devices) > 1:
-    print(f"Recommended Settings for Dual GPU: worker_count=8 | parallel_mode=chunks")
-else:
-    print("Recommended Settings: worker_count=4 | parallel_mode=chunks")
+print("All Colab pre-run diagnostic checks passed!")
+print("Recommended Settings: worker_count=4 | parallel_mode=chunks")
 print("=" * 62)

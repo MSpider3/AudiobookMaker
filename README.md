@@ -25,7 +25,7 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 - **Voice test tab** — Type any sentence and preview the cloned voice before generating. Includes language-labeled premium timbres for optimized results.
 - **Preview mode** — See chapter list with character + word counts before committing to a full audiobook run.
 - **Pronunciation fixes** — Upload a `.txt` file with `search==replace` pairs to fix how the TTS pronounces specific words.
-- **Parallel processing with Shared VRAM** — Process multiple chapters simultaneously using a **Global Shared Provider**. This allows worker counts up to 4 without multiplying VRAM usage, utilizing a thread-safe GPU lock with asynchronous disk I/O for maximum performance.
+- **True Multi-GPU Parallel Utilization (`GPUPoolManager`)** — Automatically detects all available GPUs (e.g. Kaggle T4 × 2) and assigns dedicated model instances per GPU. Enables true simultaneous work-stealing parallel execution across GPUs (with VRAM safety guards) for up to 2× speedups without OOMs.
 - **Synced Lyrics Export** — Automatically generates `.lrc` timed lyrics files perfect for Audiobookshelf syncing.
 - **Audiobookshelf-compatible output** — Zero-padded filenames + full ID3 tags (title, author, album, track) ready to drop into Audiobookshelf.
 - **Mastered Output & Single File Mode** — Output mastered MP3, FLAC, WAV, or M4B files. Optionally combine all chapters into a massive single unified file with one click.
@@ -81,13 +81,14 @@ AudiobookMaker/
     ├── voice_preprocessor.py             ← 7-step voice audio cleaning pipeline
     ├── pipeline.py                       ← Thread-safe audiobook generation orchestrator
     │                                        (AudiobookConfig, CancelToken, run_pipeline)
+    ├── gpu_pool.py                       ← Provider-agnostic GPU device pool & manager (GPUDetector, ProviderPool, GPUPoolManager)
     ├── filename_sanitizer.py             ← Cross-platform, Audiobookshelf-compatible filenames
     ├── text_processing.py                ← Sentence splitting + NLTK auto-download + normalization
     ├── ffmpeg_utils.py                   ← FFmpeg encoding helpers
     ├── utils.py                          ← Shared utilities (progress file management)
     └── tts_providers/                    ← Modular TTS provider abstraction
         ├── base_tts_provider.py          ← BaseTTSProvider ABC + get_tts_provider() factory
-        └── qwen_provider.py              ← Qwen3-TTS (Flash Attention 2 / SDPA auto-detect, X-vector cloning)
+        └── qwen_provider.py              ← QwenTTSProvider (per-device binding, Flash Attention 2 / SDPA auto-detect)
 ```
 
 ---
@@ -255,7 +256,7 @@ Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as nar
 
 ### 4. ⚙️ Advanced Tab
 - **Max chunk length** — TTS input character limit per sentence chunk (default 399).
-- **Parallel chapter workers** — Process 1–4 chapters simultaneously. Thanks to our **Shared VRAM** architecture, increasing this does not significantly increase memory usage, but can dramatically speed up generation by pre-fetching the next sentence while the current one is speaking.
+- **Parallel chapter workers** — Process 1–8 workers simultaneously. Automatically defaults to `min(gpu_count * 4, 8)` based on detected GPUs. Thanks to our **Multi-GPU Pool** architecture (`GPUPoolManager`), workers dynamically stream work across all available GPUs in parallel with optimal VRAM management.
 - **TTS Provider** — Currently: `qwen` (Qwen3-TTS). More providers will be added in future releases.
 - **EasyOCR** — Enable to extract text from images embedded inside EPUB files
 - **Force reprocess** — Re-extract text even if cached output exists
@@ -369,6 +370,14 @@ Modern versions of Gradio implement sandbox security checks that restrict browse
 ---
 
 ## 📝 Recent Changes
+
+### ⚡ True Multi-GPU Parallel Execution & Infrastructure Improvements
+- **True Multi-GPU Support**: Implemented `GPUPoolManager` and `ProviderPool` (`audiobook_factory/gpu_pool.py`), which automatically detects all CUDA devices (e.g. dual Tesla T4s on Kaggle) and loads dedicated model instances per GPU.
+- **Work-Stealing Task Dispatch**: Chapter and chunk synthesis dynamically acquires and releases GPU provider instances from a thread-safe pool, delivering up to 2× faster synthesis on multi-GPU systems.
+- **Concurrent API Worker Queue**: Converted `api/worker.py` background consumer loop to run tasks concurrently up to the number of detected GPUs (`asyncio.Semaphore`).
+- **Gradio Multi-GPU Status Badge**: Header banner displays real-time GPU hardware detection (`GPU: cuda:0 + cuda:1 (2× parallel)`), and the Advanced tab worker slider automatically defaults to `min(gpu_count * 4, 8)`.
+- **API Health Endpoint Reporting**: `GET /api/v1/health` now returns detailed multi-GPU pool status and free/total VRAM metrics per device.
+- **Warmup Threading**: Server startup launches a non-blocking background thread to warm up GPU models before the first user request.
 
 ### Session & Resume Improvements
 - **Chapter selection is now persisted** in `generation_progress.json`. When you upload a progress file to resume generation, the **chapter checkbox list is automatically restored** to the exact same selection — no need to manually re-select chapters each time.
