@@ -55,13 +55,45 @@ def _h(text): return f"{_BOLD}{text}{_RESET}"
 def _ok(text): return f"{_GREEN}{text}{_RESET}"
 def _info(text): return f"{_CYAN}{text}{_RESET}"
 def _warn(text): return f"{_YELL}{text}{_RESET}"
-def _err(text): return f"{_RED}{text}{_RESET}"
-
 def _print_banner():
     print()
     print(_h("━" * 50))
     print(_h("  📖  AudiobookMaker CLI"))
     print(_h("━" * 50))
+
+_DRY_RUN_CHARS_PER_SECOND: float = 80.0
+_IS_TTY: bool = sys.stdout.isatty()
+_cancel_token: Any | None = None
+
+def _sigint_handler(signum: int, frame: object) -> None:
+    """Handles Ctrl+C by setting the global CancelToken without exiting immediately."""
+    global _cancel_token
+    print()
+    print(_warn("Interrupt received. Waiting for current chunk to finish..."))
+    if _cancel_token is not None:
+        _cancel_token.cancel()
+
+signal.signal(signal.SIGINT, _sigint_handler)
+
+def _display_progress(
+    chapter_num: int,
+    total_chapters: int,
+    chunk_num: int,
+    total_chunks: int,
+    chapter_title: str,
+) -> None:
+    """Displays progress in TTY mode (overwriting line) or notebook mode (new line)."""
+    pct = (chunk_num / total_chunks) * 100 if total_chunks > 0 else 0
+    line = (
+        f"[{chapter_num}/{total_chapters}] {chapter_title} "
+        f"— chunk {chunk_num}/{total_chunks} ({pct:.1f}%)"
+    )
+    if _IS_TTY:
+        sys.stdout.write(f"\r{line}   ")
+        sys.stdout.flush()
+    else:
+        if chunk_num == total_chunks:
+            print(f"[DONE] {line}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -162,6 +194,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Re-generate all chapters, ignoring any saved progress.",
     )
+    p.add_argument(
+        "--quantization",
+        choices=["none", "int8"],
+        default=None,
+        help="Model quantization mode. int8 reduces VRAM by ~50%% via bitsandbytes (disables torch.compile).",
+    )
+    p.add_argument(
+        "--no-resume-chunks",
+        action="store_true",
+        default=False,
+        help="Disable chunk-level resume. Re-synthesize all chunks from scratch even if partial progress exists.",
+    )
+    p.add_argument(
+        "--clear-voice-cache",
+        action="store_true",
+        default=False,
+        help="Clear all cached voice preprocessing files and exit.",
+    )
     return p
 
 
@@ -213,6 +263,10 @@ def _load_config(args) -> tuple[dict, dict, list[dict]]:
         settings["tts_model_name"] = args.tts_model_name
     if args.force_reprocess:
         settings["force_reprocess"] = True
+    if getattr(args, "quantization", None):
+        settings["quantization"] = args.quantization
+    if getattr(args, "no_resume_chunks", False):
+        settings["resume_incomplete_chunks"] = False
 
     return meta, settings, chapters_raw, path
 
@@ -330,6 +384,7 @@ def _build_audiobook_config(meta: dict, settings: dict) -> "AudiobookConfig":
         single_file_mode  = bool(settings.get("single_file_mode", False)),
         force_reprocess   = bool(settings.get("force_reprocess", False)),
         torch_compile     = bool(settings.get("torch_compile", False)),
+        quantization      = settings.get("quantization", "none"),
         regen_missing     = bool(settings.get("regen_missing", True)),
         pronunciation_map = settings.get("pronunciation_map", {}),
         selected_chapters = settings.get("selected_chapters", []),
@@ -476,11 +531,38 @@ def _consume_queues(log_q: queue.Queue, prog_q: queue.Queue, cancel, runner_thre
     return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Main
-# ══════════════════════════════════════════════════════════════════════════════
+def _clear_voice_cache() -> None:
+    """Clear all preprocessed voice audio cache files."""
+    from audiobook_factory.voice_preprocessor import _get_cache_dir, _CACHE_ENTRY_SUFFIX
+    cache_dir = _get_cache_dir()
+    count = 0
+    if os.path.exists(cache_dir):
+        for fname in os.listdir(cache_dir):
+            if fname.endswith(_CACHE_ENTRY_SUFFIX):
+                fpath = os.path.join(cache_dir, fname)
+                try:
+                    os.remove(fpath)
+                    count += 1
+                except OSError as exc:
+                    print(_warn(f"Failed to remove cache file {fname}: {exc}"))
+    print(_ok(f"✅ Cleared {count} voice preprocessing cache file(s)."))
+
 
 def main():
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(message)s",
+        stream=sys.stdout,
+    )
+
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if getattr(args, "clear_voice_cache", False):
+        _clear_voice_cache()
+        sys.exit(0)
+
     _print_banner()
     from audiobook_factory.gpu_pool import GPUDetector
     devices = GPUDetector.detect_devices()
@@ -489,9 +571,6 @@ def main():
     else:
         dev_str = ", ".join(devices)
         print(_info(f"[GPU] Detected {len(devices)} GPU(s): {dev_str}"))
-
-    parser = _build_parser()
-    args = parser.parse_args()
 
     # ── Load and merge config ──────────────────────────────────────────────────
     meta, settings, chapters_raw, json_path = _load_config(args)
@@ -564,6 +643,42 @@ def main():
     # ── Load chapters ─────────────────────────────────────────────────────────
     chapters = _load_chapters(chapters_raw, meta, cfg)
 
+    # ── Handle --dry-run mode ──────────────────────────────────────────────────
+    if getattr(args, "dry_run", False):
+        GPUDetector.log_summary()
+        print()
+        print(_h("━" * 70))
+        print(_h("  DRY-RUN MODE — Chapter Synthesis Time Estimation"))
+        print(_h("━" * 70))
+        total_words = 0
+        total_chars = 0
+        total_est_sec = 0.0
+
+        header = f"{'Idx':<4} {'Chapter Title':<42} {'Words':>8} {'Chars':>8} {'Est. Time':>10}"
+        print(_h(header))
+        print("─" * len(header))
+
+        for idx, ch in enumerate(chapters, 1):
+            text = getattr(ch, "text", "") or ""
+            words = len(text.split())
+            chars = len(text)
+            est_sec = chars / _DRY_RUN_CHARS_PER_SECOND
+            total_words += words
+            total_chars += chars
+            total_est_sec += est_sec
+
+            mins, secs = divmod(int(est_sec), 60)
+            time_str = f"{mins:02d}:{secs:02d}"
+            title_trunc = ch.title[:40] if len(ch.title) > 40 else ch.title
+            print(f"{idx:03d}  {title_trunc:<42} {words:>8,} {chars:>8,} {time_str:>10}")
+
+        print("─" * len(header))
+        tot_m, tot_s = divmod(int(total_est_sec), 60)
+        tot_time_str = f"{tot_m:02d}:{tot_s:02d}"
+        print(_h(f"{'TOTAL':<47} {total_words:>8,} {total_chars:>8,} {tot_time_str:>10}"))
+        print(_h("━" * 70))
+        sys.exit(0)
+
     if not chapters:
         print(_ok("✅ Nothing to generate — all chapters already completed."))
         sys.exit(0)
@@ -580,12 +695,8 @@ def main():
     # ── Set up cancel token ───────────────────────────────────────────────────
     from audiobook_factory.pipeline import CancelToken, run_pipeline
     cancel = CancelToken()
-
-    def _handle_sigint(sig, frame):
-        print(_warn("\n\n  ⛔ Ctrl+C received — cancelling after current chunk…"))
-        cancel.cancel()
-
-    signal.signal(signal.SIGINT, _handle_sigint)
+    global _cancel_token
+    _cancel_token = cancel
 
     # ── Check if FastAPI orchestrator is running ───────────────────────────────
     log_q  = queue.Queue()

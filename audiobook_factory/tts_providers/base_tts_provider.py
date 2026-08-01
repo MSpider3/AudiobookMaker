@@ -41,29 +41,53 @@ class BaseTTSProvider(ABC):
     def __init__(self, config: "AudiobookConfig") -> None:
         self.config = config
 
+    @property
     @abstractmethod
-    def synthesize(self, text: str, voice_ref: str, out_path: str) -> None:
-        """Generate speech for *text* and save WAV to *out_path*."""
+    def device(self) -> str:
+        """The torch device string this provider is bound to (e.g. 'cuda:0')."""
+        ...
 
-    def synthesize_batch(self, texts: list[str], voice_refs: list[str], out_paths: list[str]) -> list[float]:
+    @abstractmethod
+    def synthesize(
+        self,
+        text: str,
+        voice_ref: str | bytes,
+        out_path: str | None = None,
+        *,
+        return_bytes: bool = False,
+    ) -> tuple[str | bytes, float]:
+        """Generate speech for *text* and save WAV to *out_path* or return PCM bytes."""
+
+    @abstractmethod
+    def synthesize_batch(
+        self,
+        texts: list[str],
+        voice_ref: bytes,
+        *,
+        return_bytes: bool = True,
+    ) -> list[tuple[bytes | str, float]]:
+        """Synthesizes multiple text chunks in a single GPU forward pass.
+
+        More efficient than calling synthesize() N times because the fixed
+        per-call overhead (attention mask setup, x-vector lookup, tensor
+        allocation) is paid once for the entire batch.
+
+        Args:
+            texts: List of text strings to synthesize. Each must be <= max_len chars.
+            voice_ref: Preprocessed voice reference WAV bytes. Same for all items.
+            return_bytes: If True, returns raw WAV bytes. If False, behavior is
+                          implementation-defined (may raise NotImplementedError).
+                          Batch synthesis always defaults to return_bytes=True.
+
+        Returns:
+            List of (audio, duration) tuples, one per input text, in the same
+            order as the input list. audio is bytes when return_bytes=True.
+
+        Raises:
+            RuntimeError: If the batch forward pass fails. Implementations should
+                          fall back to per-item synthesis on batch failure.
         """
-        Synthesize a batch of texts.
-        Subclasses should override this if they support native batching (like Qwen3-TTS).
-        """
-        import os
-        import soundfile as sf
-        durations = []
-        for text, voice_ref, out_path in zip(texts, voice_refs, out_paths):
-            self.synthesize(text, voice_ref, out_path)
-            dur = 0.0
-            if os.path.exists(out_path):
-                try:
-                    with sf.SoundFile(out_path) as f:
-                        dur = f.frames / f.samplerate
-                except Exception:
-                    pass
-            durations.append(dur)
-        return durations
+        ...
 
     @abstractmethod
     def estimate_cost(self, total_chars: int) -> float:

@@ -62,36 +62,79 @@ class PreprocessConfig:
     target_sample_rate:     int   = 44100
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Pipeline
-# ══════════════════════════════════════════════════════════════════════════════
+import hashlib
+import logging
+import os
 
-def preprocess(
+logger = logging.getLogger(__name__)
+
+_CACHE_DIR_NAME: str = ".voice_cache"
+_CACHE_ENTRY_SUFFIX: str = "_preprocessed.wav"
+_CACHE_HASH_LENGTH: int = 16
+
+
+def _get_cache_dir() -> str:
+    """Return the absolute path to the voice preprocessing cache directory."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = os.path.join(base_dir, _CACHE_DIR_NAME)
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def _get_cache_path(input_bytes: bytes, config: PreprocessConfig) -> str:
+    """Generate SHA-256 cache filename based on audio content and PreprocessConfig."""
+    audio_hash = hashlib.sha256(input_bytes).hexdigest()[:_CACHE_HASH_LENGTH]
+    config_str = repr(config)
+    config_hash = hashlib.sha256(config_str.encode("utf-8")).hexdigest()[:_CACHE_HASH_LENGTH]
+    filename = f"voice_{audio_hash}_{config_hash}{_CACHE_ENTRY_SUFFIX}"
+    return os.path.join(_get_cache_dir(), filename)
+
+
+def _read_cache(cache_path: str) -> bytes | None:
+    """Attempt to read cached WAV bytes from disk.
+
+    Returns None on cache miss or OSError (never raises).
+    """
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                data = f.read()
+            if len(data) > 0:
+                logger.info("[Preprocess Cache] ⚡ Cache HIT: %s", os.path.basename(cache_path))
+                return data
+        except OSError as exc:
+            logger.warning("[Preprocess Cache] Failed to read cache entry: %s", exc)
+    return None
+
+
+def _write_cache(cache_path: str, data: bytes) -> None:
+    """Write processed WAV bytes to cache atomically using temp file + os.replace."""
+    tmp_path = cache_path + ".tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, cache_path)
+        logger.info("[Preprocess Cache] 💾 Saved cache entry: %s", os.path.basename(cache_path))
+    except OSError as exc:
+        logger.warning("[Preprocess Cache] Failed to write cache entry: %s", exc)
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _run_preprocessing_pipeline(
     input_bytes: bytes,
-    config: PreprocessConfig | None = None,
+    config: PreprocessConfig,
     log_fn=None,
 ) -> bytes:
-    """
-    Process a raw WAV byte-string through the configured pipeline.
-
-    Parameters
-    ----------
-    input_bytes : raw audio bytes (WAV format)
-    config      : PreprocessConfig; uses defaults if None
-    log_fn      : optional callable(str) for progress reporting
-
-    Returns
-    -------
-    bytes : processed WAV audio bytes
-    """
-    if config is None:
-        config = PreprocessConfig()
-
+    """Run raw WAV bytes through the 7-step DSP pipeline."""
     def log(msg: str):
         if log_fn:
             log_fn(msg)
         else:
-            print(msg)
+            logger.info(msg)
 
     # Read input
     audio, sr = sf.read(io.BytesIO(input_bytes), dtype="float32")
@@ -188,6 +231,49 @@ def preprocess(
     sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
     log("[Preprocess] Done.")
     return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def preprocess(
+    input_bytes: bytes,
+    config: PreprocessConfig | None = None,
+    log_fn=None,
+    use_cache: bool = True,
+) -> bytes:
+    """
+    Process a raw WAV byte-string through the configured pipeline.
+
+    Parameters
+    ----------
+    input_bytes : raw audio bytes (WAV format)
+    config      : PreprocessConfig; uses defaults if None
+    log_fn      : optional callable(str) for progress reporting
+    use_cache   : bool; if True, checks and populates disk cache
+
+    Returns
+    -------
+    bytes : processed WAV audio bytes
+    """
+    if config is None:
+        config = PreprocessConfig()
+
+    if use_cache:
+        cache_path = _get_cache_path(input_bytes, config)
+        cached = _read_cache(cache_path)
+        if cached is not None:
+            if log_fn:
+                log_fn(f"[Preprocess] ⚡ Loaded from cache ({len(cached)} bytes)")
+            return cached
+
+    result = _run_preprocessing_pipeline(input_bytes, config, log_fn)
+
+    if use_cache:
+        _write_cache(cache_path, result)
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════

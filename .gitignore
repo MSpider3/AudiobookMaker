@@ -74,7 +74,6 @@ desktop.ini
 .ipynb_checkpoints/
 *.ipynb
 !AudiobookMaker_Colab.ipynb
-!AudiobookMaker_Kaggle.ipynb
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
@@ -86,6 +85,7 @@ temp/
 *.tmp
 abm_ch*/          # Temp chapter processing dirs created by pipeline.py
 test_output_speed/  # Benchmark test output
+audiobook_factory/.voice_cache/  # Voice preprocessing cache
 
 # ── Rust ──────────────────────────────────────────────────────────────────────
 audiobook_rust/target/

@@ -15,7 +15,10 @@ New in this version
 """
 from __future__ import annotations
 
+import atexit
+import concurrent.futures
 import json
+import logging
 import os
 import queue
 import re
@@ -24,12 +27,21 @@ import subprocess
 import tempfile
 from pathlib import Path
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Any
 
-import numpy as np
-import soundfile as sf
+logger = logging.getLogger(__name__)
+
+_VALID_QUANTIZATION_MODES: frozenset[str] = frozenset({"none", "int8"})
+
+_subtitle_executor: concurrent.futures.ThreadPoolExecutor = (
+    concurrent.futures.ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="audiobookmaker_subtitles",
+    )
+)
+atexit.register(_subtitle_executor.shutdown, wait=True)
 
 # ── project root & temp folder ────────────────────────────────────────────────
 # NOTE: _has_rust is checked lazily at call time (not import time).
@@ -59,6 +71,25 @@ from audiobook_factory.utils import (
     update_progress_file,
     format_lrc_timestamp
 )
+
+
+_MAX_PARALLEL_CHAPTERS: int = 0
+# 0 = auto (matches GPU count). >0 = override. Set at module level.
+
+def _get_chapter_parallelism(pool: Any) -> int:
+    """Returns the number of chapters to process simultaneously.
+
+    Equals pool.device_count when _MAX_PARALLEL_CHAPTERS == 0.
+    Capped at pool.device_count to prevent VRAM contention.
+
+    Returns:
+        Number of chapters to process in parallel (always >= 1).
+    """
+    if pool is None or not hasattr(pool, "device_count") or pool.device_count <= 0:
+        return 1
+    if _MAX_PARALLEL_CHAPTERS > 0:
+        return max(1, min(_MAX_PARALLEL_CHAPTERS, pool.device_count))
+    return max(1, pool.device_count)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -115,13 +146,28 @@ class AudiobookConfig:
     single_file_mode:    bool  = False   # combine all into one big file
 
     # ── Misc ──────────────────────────────────────────────────────────────────
-    force_reprocess:     bool  = False
-    sample_rate:         int   = 24000
-    torch_compile:       bool  = False
+    force_reprocess:          bool  = False  # When True, forces re-extraction & re-synthesis of all chunks from scratch
+    resume_incomplete_chunks: bool  = True   # When True, resumes mid-chapter from last completed chunk using disk cache
+    sample_rate:              int   = 24000
+    torch_compile:            bool  = False
+    quantization:             str   = "none"   # "none" | "int8"
 
     # ── Pronunciation fixes ───────────────────────────────────────────────────
     # { regex_pattern: replacement }  applied before TTS
     pronunciation_map:   dict  = field(default_factory=dict)
+
+
+def _validate_config(config: AudiobookConfig) -> None:
+    """Validate AudiobookConfig options before running the pipeline.
+
+    Raises:
+        ValueError: If config.quantization is not one of _VALID_QUANTIZATION_MODES.
+    """
+    if config.quantization not in _VALID_QUANTIZATION_MODES:
+        raise ValueError(
+            f"Invalid quantization mode '{config.quantization}'. "
+            f"Supported options: {sorted(_VALID_QUANTIZATION_MODES)}"
+        )
 
     # ── Resume / selection ────────────────────────────────────────────────────
     # Raw chapter labels chosen in the UI (e.g. "1. Chapter 1 (~500 words)")
@@ -224,12 +270,14 @@ def run_pipeline(
     Returns list of output file paths (one per chapter).
     In preview_mode returns an empty list (no audio files generated).
     """
+    _validate_config(config)
+
     if cancel is None:
         cancel = CancelToken()
 
     def log(msg: str):
         log_queue.put(msg)
-        print(msg)
+        logger.info(msg)
 
     def progress(cur: float, total: int):
         prog_queue.put((cur, float(total)))
@@ -262,8 +310,10 @@ def run_pipeline(
         log("[Pipeline] 🔄 Force reprocess enabled. Clearing old progress.")
         for p in [prog_path_out, prog_path_tmp]:
             if os.path.exists(p):
-                try: os.remove(p)
-                except: pass
+                try:
+                    os.remove(p)
+                except OSError as exc:
+                    logger.debug("Could not remove %s: %s", p, exc)
 
     # ── Build per-chapter tasks ───────────────────────────────────────────────
     tasks = list(enumerate(chapters, 1))
@@ -281,7 +331,7 @@ def run_pipeline(
         for k, v in asdict(config).items():
             settings_dict[k] = v
     except Exception as e:
-        print(f"Error serializing config: {e}")
+        logger.warning("Error serializing config: %s", e)
 
     progress_data = load_or_create_progress_file(
         prog_path_out,
@@ -309,14 +359,14 @@ def run_pipeline(
             with open(prog_path_out, "w", encoding="utf-8") as f:
                 json.dump(progress_data, f, indent=4)
         except Exception as e:
-            print(f"Error writing updated progress json settings: {e}")
+            logger.warning("Error writing updated progress json settings: %s", e)
             
     # Sync to temp for user visibility
     try:
         with open(prog_path_tmp, "w", encoding="utf-8") as f:
             json.dump(progress_data, f, indent=4)
-    except:
-        pass
+    except OSError as exc:
+        logger.debug("Could not sync progress to temp: %s", exc)
 
     # ── Shared TTS Provider / GPU Pool Setup ──────────────────────────────────
     from audiobook_factory.gpu_pool import GPUPoolManager
@@ -334,6 +384,9 @@ def run_pipeline(
     output_files: list[str] = []
     _lock = threading.Lock()
     
+    subtitle_futures: list[tuple[int, concurrent.futures.Future]] = []
+    subtitle_futures_lock = threading.Lock()
+
     chapter_progress = {i: 0.0 for i in range(1, total + 1)}
     def _update_chapter_prog(idx, frac):
         with _lock:
@@ -341,7 +394,7 @@ def run_pipeline(
             sum_frac = sum(chapter_progress.values())
             progress(sum_frac, total)
 
-    def _process(idx_chapter):
+    def _process(idx_chapter, pinned_device: str | None = None):
         idx, chapter = idx_chapter
         if cancel.is_cancelled:
             return None
@@ -349,6 +402,7 @@ def run_pipeline(
         # Check checkpoint
         from audiobook_factory.utils import normalize_chapter_title_for_matching
         ch_status = "pending"
+        completed_chunks: list[int] = []
         ch_title_norm = chapter.title.strip().lower()
         ch_clean_norm = re.sub(r'\(~[\d,]+\s*words\)', '', chapter.title).strip().lower()
         ch_num_extracted, ch_core = normalize_chapter_title_for_matching(chapter.title)
@@ -367,6 +421,7 @@ def run_pipeline(
                 or (c_num_extracted is not None and ch_num_extracted is not None and c_num_extracted == ch_num_extracted and c_core == ch_core)
             ):
                 ch_status = c.get("status", "pending")
+                completed_chunks = list(c.get("completed_chunks", []))
                 found_match = True
                 break
 
@@ -380,6 +435,7 @@ def run_pipeline(
                     or (c_num_extracted is not None and ch_num_extracted is not None and c_num_extracted == ch_num_extracted)
                 ):
                     ch_status = c.get("status", "pending")
+                    completed_chunks = list(c.get("completed_chunks", []))
                     break
         
         if ch_status == "completed" and not config.force_reprocess:
@@ -402,7 +458,11 @@ def run_pipeline(
         try:
             path = _process_chapter(
                 config, chapter, idx, total, log, cancel, provider, pool=pool,
-                prog_cb=lambda f: _update_chapter_prog(idx, f)
+                prog_cb=lambda f: _update_chapter_prog(idx, f),
+                pinned_device=pinned_device,
+                subtitle_futures=subtitle_futures,
+                subtitle_futures_lock=subtitle_futures_lock,
+                completed_chunks=completed_chunks,
             )
             if path:
                 with _lock:
@@ -413,8 +473,8 @@ def run_pipeline(
                 for p in [prog_path_out, prog_path_tmp]:
                     try:
                         update_progress_file(p, idx, "completed", chapter_title=chapter.title)
-                    except:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Could not update progress file: %s", exc)
             return path
         except Exception as e:
             import traceback
@@ -425,14 +485,28 @@ def run_pipeline(
             _update_chapter_prog(idx, 1.0)
 
     try:
-        if getattr(config, "parallel_mode", "chunks") == "chapters" and config.worker_count > 1:
-            with ThreadPoolExecutor(max_workers=config.worker_count) as pool:
-                futures = {pool.submit(_process, t): t for t in tasks}
-                for fut in as_completed(futures):
+        max_parallel = _get_chapter_parallelism(pool)
+        if max_parallel > 1:
+            log(f"[Pipeline] 🚀 Inter-chapter parallelism active: processing up to {max_parallel} chapters simultaneously...")
+            devices = pool.devices if pool else []
+            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                futures = {}
+                for i, t in enumerate(tasks):
                     if cancel.is_cancelled:
-                        pool.shutdown(wait=False, cancel_futures=True)
                         break
-                    fut.result()
+                    pinned = devices[i % len(devices)] if devices else None
+                    fut = executor.submit(_process, t, pinned)
+                    futures[fut] = t
+
+                for future in as_completed(futures):
+                    t = futures[future]
+                    try:
+                        future.result()
+                    except CancelledError:
+                        cancel.cancel()
+                        break
+                    except Exception as exc:
+                        log(f"[Pipeline] Chapter execution error: {exc}")
         else:
             for t in tasks:
                 if cancel.is_cancelled:
@@ -471,8 +545,10 @@ def run_pipeline(
                 
                 # Clean up chapters and list
                 for p in output_files:
-                    try: os.remove(p)
-                    except: pass
+                    try:
+                        os.remove(p)
+                    except OSError as exc:
+                        logger.debug("Could not remove chunk file %s: %s", p, exc)
                 os.remove(list_txt)
                 
                 output_files = [full_path]
@@ -484,12 +560,120 @@ def run_pipeline(
         return output_files
 
     finally:
+        _await_subtitle_futures(subtitle_futures, cancel)
         if provider is not None:
             try:
                 provider.cleanup()
             except Exception as e:
-                log(f"[Pipeline] Cleanup error: {e}")
+                logger.warning("[Pipeline] Cleanup error: %s", e)
 
+
+
+def _generate_subtitles(
+    config: AudiobookConfig,
+    chapter: ExtractedChapter,
+    idx: int,
+    tts_jobs: list[str],
+    chunk_durations: list[float],
+    log: Callable[[str], None],
+) -> None:
+    """Generate LRC, SRT, and VTT subtitle files for one chapter.
+
+    Called asynchronously via _subtitle_executor. All three formats are
+    written in a single call. Failures are caught per-format and logged as
+    warnings — subtitle files are non-critical output.
+
+    Args:
+        config: AudiobookConfig controlling which formats to export.
+        chapter: ExtractedChapter providing the chapter title.
+        idx: Chapter index used in log messages and filename generation.
+        tts_jobs: List of text chunks in chapter order.
+        chunk_durations: Duration in seconds for each chunk in tts_jobs.
+        log: Callable for progress reporting.
+    """
+    # ── Generate LRC timed lyrics ─────────────────────────────────────────
+    if config.export_lrc:
+        lrc_name = make_safe_filename(chapter.title, idx, config.output_dir, ".lrc")
+        lrc_path = os.path.join(config.output_dir, lrc_name)
+        try:
+            curr_time = 0.0
+            pause_len = config.pause
+            with open(lrc_path, "w", encoding="utf-8") as fh:
+                for i, (text_chunk, dur) in enumerate(zip(tts_jobs, chunk_durations)):
+                    m, s = divmod(curr_time, 60)
+                    fh.write(f"[{int(m):02d}:{s:05.2f}]{text_chunk}\n")
+                    curr_time += dur + pause_len
+            log(f"  [Ch{idx}] LRC exported → {lrc_name}")
+        except Exception as e:
+            log(f"  [Ch{idx}] LRC export failed: {e}")
+
+    # ── Generate SRT timed subtitles ──────────────────────────────────────
+    if config.export_srt:
+        srt_name = make_safe_filename(chapter.title, idx, config.output_dir, ".srt")
+        srt_path = os.path.join(config.output_dir, srt_name)
+        try:
+            from audiobook_factory.utils import seconds_to_srt_time
+            curr_time = 0.0
+            pause_len = config.pause
+            with open(srt_path, "w", encoding="utf-8") as fh:
+                for i, (text_chunk, dur) in enumerate(zip(tts_jobs, chunk_durations), 1):
+                    start = seconds_to_srt_time(curr_time)
+                    end = seconds_to_srt_time(curr_time + dur)
+                    fh.write(f"{i}\n{start} --> {end}\n{text_chunk}\n\n")
+                    curr_time += dur + pause_len
+            log(f"  [Ch{idx}] SRT exported → {srt_name}")
+        except Exception as e:
+            log(f"  [Ch{idx}] SRT export failed: {e}")
+
+    # ── Generate WebVTT timed subtitles ───────────────────────────────────
+    if config.export_vtt:
+        vtt_name = make_safe_filename(chapter.title, idx, config.output_dir, ".vtt")
+        vtt_path = os.path.join(config.output_dir, vtt_name)
+        try:
+            from audiobook_factory.utils import seconds_to_vtt_time
+            curr_time = 0.0
+            pause_len = config.pause
+            with open(vtt_path, "w", encoding="utf-8") as fh:
+                fh.write("WEBVTT\n\n")
+                for i, (text_chunk, dur) in enumerate(zip(tts_jobs, chunk_durations), 1):
+                    start = seconds_to_vtt_time(curr_time)
+                    end = seconds_to_vtt_time(curr_time + dur)
+                    fh.write(f"{i}\n{start} --> {end}\n{text_chunk}\n\n")
+                    curr_time += dur + pause_len
+            log(f"  [Ch{idx}] WebVTT exported → {vtt_name}")
+        except Exception as e:
+            log(f"  [Ch{idx}] WebVTT export failed: {e}")
+
+
+def _await_subtitle_futures(
+    futures: list[tuple[int, concurrent.futures.Future]],
+    cancel_token: CancelToken | None = None,
+) -> None:
+    """Waits for all subtitle generation tasks to complete.
+
+    Cancels pending futures if cancel_token.is_cancelled. Logs warnings
+    for timeouts and errors — subtitle files are non-critical output.
+
+    Args:
+        futures: List of (chapter_idx, Future) pairs to await.
+        cancel_token: Optional token checked before awaiting each future.
+    """
+    for chapter_num, future in futures:
+        if cancel_token is not None and cancel_token.is_cancelled:
+            future.cancel()
+            continue
+        try:
+            future.result(timeout=30.0)
+        except concurrent.futures.CancelledError:
+            pass
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "Subtitle generation timed out for chapter %d.", chapter_num
+            )
+        except Exception as exc:
+            logger.warning(
+                "Subtitle generation failed for chapter %d: %s", chapter_num, exc
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -506,12 +690,33 @@ def _process_chapter(
     provider: "BaseTTSProvider" = None,
     pool: Any = None,
     prog_cb: Callable[[float], None] = None,
+    pinned_device: str | None = None,
+    subtitle_futures: list[tuple[int, concurrent.futures.Future]] | None = None,
+    subtitle_futures_lock: threading.Lock | None = None,
+    completed_chunks: list[int] | None = None,
 ) -> str | None:
     """Generate audio for one chapter. Returns output file path."""
     from audiobook_factory.ffmpeg_utils import get_format_settings
     from audiobook_factory.tts_providers import get_tts_provider
 
-    temp_dir = tempfile.mkdtemp(prefix=f"abm_ch{idx:03d}_", dir=str(_TEMP_DIR))
+    temp_dir = os.path.join(config.output_dir, ".temp_chunks", f"abm_ch{idx:03d}")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    if config.force_reprocess or not getattr(config, "resume_incomplete_chunks", True):
+        completed_chunks = []
+        if os.path.exists(temp_dir):
+            try:
+                for f_name in os.listdir(temp_dir):
+                    if f_name.startswith(f"chunk_ch_{idx}_") and f_name.endswith(".wav"):
+                        os.remove(os.path.join(temp_dir, f_name))
+            except OSError as exc:
+                logger.warning("Could not clear chunk files in %s: %s", temp_dir, exc)
+
+    prog_path_out = os.path.join(config.output_dir, "generation_progress.json")
+    def _chunk_cb(c_idx: int) -> None:
+        from audiobook_factory.utils import update_progress_file_chunk
+        update_progress_file_chunk(prog_path_out, idx, c_idx, chapter_title=chapter.title)
+
     try:
         # ── Apply pronunciation fixes ─────────────────────────────────────────
         text = chapter.text
@@ -542,104 +747,65 @@ def _process_chapter(
 
         log(f"  [Ch{idx}] {len(tts_jobs)} TTS chunks…")
 
-        def _synth_batch(texts: list[str], voice_refs: list[str], out_paths: list[str]) -> list[float]:
-            if pool is not None:
-                with pool.acquire_context(cancel) as p:
-                    return p.synthesize_batch(texts, voice_refs, out_paths)
-            elif provider is not None:
-                return provider.synthesize_batch(texts, voice_refs, out_paths)
-            else:
-                p = get_tts_provider(config.tts_provider_name, config)
-                return p.synthesize_batch(texts, voice_refs, out_paths)
+        # ── Synthesis via 3-Stage Overlapped Chapter Pipeline ─────────────────
+        if pool is not None:
+            from audiobook_factory.chapter_pipeline import run_chapter_pipeline
 
-        def _synth_single(t_text: str, v_ref: str, o_path: str) -> None:
-            if pool is not None:
-                with pool.acquire_context(cancel) as p:
-                    p.synthesize(t_text, v_ref, o_path)
-            elif provider is not None:
-                provider.synthesize(t_text, v_ref, o_path)
-            else:
-                p = get_tts_provider(config.tts_provider_name, config)
-                p.synthesize(t_text, v_ref, o_path)
-
-        chunk_paths: list[str | None] = [None] * len(tts_jobs)
-        chunk_durations: list[float] = [0.0] * len(tts_jobs)
-
-        use_parallel_chunks = (getattr(config, "parallel_mode", "chunks") == "chunks" and config.worker_count > 1)
-
-        if use_parallel_chunks:
-            # Batch size for GPU inference — can be larger than worker_count
-            # since batched TTS runs in a single model forward pass
-            batch_size = max(config.worker_count, 4)
-            for batch_start in range(0, len(tts_jobs), batch_size):
-                if cancel.is_cancelled:
-                    break
-                
-                batch_end = min(batch_start + batch_size, len(tts_jobs))
-                batch_texts = tts_jobs[batch_start:batch_end]
-                batch_voice_refs = [config.voice_file] * len(batch_texts)
-                batch_out_paths = [os.path.join(temp_dir, f"s_{i:04d}.wav") for i in range(batch_start, batch_end)]
-                
+            voice_bytes = b""
+            if config.voice_file and os.path.exists(config.voice_file):
                 try:
-                    durations = _synth_batch(batch_texts, batch_voice_refs, batch_out_paths)
-                    for idx_chunk, out_wav in enumerate(batch_out_paths):
-                        i = batch_start + idx_chunk
-                        # Only record path if the file was actually written
-                        if os.path.exists(out_wav) and os.path.getsize(out_wav) > 0:
-                            chunk_paths[i] = out_wav
-                            if config.export_lrc:
-                                chunk_durations[i] = durations[idx_chunk]
-                except Exception as e:
-                    import traceback
-                    error_trace = traceback.format_exc()
-                    log(f"  [Ch{idx}] Batch starting at chunk {batch_start} failed ({type(e).__name__}): {e}")
-                    log(f"  [Ch{idx}] Retrying batch chunks one-by-one...")
-                    err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_batch_{batch_start}.txt")
-                    with open(err_log_path, "w", encoding="utf-8") as err_f:
-                        err_f.write(error_trace)
+                    with open(config.voice_file, "rb") as vf:
+                        voice_bytes = vf.read()
+                except Exception as exc:
+                    log(f"  [Ch{idx}] Warning: Could not read voice_file bytes: {exc}")
 
-                    # ── One-by-one fallback for failed batch ──────────────────
-                    recovered = 0
-                    for sub_i, (chunk_text, out_wav) in enumerate(zip(batch_texts, batch_out_paths)):
-                        global_i = batch_start + sub_i
-                        try:
-                            _synth_single(chunk_text, config.voice_file, out_wav)
-                            chunk_paths[global_i] = out_wav
-                            if config.export_lrc:
-                                chunk_durations[global_i] = _get_wav_duration(out_wav)
-                            recovered += 1
-                        except Exception as sub_e:
-                            log(f"  [Ch{idx}] ⚠ Chunk {global_i} failed even in single mode: {sub_e}")
-                    log(f"  [Ch{idx}] One-by-one recovery: {recovered}/{len(batch_texts)} chunks saved.")
-                
-                if prog_cb:
-                    prog_cb(batch_end / len(tts_jobs))
+            chapter_wav_path = os.path.join(temp_dir, "chapter_mastered.wav")
+            chunk_durations = run_chapter_pipeline(
+                sentences=sentences,
+                voice_ref=voice_bytes,
+                out_wav_path=chapter_wav_path,
+                out_dir=temp_dir,
+                chapter_index=idx,
+                config=config,
+                pool=pool,
+                cancel_token=cancel,
+                log_callback=log,
+                progress_callback=prog_cb,
+                pinned_device=pinned_device,
+                completed_chunks=completed_chunks,
+                chunk_completed_cb=_chunk_cb,
+            )
+            chunk_paths = [chapter_wav_path] if os.path.exists(chapter_wav_path) else []
         else:
+            def _synth_single(t_text: str, v_ref: str, o_path: str) -> None:
+                if provider is not None:
+                    provider.synthesize(t_text, v_ref, o_path)
+                else:
+                    p = get_tts_provider(config.tts_provider_name, config)
+                    p.synthesize(t_text, v_ref, o_path)
+
+            chunk_paths: list[str | None] = [None] * len(tts_jobs)
+            chunk_durations: list[float] = [0.0] * len(tts_jobs)
+
             for i, chunk_text in enumerate(tts_jobs):
                 if cancel.is_cancelled:
                     return None
                 out_wav = os.path.join(temp_dir, f"s_{i:04d}.wav")
-                # Retry once on transient failures (e.g. brief GPU hiccup)
                 for attempt in range(2):
                     try:
                         _synth_single(chunk_text, config.voice_file, out_wav)
                         if os.path.exists(out_wav) and os.path.getsize(out_wav) > 0:
                             chunk_paths[i] = out_wav
-                            if config.export_lrc:
+                            if config.export_lrc or config.export_srt or config.export_vtt:
                                 chunk_durations[i] = _get_wav_duration(out_wav)
-                        break  # success
+                        break
                     except Exception as e:
                         if attempt == 0:
                             import time as _time
                             log(f"  [Ch{idx}] chunk {i} failed ({e}), retrying...")
                             _time.sleep(1)
                         else:
-                            import traceback
-                            error_trace = traceback.format_exc()
                             log(f"  [Ch{idx}] chunk {i} failed after retry: {e}")
-                            err_log_path = os.path.join(config.output_dir, f"error_ch{idx:03d}_{i}.txt")
-                            with open(err_log_path, "w", encoding="utf-8") as err_f:
-                                err_f.write(error_trace)
 
                 if prog_cb:
                     prog_cb((i + 1) / len(tts_jobs))
@@ -647,58 +813,17 @@ def _process_chapter(
         if cancel.is_cancelled:
             return None
 
-        # ── Generate LRC timed lyrics ─────────────────────────────────────────
-        if config.export_lrc:
-            lrc_name = make_safe_filename(chapter.title, idx, config.output_dir, ".lrc")
-            lrc_path = os.path.join(config.output_dir, lrc_name)
-            try:
-                curr_time = 0.0
-                pause_len = config.pause
-                with open(lrc_path, "w", encoding="utf-8") as fh:
-                    for i, (text_chunk, dur) in enumerate(zip(tts_jobs, chunk_durations)):
-                        m, s = divmod(curr_time, 60)
-                        fh.write(f"[{int(m):02d}:{s:05.2f}]{text_chunk}\n")
-                        curr_time += dur + pause_len
-                log(f"  [Ch{idx}] LRC exported → {lrc_name}")
-            except Exception as e:
-                log(f"  [Ch{idx}] LRC export failed: {e}")
-
-        # ── Generate SRT timed subtitles ──────────────────────────────────────
-        if config.export_srt:
-            srt_name = make_safe_filename(chapter.title, idx, config.output_dir, ".srt")
-            srt_path = os.path.join(config.output_dir, srt_name)
-            try:
-                from audiobook_factory.utils import seconds_to_srt_time
-                curr_time = 0.0
-                pause_len = config.pause
-                with open(srt_path, "w", encoding="utf-8") as fh:
-                    for i, (text_chunk, dur) in enumerate(zip(tts_jobs, chunk_durations), 1):
-                        start = seconds_to_srt_time(curr_time)
-                        end = seconds_to_srt_time(curr_time + dur)
-                        fh.write(f"{i}\n{start} --> {end}\n{text_chunk}\n\n")
-                        curr_time += dur + pause_len
-                log(f"  [Ch{idx}] SRT exported → {srt_name}")
-            except Exception as e:
-                log(f"  [Ch{idx}] SRT export failed: {e}")
-
-        # ── Generate WebVTT timed subtitles ───────────────────────────────────
-        if config.export_vtt:
-            vtt_name = make_safe_filename(chapter.title, idx, config.output_dir, ".vtt")
-            vtt_path = os.path.join(config.output_dir, vtt_name)
-            try:
-                from audiobook_factory.utils import seconds_to_vtt_time
-                curr_time = 0.0
-                pause_len = config.pause
-                with open(vtt_path, "w", encoding="utf-8") as fh:
-                    fh.write("WEBVTT\n\n")
-                    for i, (text_chunk, dur) in enumerate(zip(tts_jobs, chunk_durations), 1):
-                        start = seconds_to_vtt_time(curr_time)
-                        end = seconds_to_vtt_time(curr_time + dur)
-                        fh.write(f"{i}\n{start} --> {end}\n{text_chunk}\n\n")
-                        curr_time += dur + pause_len
-                log(f"  [Ch{idx}] WebVTT exported → {vtt_name}")
-            except Exception as e:
-                log(f"  [Ch{idx}] WebVTT export failed: {e}")
+        # ── Generate Subtitles Asynchronously ─────────────────────────────────
+        if config.export_lrc or config.export_srt or config.export_vtt:
+            if subtitle_futures is not None and subtitle_futures_lock is not None:
+                sub_future = _subtitle_executor.submit(
+                    _generate_subtitles,
+                    config, chapter, idx, tts_jobs, chunk_durations, log,
+                )
+                with subtitle_futures_lock:
+                    subtitle_futures.append((idx, sub_future))
+            else:
+                _generate_subtitles(config, chapter, idx, tts_jobs, chunk_durations, log)
 
         # ── Ensure cover image is in valid format (e.g. JPEG/PNG) ────────────
         raw_cover = config.cover_image
@@ -881,9 +1006,20 @@ def _process_chapter(
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ══════════════════════════════════════════════════════════════════════════════
+def _cleanup_chunk_files(paths: list[str | None]) -> None:
+    """Removes temporary chunk WAV files. Logs warnings for failures.
+
+    Thread-safe. Safe to call with an empty list or paths that no longer exist.
+    """
+    for path in paths:
+        if not path:
+            continue
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError as exc:
+            import logging
+            logging.getLogger(__name__).warning("Failed to remove temp chunk file %s: %s", path, exc)
 
 def _get_wav_duration(path: str) -> float:
     """Return the duration of a WAV file in seconds."""
@@ -923,5 +1059,5 @@ def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
                 with open(out_path, "rb") as f:
                     return f.read()
         except Exception as e:
-            print(f"[preview_tts] Error: {e}")
+            logger.warning("[preview_tts] Error: %s", e)
     return None

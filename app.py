@@ -422,6 +422,14 @@ def build_app():
                     force_repro_chk   = gr.Checkbox(label="Force re-process (ignore saved progress)", value=False)
                     export_text_chk   = gr.Checkbox(label="Export chapter text as .txt", value=False)
                     torch_compile_chk = gr.Checkbox(label="Enable GPU compile (torch.compile)", value=False)
+                with gr.Row():
+                    quantization_radio = gr.Radio(
+                        label="Model Quantization",
+                        choices=["none", "int8"],
+                        value="none",
+                        info="int8 reduces VRAM usage by ~50% via bitsandbytes (disables torch.compile).",
+                        interactive=True,
+                    )
                 gr.Markdown("#### Pronunciation fixes")
                 gr.HTML('<div class="warn-box">ℹ️ Upload a plain text file with one fix per line: <code>search==replace</code> (regex supported). Lines starting with # are comments.</div>')
                 pronunciation_file = gr.File(
@@ -455,6 +463,11 @@ def build_app():
                         label="**🔄 Re-generate completed chapters whose audio file is missing**",
                         value=True,
                         info="When ON (default): if a chapter is marked 'completed' in the progress JSON but the audio file is gone, it will be re-generated automatically. Turn OFF to skip those chapters entirely."
+                    )
+                    resume_chunks_chk = gr.Checkbox(
+                        label="**⏩ Resume incomplete chapters from last chunk**",
+                        value=True,
+                        info="When ON (default): if a chapter was interrupted mid-synthesis, skip already-synthesized chunks using disk cache. Turn OFF to re-synthesize all chunks from scratch."
                     )
 
                 preview_table = gr.Dataframe(
@@ -740,7 +753,7 @@ def build_app():
                 with open(raw_audio_path, "rb") as f:
                     in_bytes = f.read()
                 logs = []
-                out_bytes = voice_preprocess(in_bytes, cfg, log_fn=logs.append)
+                out_bytes = voice_preprocess(in_bytes, cfg, log_fn=logs.append, use_cache=False)
 
             sr, audio = _bytes_to_gradio_audio(out_bytes)
             return (sr, audio), "✅ Preprocessing complete!", out_bytes
@@ -954,7 +967,7 @@ def build_app():
             worker_count, parallel_mode, export_text, pron_file_obj, progress_file_obj, tts_provider,
             mname, timbre, instruct,
             single_file, export_lrc, export_srt, export_vtt,
-            torch_compile, regen_missing,
+            torch_compile, regen_missing, quantization, resume_incomplete_chunks,
             progress=gr.Progress(track_tqdm=False)
         ):
             if file_obj is None:
@@ -1052,6 +1065,7 @@ def build_app():
                 export_srt=export_srt,
                 export_vtt=export_vtt,
                 torch_compile=bool(torch_compile),
+                quantization=str(quantization or "none"),
                 selected_chapters=selected_chapters or [],
                 regen_missing=bool(regen_missing),
             )
@@ -1243,7 +1257,7 @@ def build_app():
                 worker_count_sl, parallel_mode_dd, export_text_chk, pronunciation_file, progress_file_upload, tts_provider_dd,
                 tts_model_name, tts_timbre, tts_instruct,
                 single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
-                torch_compile_chk, regen_missing_chk
+                torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk
             ],
             outputs=[log_box, prog_html, download_col, download_files, cancel_state],
         )
@@ -1346,6 +1360,8 @@ def build_app():
                 exp_vtt_val = val("export_vtt", False)
                 torch_compile_val = val("torch_compile", False)
                 regen_missing_val = val("regen_missing", True)
+                quantization_val = val("quantization", "none")
+                resume_chunks_val = val("resume_incomplete_chunks", False)
 
                 # Restore pronunciation map if present
                 pron_map = val("pronunciation_map", {})
@@ -1393,12 +1409,14 @@ def build_app():
                     gr.update(value=exp_vtt_val),
                     gr.update(value=torch_compile_val),
                     gr.update(value=regen_missing_val),
+                    gr.update(value=quantization_val),
+                    gr.update(value=resume_chunks_val),
                     pron_file_update,
                     gr.update(value=saved_chapters) if saved_chapters else gr.update(),
                     saved_chapters or None,   # json_selected_chapters_state
                 )
             except Exception as e:
-                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(30)]
+                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(32)]
 
         progress_file_upload.upload(
             on_progress_upload,
@@ -1410,7 +1428,7 @@ def build_app():
                 tts_timbre, tts_instruct, max_len_sl, lufs_adv, worker_count_sl,
                 parallel_mode_dd, tts_provider_dd, epub_ocr_chk, force_repro_chk,
                 export_text_chk, single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
-                torch_compile_chk, regen_missing_chk, pronunciation_file, chapter_check,
+                torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk, pronunciation_file, chapter_check,
                 json_selected_chapters_state,
             ]
         )
@@ -1427,7 +1445,7 @@ def build_app():
             worker_count, parallel_mode, export_text, pron_file_obj, tts_provider,
             mname, timbre, instruct,
             single_file, export_lrc, export_srt, export_vtt,
-            torch_compile, regen_missing,
+            torch_compile, regen_missing, quantization, resume_incomplete_chunks,
         ):
             """Parse the book, cache chapter text, and write a self-contained
             generation_progress.json — without starting TTS generation."""
@@ -1537,8 +1555,10 @@ def build_app():
                     tts_instruct=instruct, single_file_mode=single_file,
                     export_lrc=export_lrc, export_srt=export_srt, export_vtt=export_vtt,
                     torch_compile=bool(torch_compile),
+                    quantization=str(quantization or "none"),
                     selected_chapters=selected_chapters or [],
                     regen_missing=bool(regen_missing),
+                    resume_incomplete_chunks=bool(resume_incomplete_chunks),
                 )
                 settings_dict = dataclasses.asdict(cfg)
 
@@ -1559,8 +1579,8 @@ def build_app():
                         pass
 
                 if cover_bytes:
-                    os.makedirs(out_dir, exist_ok=True)
-                    local_cov = os.path.join(out_dir, "cover.jpg")
+                    os.makedirs(book_out, exist_ok=True)
+                    local_cov = os.path.join(book_out, "cover.jpg")
                     try:
                         with open(local_cov, "wb") as f_cov:
                             f_cov.write(cover_bytes)
@@ -1672,7 +1692,7 @@ def build_app():
                 worker_count_sl, parallel_mode_dd, export_text_chk, pronunciation_file, tts_provider_dd,
                 tts_model_name, tts_timbre, tts_instruct,
                 single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
-                torch_compile_chk, regen_missing_chk,
+                torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk,
             ],
             outputs=[export_cfg_status, export_config_file, export_cfg_accordion],
         )

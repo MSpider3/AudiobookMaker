@@ -27,7 +27,12 @@ __all__ = ["GPUDetector", "ProviderPool", "GPUPoolManager"]
 
 _DEFAULT_MIN_VRAM_GB: float = 5.0
 _ACQUIRE_POLL_TIMEOUT_SEC: float = 0.5
+_AFFINITY_PREFER_TIMEOUT_SEC: float = 0.1
 _BYTES_PER_GB: float = 1024.0 * 1024.0 * 1024.0
+_DEFAULT_CHUNK_CHARS: int = 399
+_VRAM_PER_CHUNK_GB: float = 0.5
+_MIN_BATCH_SIZE: int = 4
+_MAX_BATCH_SIZE: int = 32
 
 
 class GPUDetector:
@@ -129,6 +134,32 @@ class GPUDetector:
         return valid_devices
 
     @staticmethod
+    def suggest_batch_size(
+        device: str,
+        base_chunk_chars: int = _DEFAULT_CHUNK_CHARS,
+    ) -> int:
+        """Suggests a TTS batch size based on available VRAM for the device.
+
+        Uses an empirical estimate of activation memory per chunk. Clamped
+        between _MIN_BATCH_SIZE and _MAX_BATCH_SIZE.
+
+        Args:
+            device: CUDA device string (e.g. "cuda:0") or "cpu".
+            base_chunk_chars: Character count per TTS chunk (default: 399).
+
+        Returns:
+            Integer batch size suggestion for this device.
+        """
+        if device == "cpu":
+            return _MIN_BATCH_SIZE
+        info = GPUDetector.get_device_info(device)
+        free_gb = info["free_vram_gb"]
+        chars_scaling = base_chunk_chars / _DEFAULT_CHUNK_CHARS if _DEFAULT_CHUNK_CHARS > 0 else 1.0
+        denom = _VRAM_PER_CHUNK_GB * chars_scaling
+        estimated_batches = int(free_gb / denom) if denom > 0 else _MIN_BATCH_SIZE
+        return max(_MIN_BATCH_SIZE, min(_MAX_BATCH_SIZE, estimated_batches))
+
+    @staticmethod
     def log_summary() -> None:
         """Log a formatted summary of all detected compute devices."""
         devices = GPUDetector.detect_devices()
@@ -147,17 +178,29 @@ class GPUDetector:
             )
 
 
-def _check_cancellation(cancel_token: Any | None) -> bool:
-    """Helper to evaluate various cancel token interface styles safely."""
+from asyncio import CancelledError
+
+def _check_cancellation(cancel_token: Any | None) -> None:
+    """Helper to evaluate cancellation and raise CancelledError if set.
+
+    Args:
+        cancel_token: Optional cancellation token object.
+
+    Raises:
+        CancelledError: If cancellation is requested.
+    """
     if cancel_token is None:
-        return False
+        return
+    is_canc = False
     if hasattr(cancel_token, "is_cancelled"):
         val = getattr(cancel_token, "is_cancelled")
-        return val() if callable(val) else bool(val)
-    if hasattr(cancel_token, "cancelled"):
+        is_canc = val() if callable(val) else bool(val)
+    elif hasattr(cancel_token, "cancelled"):
         val = getattr(cancel_token, "cancelled")
-        return val() if callable(val) else bool(val)
-    return False
+        is_canc = val() if callable(val) else bool(val)
+    if is_canc:
+        raise CancelledError("Acquisition cancelled by CancelToken")
+
 
 
 class ProviderPool:
@@ -182,7 +225,10 @@ class ProviderPool:
         self._provider_factory = provider_factory
         self._devices = list(devices)
         self._provider_name = provider_name
-        self._queue: queue.Queue[BaseTTSProvider] = queue.Queue()
+        self._device_queues: dict[str, queue.Queue[BaseTTSProvider]] = {
+            dev: queue.Queue(maxsize=1) for dev in self._devices
+        }
+        self._device_map: dict[str, BaseTTSProvider] = {}
 
         logger.info(
             "Initializing ProviderPool[%s] with %d device(s): %s",
@@ -193,7 +239,8 @@ class ProviderPool:
 
         for dev in self._devices:
             provider_instance = self._provider_factory(dev)
-            self._queue.put(provider_instance)
+            self._device_queues[dev].put(provider_instance)
+            self._device_map[dev] = provider_instance
 
     @property
     def device_count(self) -> int:
@@ -218,50 +265,88 @@ class ProviderPool:
         """
         return self.device_count > 0
 
-    def acquire(self, cancel_token: Any | None = None) -> BaseTTSProvider:
-        """Acquire an available TTS provider from the pool.
+    def get_provider_for_device(self, device: str) -> BaseTTSProvider | None:
+        """Returns the provider instance bound to a specific device, without acquiring.
 
-        Blocks until a provider becomes available or cancellation is requested.
+        Deprecated: As of Phase 3, direct device_map access is used. This method is
+        retained for backward compatibility.
 
         Args:
-            cancel_token: Optional token exposing an is_cancelled property/method.
+            device: CUDA device string e.g. "cuda:0".
+
+        Returns:
+            The provider instance for that device, or None if not found.
+        """
+        return self._device_map.get(device)
+
+    def preferred_device_for_index(self, chapter_index: int) -> str:
+        """Returns the preferred device for a chapter index.
+
+        Deprecated: As of Phase 3, chunk dispatch uses static pre-assignment
+        in chapter_pipeline.py. This method is retained for backward compatibility.
+        Use pool.devices[chapter_index % pool.device_count] directly.
+        """
+        if not self._devices:
+            return "cpu"
+        return self._devices[chapter_index % len(self._devices)]
+
+    def acquire(
+        self,
+        cancel_token: Any | None = None,
+        preferred_device: str | None = None,
+    ) -> BaseTTSProvider:
+        """Acquire an available TTS provider from the pool with device affinity.
+
+        Args:
+            cancel_token: Optional cancellation token.
+            preferred_device: Target device string (e.g. "cuda:0") to prefer.
 
         Returns:
             An available BaseTTSProvider instance.
 
         Raises:
-            InterruptedError: If operation is cancelled while waiting for a provider.
+            CancelledError: If cancellation is requested.
         """
-        while True:
-            if _check_cancellation(cancel_token):
-                raise InterruptedError("Synthesis acquisition cancelled by user.")
-
+        if preferred_device and preferred_device in self._device_queues:
             try:
-                return self._queue.get(timeout=_ACQUIRE_POLL_TIMEOUT_SEC)
+                return self._device_queues[preferred_device].get(timeout=_AFFINITY_PREFER_TIMEOUT_SEC)
             except queue.Empty:
-                continue
+                pass
+
+        while True:
+            _check_cancellation(cancel_token)
+            for dev_queue in self._device_queues.values():
+                try:
+                    return dev_queue.get(block=False)
+                except queue.Empty:
+                    continue
+            time.sleep(_ACQUIRE_POLL_TIMEOUT_SEC)
 
     def release(self, provider: BaseTTSProvider) -> None:
-        """Return a TTS provider instance to the pool queue.
+        """Return a TTS provider instance to its device queue.
 
         Args:
             provider: The BaseTTSProvider instance to return.
         """
-        self._queue.put(provider)
+        dev = getattr(provider, "device", None)
+        if dev and dev in self._device_queues:
+            self._device_queues[dev].put(provider)
+        else:
+            for q in self._device_queues.values():
+                try:
+                    q.put_nowait(provider)
+                    break
+                except queue.Full:
+                    continue
 
     @contextmanager
     def acquire_context(
-        self, cancel_token: Any | None = None
+        self,
+        cancel_token: Any | None = None,
+        preferred_device: str | None = None,
     ) -> Generator[BaseTTSProvider, None, None]:
-        """Context manager to safely acquire and automatically release a provider.
-
-        Args:
-            cancel_token: Optional cancellation token.
-
-        Yields:
-            An acquired BaseTTSProvider instance.
-        """
-        provider = self.acquire(cancel_token=cancel_token)
+        """Context manager to safely acquire and automatically release a provider."""
+        provider = self.acquire(cancel_token=cancel_token, preferred_device=preferred_device)
         try:
             yield provider
         finally:

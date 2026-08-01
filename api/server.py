@@ -173,6 +173,7 @@ async def api_preprocess(
     formant_timbre: float = Form(...),
     resample: bool = Form(...),
     target_sample_rate: int = Form(...),
+    use_cache: bool = Form(default=False),
     audio_file: UploadFile = File(...)
 ):
     """
@@ -200,7 +201,7 @@ async def api_preprocess(
         )
         
         in_bytes = await audio_file.read()
-        out_bytes = voice_preprocess(in_bytes, cfg)
+        out_bytes = voice_preprocess(in_bytes, cfg, use_cache=use_cache)
         
         return StreamingResponse(io.BytesIO(out_bytes), media_type="audio/wav")
     except Exception as e:

@@ -19,7 +19,10 @@ logger = logging.getLogger(__name__)
 
 # Trim very quiet audio edges before saving (amplitude threshold).
 _TRIM_THRESHOLD: float = 0.04
+_TORCH_COMPILE_MODE: str = "max-autotune"
 
+
+import hashlib
 
 class QwenTTSProvider(BaseTTSProvider):
     """Local Qwen3-TTS provider supporting all model variants (Base, CustomVoice, VoiceDesign)."""
@@ -32,11 +35,16 @@ class QwenTTSProvider(BaseTTSProvider):
             device: Target torch device string (e.g. "cuda:0", "cuda:1", "cpu").
         """
         super().__init__(config)
-        self._device: str = device or getattr(config, "device", "cuda")
+        self._init_with_device(device or getattr(config, "device", "cuda"), config)
+
+    def _init_with_device(self, device: str, config: AudiobookConfig) -> None:
+        """Initialize instance variables pinned to target device."""
+        import torch
+        self.config = config
+        self._device: str = device
         self._model: Any = None
         self._loaded_model_name: str | None = None
-        self._cached_x_vector: Any = None  # cached speaker embedding
-        self._cached_voice_path: str | None = None  # path the cached x-vector was built from
+        self._x_vector_cache: dict[str, torch.Tensor] = {}
         self._lock: threading.Lock = threading.Lock()
 
     @classmethod
@@ -52,6 +60,11 @@ class QwenTTSProvider(BaseTTSProvider):
         """
         return cls(config, device=device)
 
+    @property
+    def device(self) -> str:
+        """The torch device string this provider is bound to."""
+        return self._device
+
     def get_name(self) -> str:
         """Return display name of the provider."""
         return f"Qwen3-TTS ({self.config.tts_model_name}) [{self._device}]"
@@ -60,37 +73,55 @@ class QwenTTSProvider(BaseTTSProvider):
         """Return USD cost estimate for synthesis (0.0 for local model)."""
         return 0.0
 
-    def _ensure_x_vector_cached(self, voice_ref: str) -> None:
+    def _ensure_x_vector_cached(self, voice_ref: str | bytes) -> str | None:
         """Pre-compute and cache the speaker x-vector for the reference voice.
 
         Args:
-            voice_ref: Path to speaker reference WAV audio file.
+            voice_ref: Path to speaker reference WAV audio file or raw bytes.
+
+        Returns:
+            Cache key string or None.
         """
-        if self._cached_x_vector is not None and self._cached_voice_path == voice_ref:
-            return  # already cached for this voice file
+        if not voice_ref:
+            return None
+
+        if isinstance(voice_ref, bytes):
+            key = hashlib.sha256(voice_ref).hexdigest()[:16]
+        else:
+            key = hashlib.sha256(str(voice_ref).encode("utf-8", errors="replace")).hexdigest()[:16]
+
+        if key in self._x_vector_cache:
+            return key
 
         model_type = getattr(self._model.model, "tts_model_type", "base")
-        if model_type != "base" or not voice_ref:
-            return  # x-vector caching only applies to Base voice clone
+        if model_type != "base":
+            return None
 
         try:
-            # Extract the x-vector embedding from the reference audio
+            vec = None
             if hasattr(self._model, "extract_x_vector"):
-                self._cached_x_vector = self._model.extract_x_vector(voice_ref)
-                self._cached_voice_path = voice_ref
-                logger.info("    [QwenTTS] ⚡ X-vector cached for: %s", voice_ref)
+                vec = self._model.extract_x_vector(voice_ref)
             elif hasattr(self._model, "get_speaker_embedding"):
-                self._cached_x_vector = self._model.get_speaker_embedding(voice_ref)
-                self._cached_voice_path = voice_ref
-                logger.info("    [QwenTTS] ⚡ Speaker embedding cached for: %s", voice_ref)
-            else:
-                pass
+                vec = self._model.get_speaker_embedding(voice_ref)
+
+            if vec is not None:
+                self._x_vector_cache[key] = vec
+                logger.info("    [QwenTTS] ⚡ X-vector cached under key %s", key)
+                return key
         except Exception as e:
             logger.warning("    [QwenTTS] X-vector caching failed (%s) — will use voice_ref per-call.", e)
-            self._cached_x_vector = None
+        return None
 
-    def synthesize(self, text: str, voice_ref: str, out_path: str) -> None:
-        """Synthesize speech for input text and write output WAV file."""
+    def synthesize(
+        self,
+        text: str,
+        voice_ref: str | bytes,
+        out_path: str | None = None,
+        *,
+        return_bytes: bool = False,
+    ) -> tuple[str | bytes, float]:
+        """Synthesize speech for input text and write output WAV file or return PCM bytes."""
+        import io
         import soundfile as sf
         import torch
 
@@ -99,7 +130,7 @@ class QwenTTSProvider(BaseTTSProvider):
             try:
                 with self._lock:
                     self._ensure_initialised()
-                    self._ensure_x_vector_cached(voice_ref or self.config.voice_file)
+                    x_key = self._ensure_x_vector_cached(voice_ref or self.config.voice_file)
 
                     model_type = getattr(self._model.model, "tts_model_type", "base")
 
@@ -111,8 +142,8 @@ class QwenTTSProvider(BaseTTSProvider):
                             temperature=self.config.temperature,
                             top_p=self.config.top_p,
                         )
-                        if self._cached_x_vector is not None and hasattr(self._model, "generate_voice_clone"):
-                            gen_kwargs["x_vector"] = self._cached_x_vector
+                        if x_key is not None and x_key in self._x_vector_cache and hasattr(self._model, "generate_voice_clone"):
+                            gen_kwargs["x_vector"] = self._x_vector_cache[x_key]
                         else:
                             gen_kwargs["ref_audio"] = voice_ref or self.config.voice_file
                         wav_data, sr = self._model.generate_voice_clone(**gen_kwargs)
@@ -142,8 +173,15 @@ class QwenTTSProvider(BaseTTSProvider):
                     if isinstance(audio, torch.Tensor):
                         audio = audio.cpu().float().numpy()
 
-                sf.write(out_path, audio, sr)
-                break
+                    duration = len(audio) / float(sr) if sr > 0 else 0.0
+
+                if return_bytes or out_path is None:
+                    buf = io.BytesIO()
+                    sf.write(buf, audio, sr, format="WAV")
+                    return (buf.getvalue(), duration)
+                else:
+                    sf.write(out_path, audio, sr)
+                    return (out_path, duration)
 
             except torch.cuda.OutOfMemoryError as e:
                 logger.error("    [QwenTTS] CUDA OOM encountered on %s. Attempting recovery...", self._device)
@@ -164,113 +202,107 @@ class QwenTTSProvider(BaseTTSProvider):
                     continue
                 raise
 
-    def synthesize_batch(self, texts: list[str], voice_refs: list[str], out_paths: list[str]) -> list[float]:
-        """Synthesize speech for a batch of text items and return durations."""
+    def synthesize_batch(
+        self,
+        texts: list[str],
+        voice_ref: bytes,
+        *,
+        return_bytes: bool = True,
+    ) -> list[tuple[bytes | str, float]]:
+        """Single-GPU batched synthesis using QwenTTS forward pass.
+
+        Acquires self._lock for the duration of the forward pass. Releases
+        lock before any WAV encoding. Falls back to per-item synthesis if the
+        batched call raises RuntimeError or CUDA OutOfMemoryError.
+
+        Thread-safe via self._lock. Caller must hold exclusive ownership of
+        this provider — do not call from two threads simultaneously.
+        """
+        import io
         import soundfile as sf
         import torch
 
-        durations = [0.0] * len(texts)
         if not texts:
-            return durations
+            return []
 
-        max_retries = 1
-        for attempt in range(max_retries + 1):
-            try:
-                with self._lock:
-                    self._ensure_initialised()
-                    primary_voice = voice_refs[0] if voice_refs else self.config.voice_file
-                    self._ensure_x_vector_cached(primary_voice or self.config.voice_file)
+        x_key = self._ensure_x_vector_cached(voice_ref or self.config.voice_file)
 
-                    model_type = getattr(self._model.model, "tts_model_type", "base")
-                    languages = [getattr(self.config, "language", "English")] * len(texts)
+        try:
+            with self._lock:
+                self._ensure_initialised()
+                model_type = getattr(self._model.model, "tts_model_type", "base")
+                languages = [getattr(self.config, "language", "English")] * len(texts)
 
-                    if model_type == "base":
-                        gen_kwargs = dict(
-                            text=texts,
-                            language=languages,
-                            x_vector_only_mode=True,
-                            temperature=self.config.temperature,
-                            top_p=self.config.top_p,
-                        )
-                        if self._cached_x_vector is not None and hasattr(self._model, "generate_voice_clone"):
-                            gen_kwargs["x_vector"] = self._cached_x_vector
-                        else:
-                            voice_files = [vr or self.config.voice_file for vr in voice_refs]
-                            gen_kwargs["ref_audio"] = voice_files
-                        wav_data_list, sr = self._model.generate_voice_clone(**gen_kwargs)
-                    elif model_type == "custom_voice":
-                        speakers = [self.config.tts_timbre or "serena"] * len(texts)
-                        instructs = [self.config.tts_instruct] * len(texts)
-                        wav_data_list, sr = self._model.generate_custom_voice(
-                            text=texts,
-                            speaker=speakers,
-                            language=languages,
-                            instruct=instructs,
-                            temperature=self.config.temperature,
-                            top_p=self.config.top_p,
-                        )
-                    elif model_type == "voice_design":
-                        instructs = [self.config.tts_instruct] * len(texts)
-                        wav_data_list, sr = self._model.generate_voice_design(
-                            text=texts,
-                            instruct=instructs,
-                            language=languages,
-                            temperature=self.config.temperature,
-                            top_p=self.config.top_p,
-                        )
-                    else:
-                        raise ValueError(f"Unknown model type: {model_type}")
-
-                    processed_wavs = []
-                    for wav_data in wav_data_list:
-                        audio = wav_data[0] if isinstance(wav_data, (list, tuple)) else wav_data
-                        if hasattr(audio, "ndim") and audio.ndim > 1:
-                            audio = audio[0]
-                        if isinstance(audio, torch.Tensor):
-                            audio = audio.cpu().float().numpy()
-                        processed_wavs.append(audio)
-
-                for i, (audio, out_path) in enumerate(zip(processed_wavs, out_paths)):
-                    sf.write(out_path, audio, sr)
-                    durations[i] = len(audio) / sr
-
-                return durations
-
-            except torch.cuda.OutOfMemoryError:
-                logger.warning(
-                    "    [QwenTTS] CUDA OOM during batch synthesis on %s. Retrying one-by-one...",
-                    self._device,
-                )
-                import gc
-                torch.cuda.empty_cache()
-                gc.collect()
-
-                one_by_one_failed = False
-                for i, (text, voice_ref, out_path) in enumerate(zip(texts, voice_refs, out_paths)):
-                    try:
-                        self.synthesize(text, voice_ref, out_path)
-                        if out_path:
-                            import soundfile as _sf
-                            info = _sf.info(out_path)
-                            durations[i] = info.frames / info.samplerate
-                    except Exception as inner_e:
-                        logger.error("    [QwenTTS] ⚠ Chunk %d failed even in one-by-one mode: %s", i, inner_e)
-                        one_by_one_failed = True
-                if one_by_one_failed:
-                    logger.warning("    [QwenTTS] ⚠ Some chunks could not be recovered. Returning partial results.")
-                return durations
-            except Exception as e:
-                if attempt < max_retries:
-                    logger.warning(
-                        "    [QwenTTS] Batch synthesis failed (%s). Retrying (%d/%d)...",
-                        e,
-                        attempt + 1,
-                        max_retries,
+                if model_type == "base":
+                    gen_kwargs = dict(
+                        text=texts,
+                        language=languages,
+                        x_vector_only_mode=True,
+                        temperature=self.config.temperature,
+                        top_p=self.config.top_p,
                     )
-                    import time
-                    time.sleep(1)
-                    continue
-                raise
+                    if x_key is not None and x_key in self._x_vector_cache and hasattr(self._model, "generate_voice_clone"):
+                        gen_kwargs["x_vector"] = self._x_vector_cache[x_key]
+                    else:
+                        voice_ref_val = voice_ref or self.config.voice_file
+                        gen_kwargs["ref_audio"] = [voice_ref_val] * len(texts)
+                    wav_data_list, sr = self._model.generate_voice_clone(**gen_kwargs)
+                elif model_type == "custom_voice":
+                    speakers = [self.config.tts_timbre or "serena"] * len(texts)
+                    instructs = [self.config.tts_instruct] * len(texts)
+                    wav_data_list, sr = self._model.generate_custom_voice(
+                        text=texts,
+                        speaker=speakers,
+                        language=languages,
+                        instruct=instructs,
+                        temperature=self.config.temperature,
+                        top_p=self.config.top_p,
+                    )
+                elif model_type == "voice_design":
+                    instructs = [self.config.tts_instruct] * len(texts)
+                    wav_data_list, sr = self._model.generate_voice_design(
+                        text=texts,
+                        instruct=instructs,
+                        language=languages,
+                        temperature=self.config.temperature,
+                        top_p=self.config.top_p,
+                    )
+                else:
+                    raise ValueError(f"Unknown model type: {model_type}")
+
+                processed_wavs = []
+                for wav_data in wav_data_list:
+                    audio = wav_data[0] if isinstance(wav_data, (list, tuple)) else wav_data
+                    if hasattr(audio, "ndim") and audio.ndim > 1:
+                        audio = audio[0]
+                    if isinstance(audio, torch.Tensor):
+                        audio = audio.cpu().float().numpy()
+                    processed_wavs.append(audio)
+
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+            logger.warning(
+                "    [QwenTTS] Batch synthesis failed on %s (%d items): %s, falling back to per-item synthesis",
+                self._device, len(texts), exc,
+            )
+            import gc
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+            results: list[tuple[bytes | str, float]] = []
+            for text in texts:
+                audio_res, duration = self.synthesize(text, voice_ref, return_bytes=True)
+                results.append((audio_res, duration))
+            return results
+
+        output: list[tuple[bytes | str, float]] = []
+        for audio in processed_wavs:
+            buf = io.BytesIO()
+            sf.write(buf, audio, sr, format="WAV")
+            duration = len(audio) / float(sr) if sr > 0 else 0.0
+            output.append((buf.getvalue(), duration))
+
+        return output
 
     def cleanup(self) -> None:
         """Clean up loaded PyTorch model and free GPU memory."""
@@ -280,8 +312,7 @@ class QwenTTSProvider(BaseTTSProvider):
             del self._model
             self._model = None
             self._loaded_model_name = None
-            self._cached_x_vector = None
-            self._cached_voice_path = None
+            self._x_vector_cache.clear()
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -296,8 +327,43 @@ class QwenTTSProvider(BaseTTSProvider):
 
         self._load_model()
 
+    def _build_model_load_kwargs(self, config: AudiobookConfig) -> dict[str, Any]:
+        """Build model loading keyword arguments based on configuration.
+
+        Handles lazy loading check for bitsandbytes when INT8 quantization is requested.
+        Preserves bfloat16 for non-quantized loading.
+
+        Args:
+            config: AudiobookConfig options.
+
+        Returns:
+            Dict of keyword arguments for Qwen3TTSModel.from_pretrained.
+        """
+        quant = getattr(config, "quantization", "none")
+        if quant == "int8":
+            try:
+                import bitsandbytes  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "bitsandbytes is required for INT8 quantization. "
+                    "Install it with: pip install bitsandbytes>=0.41.0"
+                )
+            return {
+                "device_map": self._device,
+                "load_in_8bit": True,
+            }
+        import torch
+        return {
+            "device_map": self._device,
+            "torch_dtype": torch.bfloat16,
+        }
+
     def _load_model(self) -> None:
-        """Load the Qwen3TTSModel on the assigned target device."""
+        """Load the Qwen3TTSModel on the assigned target device.
+
+        Note: torch.compile is applied at instance-level to self._model.model
+        so that each device instance maintains its own compiled PyTorch graph.
+        """
         import os
         import sys
         import torch
@@ -331,9 +397,8 @@ class QwenTTSProvider(BaseTTSProvider):
 
         self._model = Qwen3TTSModel.from_pretrained(
             self.config.tts_model_name,
-            device_map=self._device,
-            torch_dtype=torch.bfloat16,
             attn_implementation=attn_impl,
+            **self._build_model_load_kwargs(self.config),
         )
         self._loaded_model_name = self.config.tts_model_name
 
@@ -342,11 +407,26 @@ class QwenTTSProvider(BaseTTSProvider):
             gen_cfg.pad_token_id = gen_cfg.eos_token_id
 
         if getattr(self.config, "torch_compile", False):
-            try:
-                logger.info("    [QwenTTS] ⚡ Compiling underlying transformer graphs with torch.compile...")
-                self._model.model = torch.compile(self._model.model, mode="reduce-overhead")
-                logger.info("    [QwenTTS] ⚡ Model compile registered.")
-            except Exception as e:
-                logger.warning("    [QwenTTS] ⚠️ torch.compile not supported or failed: %s", e)
+            if getattr(self.config, "quantization", "none") == "int8":
+                logger.warning(
+                    "torch_compile=True is ignored when quantization='int8'. "
+                    "bitsandbytes INT8 kernels are incompatible with torch.compile()."
+                )
+            else:
+                try:
+                    logger.info("    [QwenTTS] ⚡ Compiling underlying transformer graphs (mode=%s)...", _TORCH_COMPILE_MODE)
+                    self._model.model = torch.compile(
+                        self._model.model,
+                        mode=_TORCH_COMPILE_MODE,
+                        fullgraph=False,
+                    )
+                    logger.info(
+                        "torch.compile(mode='max-autotune') applied on %s. "
+                        "First chapter will incur ~10–30s autotuning overhead. "
+                        "All subsequent chapters will be 15–25%% faster.",
+                        self._device,
+                    )
+                except Exception as exc:
+                    logger.warning("    [QwenTTS] ⚠️ torch.compile not supported or failed: %s", exc)
 
         logger.info("    [QwenTTS] %s ready on %s.", self.config.tts_model_name, self._device)

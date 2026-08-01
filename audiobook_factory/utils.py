@@ -1,14 +1,16 @@
 import os
 import json
 import re
-import ebooklib
 import subprocess
 import sys
 import shutil
 import tempfile
-from ebooklib import epub
-from bs4 import BeautifulSoup
 
+
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def seconds_to_srt_time(seconds):
@@ -62,6 +64,8 @@ def update_progress_file(progress_path, chapter_num, status, chapter_title=""):
                         or (c_num_ext is not None and ch_num_ext is not None and c_num_ext == ch_num_ext and c_core == ch_core)
                     ):
                         chapter["status"] = status
+                        if status == "completed":
+                            chapter["completed_chunks"] = []
                         found = True
                         break
 
@@ -69,12 +73,60 @@ def update_progress_file(progress_path, chapter_num, status, chapter_title=""):
                 for chapter in progress_data.get("chapters", []):
                     if chapter.get("num") == chapter_num or str(chapter.get("num")) == str(chapter_num):
                         chapter["status"] = status
+                        if status == "completed":
+                            chapter["completed_chunks"] = []
                         break
 
             with open(progress_path, 'w', encoding='utf-8') as f:
                 json.dump(progress_data, f, indent=4)
         except Exception as e:
-            print(f"Warning: Failed to update progress file {progress_path}: {e}")
+            logger.warning("Failed to update progress file %s: %s", progress_path, e)
+
+
+def update_progress_file_chunk(progress_path: str, chapter_num: int, chunk_index: int, chapter_title: str = "") -> None:
+    """Thread-safe update appending chunk_index to completed_chunks in progress JSON."""
+    with _progress_lock:
+        if not os.path.exists(progress_path):
+            return
+        try:
+            with open(progress_path, 'r', encoding='utf-8') as f:
+                progress_data = json.load(f)
+
+            chapter_entry = None
+            if chapter_title:
+                ch_title_raw = chapter_title.strip().lower()
+                ch_clean = re.sub(r'\(~[\d,]+\s*words\)', '', chapter_title).strip().lower()
+                ch_num_ext, ch_core = normalize_chapter_title_for_matching(chapter_title)
+
+                for c in progress_data.get("chapters", []):
+                    c_title_raw = c.get("title", "").strip().lower()
+                    c_clean = re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower()
+                    c_num_ext, c_core = normalize_chapter_title_for_matching(c.get("title", ""))
+
+                    if (
+                        (c_title_raw and c_title_raw == ch_title_raw)
+                        or (c_clean and c_clean == ch_clean)
+                        or (c_core and ch_core and c_core == ch_core)
+                        or (c_num_ext is not None and ch_num_ext is not None and c_num_ext == ch_num_ext and c_core == ch_core)
+                    ):
+                        chapter_entry = c
+                        break
+
+            if chapter_entry is None:
+                for c in progress_data.get("chapters", []):
+                    if c.get("num") == chapter_num or str(c.get("num")) == str(chapter_num):
+                        chapter_entry = c
+                        break
+
+            if chapter_entry is not None:
+                completed = chapter_entry.setdefault("completed_chunks", [])
+                if chunk_index not in completed:
+                    completed.append(chunk_index)
+                    with open(progress_path, 'w', encoding='utf-8') as f:
+                        json.dump(progress_data, f, indent=4)
+        except Exception as e:
+            logger.warning("Failed to update completed_chunks in %s: %s", progress_path, e)
+
 
 def normalize_chapter_title_for_matching(title: str):
     if not title:
@@ -95,9 +147,14 @@ def load_or_create_progress_file(progress_path, chapters_data, book_title, book_
     (older format) we backfill from chapters_data if available.
     """
     if os.path.exists(progress_path):
-        print("Found existing progress file. Loading state.")
+        logger.info("Found existing progress file. Loading state.")
         with open(progress_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
+
+        # Ensure every chapter entry has completed_chunks
+        for c in data.get("chapters", []):
+            if "completed_chunks" not in c:
+                c["completed_chunks"] = []
 
         # Backfill text/sentences for chapters that are missing them (old format)
         existing_chapters = data.get("chapters", [])
@@ -148,10 +205,10 @@ def load_or_create_progress_file(progress_path, chapters_data, book_title, book_
                 with open(progress_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=4)
             except Exception as e:
-                print(f"Warning: could not backfill text cache into progress file: {e}")
+                logger.warning("Could not backfill text cache into progress file: %s", e)
         return data
     else:
-        print("No progress file found. Creating a new one.")
+        logger.info("No progress file found. Creating a new one.")
         progress_data = {
             "book_title": book_title,
             "book_path": book_path,
@@ -163,6 +220,7 @@ def load_or_create_progress_file(progress_path, chapters_data, book_title, book_
                     "num": c["num"],
                     "title": c["title"],
                     "status": "pending",
+                    "completed_chunks": [],
                     "text": c.get("text", ""),
                     "sentences": c.get("sentences", []),
                 }

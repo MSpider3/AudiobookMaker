@@ -75,7 +75,35 @@ async def monitor_task(task: Task, log_q: queue.Queue, prog_q: queue.Queue, futu
         await asyncio.sleep(0.1)
 
 
-from audiobook_factory.gpu_pool import GPUDetector
+import torch
+from audiobook_factory.gpu_pool import GPUDetector, GPUPoolManager
+
+_current_semaphore: asyncio.Semaphore | None = None
+_current_semaphore_value: int = 0
+
+
+def _get_active_gpu_count() -> int:
+    """Returns the number of active GPU providers in the pool, or 1 if none loaded."""
+    manager = GPUPoolManager.instance()
+    pools = manager.all_pools()
+    if not pools:
+        return max(1, torch.cuda.device_count() if torch.cuda.is_available() else 1)
+    return max(1, max(p.device_count for p in pools.values()))
+
+
+def _get_or_resize_semaphore(desired_count: int) -> asyncio.Semaphore:
+    """Returns the current semaphore if capacity matches, otherwise creates a new one."""
+    global _current_semaphore, _current_semaphore_value
+    if _current_semaphore is None or _current_semaphore_value != desired_count:
+        import logging
+        logging.getLogger(__name__).info(
+            "Updating task concurrency limit: %d → %d",
+            _current_semaphore_value,
+            desired_count,
+        )
+        _current_semaphore = asyncio.Semaphore(desired_count)
+        _current_semaphore_value = desired_count
+    return _current_semaphore
 
 
 async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
@@ -138,15 +166,15 @@ async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
             task_queue.task_done()
 
 
-async def worker_loop():
+async def worker_loop() -> None:
     """
     Main background consumer queue loop executing generation tasks concurrently.
-    Allowed concurrency is bounded by available GPU count.
+    Allowed concurrency is dynamically evaluated per task dispatch.
     """
-    devices = GPUDetector.detect_devices()
-    max_concurrent = len(devices) if devices != ["cpu"] else 1
-    sem = asyncio.Semaphore(max_concurrent)
-    print(f"[API Worker] Central task worker queue consumer started (max_concurrent={max_concurrent}).")
+    import logging
+    logging.getLogger(__name__).info("[API Worker] Central task worker queue consumer started.")
     while True:
         task_id = await task_queue.get()
-        asyncio.create_task(_process_single_task(task_id, sem))
+        active_gpu_count = _get_active_gpu_count()
+        semaphore = _get_or_resize_semaphore(active_gpu_count)
+        asyncio.create_task(_process_single_task(task_id, semaphore))
