@@ -97,6 +97,29 @@ class BaseTTSProvider(ABC):
     def get_name(self) -> str:
         """Short display name, e.g. 'Qwen3-TTS'."""
 
+    @property
+    def is_ready(self) -> bool:
+        """Returns True if the provider is loaded and ready for synthesis.
+
+        Default checks for a non-None _model attribute. Subclasses may
+        override for different readiness semantics.
+        """
+        return getattr(self, "_model", None) is not None
+
+    def ensure_ready(self) -> None:
+        """Ensures the provider is fully initialized and ready for synthesis.
+
+        The default implementation calls _ensure_initialised() if it exists.
+        Subclasses may override to perform additional readiness checks.
+
+        This method is called by GPUPoolManager during pool warmup to
+        guarantee initialization before any synthesis request arrives.
+
+        Thread-safe: implementations must be safe to call from any thread.
+        """
+        if hasattr(self, "_ensure_initialised"):
+            self._ensure_initialised()
+
     def cleanup(self) -> None:
         """Release resources. Override if the provider holds GPU models."""
 

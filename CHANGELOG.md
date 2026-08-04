@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [v1.1.0] - 2026-08-05
+
+### ⚡ Added
+- **Thread-Safe Atomic Progress I/O Layer (`progress_io.py`)**: Created a dedicated, thread-safe file I/O layer for `generation_progress.json` featuring atomic writes (tmp file + `os.replace()`), module-level write lock (`_WRITE_LOCK`), UTF-8 BOM auto-decoding, leading garbage stripping, empty file detection, HTML response guarding, and multi-encoding fallbacks.
+- **Atomic Read-Inside-Lock Update Pattern**: Enforced atomic read-modify-write inside single lock acquisitions for chapter status and chunk completion updates, completely eliminating TOCTOU race conditions under concurrent multi-chapter/multi-GPU execution.
+- **Config Contract Schema Versioning (`AudiobookConfig`)**: Introduced schema versioning (`_CONFIG_SCHEMA_VERSION = 5`, `config_version`) and a hardened `from_dict()` method that tolerates unknown/missing keys and warns on stale progress versions without crashing. Added `field_summary()` classmethod for config diagnostics.
+- **Eager Multi-GPU Pool Warmup (`GPUPoolManager`)**: Added blocking parallel provider warmup via `ThreadPoolExecutor` during GPU pool creation to eliminate lazy-initialization race conditions. Failed GPU warmups (`OutOfMemoryError`, `RuntimeError`) are automatically caught and excluded from the pool so healthy GPUs continue synthesizing.
+- **Comprehensive Regression Test Suite (`tests/test_hardening.py`)**: Added a 21-case test suite covering config contract parsing, atomic progress I/O, concurrent chunk update race prevention, provider readiness guards, and health endpoint output.
+
+### 🔄 Changed
+- Updated `GET /api/v1/health` endpoint to report per-device model readiness via provider `is_ready` property.
+- Replaced all legacy JSON progress file loading and saving calls in `pipeline.py`, `app.py`, and `cli.py` with `progress_io` methods.
+
+### 🧹 Removed
+- Deprecated legacy, non-atomic progress file helper functions (`load_or_create_progress_file`, `update_progress_file`, `update_progress_file_chunk`, `_progress_lock`) from `audiobook_factory/utils.py`.
+
+---
+
 ## [v1.0.0] - 2026-08-02
 
 ### ⚡ Added

@@ -353,6 +353,31 @@ class ProviderPool:
             self.release(provider)
 
 
+def _warmup_provider(provider: BaseTTSProvider) -> None:
+    """Forces model initialization on the provider's device.
+
+    Called once per provider after pool construction. Ensures
+    provider is ready before any synthesis request arrives,
+    eliminating lazy-initialization race conditions in concurrent
+    multi-chapter synthesis.
+
+    Args:
+        provider: Provider instance to warm up.
+    """
+    try:
+        provider.ensure_ready()
+        logger.info("Provider on %s warmed up successfully.", provider.device)
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+        logger.error(
+            "Provider warmup failed on %s (%s: %s). "
+            "This device will be excluded from the pool.",
+            provider.device,
+            type(exc).__name__,
+            exc,
+        )
+        raise
+
+
 class GPUPoolManager:
     """Singleton manager maintaining active provider pools by name.
 
@@ -416,6 +441,53 @@ class GPUPoolManager:
                 devices=filtered_devices,
                 provider_name=provider_name,
             )
+
+            import concurrent.futures as _cf
+
+            futures: dict[str, _cf.Future] = {}
+            with _cf.ThreadPoolExecutor(
+                max_workers=max(1, len(filtered_devices)),
+                thread_name_prefix="provider_warmup",
+            ) as warmup_executor:
+                futures = {
+                    device: warmup_executor.submit(_warmup_provider, provider)
+                    for device, provider in pool._device_map.items()
+                }
+                for future in _cf.as_completed(futures.values()):
+                    pass
+
+            failed_devices = [
+                device for device, future in futures.items()
+                if future.exception() is not None
+            ]
+
+            if failed_devices:
+                logger.warning(
+                    "Warmup failed for %d device(s): %s. Removing from pool.",
+                    len(failed_devices),
+                    ", ".join(
+                        f"{d} ({futures[d].exception()})"
+                        for d in failed_devices
+                    ),
+                )
+                for device in failed_devices:
+                    pool._device_queues.pop(device, None)
+                    pool._device_map.pop(device, None)
+                pool._devices = [d for d in pool._devices if d not in failed_devices]
+
+                if not pool._devices:
+                    raise RuntimeError(
+                        "All provider warmups failed. Cannot synthesize audio. "
+                        "Check GPU memory and model path."
+                    )
+
+                logger.info(
+                    "Continuing with %d of %d devices: %s",
+                    len(pool._devices),
+                    len(pool._devices) + len(failed_devices),
+                    ", ".join(pool._devices),
+                )
+
             self._pools[provider_name] = pool
             return pool
 

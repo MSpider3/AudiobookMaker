@@ -28,7 +28,7 @@ import tempfile
 from pathlib import Path
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, MISSING
 from typing import Callable, Any
 
 logger = logging.getLogger(__name__)
@@ -66,11 +66,13 @@ _TEMP_DIR.mkdir(parents=True, exist_ok=True)
 from audiobook_factory.text_extractor import ExtractedChapter
 from audiobook_factory.text_processing import smart_sentence_splitter
 from audiobook_factory.filename_sanitizer import make_safe_filename
-from audiobook_factory.utils import (
-    load_or_create_progress_file, 
-    update_progress_file,
-    format_lrc_timestamp
+from audiobook_factory.progress_io import (
+    read_progress_file,
+    write_progress_file,
+    update_chapter_status,
+    update_chapter_chunk,
 )
+from audiobook_factory.utils import format_lrc_timestamp
 
 
 _MAX_PARALLEL_CHAPTERS: int = 0
@@ -92,12 +94,17 @@ def _get_chapter_parallelism(pool: Any) -> int:
     return max(1, pool.device_count)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Config dataclass
-# ══════════════════════════════════════════════════════════════════════════════
+_CONFIG_SCHEMA_VERSION: int = 5
+# Increment this integer whenever AudiobookConfig fields are added,
+# removed, or renamed. Used to detect stale generation_progress.json
+# files from older versions.
+
 
 @dataclass
 class AudiobookConfig:
+    # ── Config version ────────────────────────────────────────────────────────
+    config_version:      int   = _CONFIG_SCHEMA_VERSION
+
     # ── Book metadata ─────────────────────────────────────────────────────────
     book_title:          str   = "Audiobook"
     author:              str   = "Unknown Author"
@@ -160,9 +167,54 @@ class AudiobookConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> "AudiobookConfig":
-        valid_keys = {f.name for f in fields(cls)}
-        filtered = {k: v for k, v in data.items() if k in valid_keys}
+        """Constructs AudiobookConfig from a dict, tolerating unknown and
+        missing keys.
+
+        Unknown keys are silently dropped. Missing keys use the field's
+        default value. A version mismatch logs a warning but does not raise.
+
+        Args:
+            data: Dict from generation_progress.json settings section.
+
+        Returns:
+            Populated AudiobookConfig instance.
+        """
+        known_fields = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+
+        # Version check
+        incoming_version = data.get("config_version", 0)
+        if incoming_version < _CONFIG_SCHEMA_VERSION:
+            logger.warning(
+                "generation_progress.json was created with config schema "
+                "version %d, current version is %d. Some settings may use "
+                "defaults. Re-export config JSON to update.",
+                incoming_version,
+                _CONFIG_SCHEMA_VERSION,
+            )
+
         return cls(**filtered)
+
+    @classmethod
+    def field_summary(cls) -> str:
+        """Returns a human-readable summary of all config fields and defaults.
+
+        Used in --dry-run output and error messages to show users what
+        settings are available and what their current defaults are.
+
+        Returns:
+            Multi-line string, one field per line: "field_name: default_value"
+        """
+        lines = []
+        for f in fields(cls):
+            if f.name.startswith("_"):
+                continue
+            default = f.default if f.default is not MISSING else (
+                f.default_factory() if f.default_factory is not MISSING
+                else "<required>"
+            )
+            lines.append(f"  {f.name}: {default!r}")
+        return "\n".join(lines)
 
 
 def _validate_config(config: AudiobookConfig) -> None:
@@ -341,14 +393,30 @@ def run_pipeline(
     except Exception as e:
         logger.warning("Error serializing config: %s", e)
 
-    progress_data = load_or_create_progress_file(
-        prog_path_out,
-        chapters_data,
-        config.book_title,
-        book_path=getattr(config, "book_path", ""),
-        voice_file=getattr(config, "voice_file", ""),
-        settings=settings_dict
-    )
+    try:
+        progress_data = read_progress_file(prog_path_out)
+        for c in progress_data.get("chapters", []):
+            if "completed_chunks" not in c:
+                c["completed_chunks"] = []
+    except (FileNotFoundError, ValueError):
+        progress_data = {
+            "book_title": config.book_title,
+            "book_path": getattr(config, "book_path", ""),
+            "voice_file": getattr(config, "voice_file", ""),
+            "settings": settings_dict,
+            "chapters": [
+                {
+                    "num": c["num"],
+                    "title": c["title"],
+                    "status": "pending",
+                    "completed_chunks": [],
+                    "text": c.get("text", ""),
+                    "sentences": c.get("sentences", []),
+                }
+                for c in chapters_data
+            ],
+        }
+        write_progress_file(prog_path_out, progress_data)
 
     # Ensure settings, book_path, voice_file are up to date in the progress data
     dirty = False
@@ -364,15 +432,13 @@ def run_pipeline(
         
     if dirty:
         try:
-            with open(prog_path_out, "w", encoding="utf-8") as f:
-                json.dump(progress_data, f, indent=4)
+            write_progress_file(prog_path_out, progress_data)
         except Exception as e:
             logger.warning("Error writing updated progress json settings: %s", e)
             
     # Sync to temp for user visibility
     try:
-        with open(prog_path_tmp, "w", encoding="utf-8") as f:
-            json.dump(progress_data, f, indent=4)
+        write_progress_file(prog_path_tmp, progress_data)
     except OSError as exc:
         logger.debug("Could not sync progress to temp: %s", exc)
 
@@ -480,7 +546,7 @@ def run_pipeline(
                 # Update checkpoint files
                 for p in [prog_path_out, prog_path_tmp]:
                     try:
-                        update_progress_file(p, idx, "completed", chapter_title=chapter.title)
+                        update_chapter_status(p, idx, "completed", reset_chunks=True)
                     except Exception as exc:
                         logger.debug("Could not update progress file: %s", exc)
             return path
@@ -722,8 +788,7 @@ def _process_chapter(
 
     prog_path_out = os.path.join(config.output_dir, "generation_progress.json")
     def _chunk_cb(c_idx: int) -> None:
-        from audiobook_factory.utils import update_progress_file_chunk
-        update_progress_file_chunk(prog_path_out, idx, c_idx, chapter_title=chapter.title)
+        update_chapter_chunk(prog_path_out, idx, c_idx)
 
     try:
         # ── Apply pronunciation fixes ─────────────────────────────────────────

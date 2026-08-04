@@ -13,6 +13,9 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 
 ## ✨ Features
 
+- **Thread-Safe Atomic Progress I/O (`progress_io.py`)** — Dedicated, thread-safe file I/O layer for `generation_progress.json`. Uses atomic writes (temp file + `os.replace()`), module-level write lock (`_WRITE_LOCK`), UTF-8 BOM auto-decoding, leading garbage stripping, HTML detection, and an atomic read-inside-lock pattern to eliminate TOCTOU race conditions under concurrent GPU execution.
+- **Config Contract Schema Versioning (`AudiobookConfig`)** — Versioned config contract (`_CONFIG_SCHEMA_VERSION = 5`) with hardened `from_dict()` construction, backward-compatible default fallback, unknown key filtering, and human-readable `field_summary()` diagnostics.
+- **Eager Multi-GPU Pool Warmup & Self-Healing (`GPUPoolManager`)** — Parallel model warmup via `ThreadPoolExecutor` during pool creation. Failed/OOM GPU instances are automatically detected and pruned from the active pool, allowing healthy GPUs to continue synthesizing without failing the job.
 - **3-Stage Overlapped Pipeline & Chunk-Level Resume** — `chapter_pipeline.py` implements a high-throughput 3-stage pipeline (Stage A: CPU text preparation, Stage B: parallel GPU synthesis workers, Stage C: streaming audio mastering and async disk I/O). Sentence audio chunks are cached incrementally in `.temp_chunks/` — if interrupted, generation resumes mid-chapter without re-synthesizing completed chunks.
 - **Rust PyO3 SIMD Acceleration (`audiobook_rust`)** — High-performance Rust extension providing 5.5× faster audio mastering, SIMD sentence splitting, and ultra-fast text normalization compiled with `maturin` (with transparent Python fallbacks).
 - **Headless CLI generation (`cli.py`)** — Run audiobook generation headless in cloud environments (Kaggle/Colab) or terminal without launching or maintaining a web browser interface. Includes flags for cover art injection (`--embed-cover-only`), quantization, device selection, and progress file execution.
@@ -97,7 +100,8 @@ AudiobookMaker/
     ├── filename_sanitizer.py             ← Cross-platform, Audiobookshelf-compatible filenames
     ├── text_processing.py                ← Sentence splitting + NLTK auto-download + normalization
     ├── ffmpeg_utils.py                   ← FFmpeg encoding helpers
-    ├── utils.py                          ← Shared utilities (progress file management, LRC timestamping)
+    ├── progress_io.py                    ← Thread-safe atomic progress JSON I/O layer & TOCTOU lock manager
+    ├── utils.py                          ← Shared utilities (LRC timestamping, SRT formatting)
     └── tts_providers/                    ← Modular TTS provider abstraction
         ├── base_tts_provider.py          ← BaseTTSProvider ABC + get_tts_provider() factory
         └── qwen_provider.py              ← QwenTTSProvider (per-device binding, Flash Attention 2 / SDPA auto-detect)

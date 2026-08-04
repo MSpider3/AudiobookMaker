@@ -5,9 +5,6 @@ import subprocess
 import sys
 import shutil
 import tempfile
-
-
-
 import logging
 
 logger = logging.getLogger(__name__)
@@ -21,6 +18,7 @@ def seconds_to_srt_time(seconds):
     ms = ms % 1000
     return f"{hours:02d}:{minutes:02d}:{seconds % 60:02d},{ms:03d}"
 
+
 def seconds_to_vtt_time(seconds):
     """Converts seconds to WebVTT timestamp format (HH:MM:SS.mmm)."""
     ms = int(seconds * 1000)
@@ -28,104 +26,6 @@ def seconds_to_vtt_time(seconds):
     hours, minutes = divmod(minutes, 60)
     ms = ms % 1000
     return f"{hours:02d}:{minutes:02d}:{seconds % 60:02d}.{ms:03d}"
-
-import threading as _threading
-_progress_lock = _threading.Lock()
-
-def update_progress_file(progress_path, chapter_num, status, chapter_title=""):
-    """
-    Updates the progress JSON file for a specific chapter.
-    Thread-safe: uses a module-level lock to prevent race conditions
-    when multiple chapter workers complete simultaneously.
-    Supports title priority matching so off-by-one numeric index shifts do not target wrong chapters.
-    """
-    with _progress_lock:
-        if not os.path.exists(progress_path):
-            return
-        try:
-            with open(progress_path, 'r', encoding='utf-8-sig') as f:
-                progress_data = json.load(f)
-
-            found = False
-            if chapter_title:
-                ch_title_raw = chapter_title.strip().lower()
-                ch_clean = re.sub(r'\(~[\d,]+\s*words\)', '', chapter_title).strip().lower()
-                ch_num_ext, ch_core = normalize_chapter_title_for_matching(chapter_title)
-
-                for chapter in progress_data.get("chapters", []):
-                    c_title_raw = chapter.get("title", "").strip().lower()
-                    c_clean = re.sub(r'\(~[\d,]+\s*words\)', '', chapter.get("title", "")).strip().lower()
-                    c_num_ext, c_core = normalize_chapter_title_for_matching(chapter.get("title", ""))
-
-                    if (
-                        (c_title_raw and c_title_raw == ch_title_raw)
-                        or (c_clean and c_clean == ch_clean)
-                        or (c_core and ch_core and c_core == ch_core)
-                        or (c_num_ext is not None and ch_num_ext is not None and c_num_ext == ch_num_ext and c_core == ch_core)
-                    ):
-                        chapter["status"] = status
-                        if status == "completed":
-                            chapter["completed_chunks"] = []
-                        found = True
-                        break
-
-            if not found:
-                for chapter in progress_data.get("chapters", []):
-                    if chapter.get("num") == chapter_num or str(chapter.get("num")) == str(chapter_num):
-                        chapter["status"] = status
-                        if status == "completed":
-                            chapter["completed_chunks"] = []
-                        break
-
-            with open(progress_path, 'w', encoding='utf-8') as f:
-                json.dump(progress_data, f, indent=4)
-        except Exception as e:
-            logger.warning("Failed to update progress file %s: %s", progress_path, e)
-
-
-def update_progress_file_chunk(progress_path: str, chapter_num: int, chunk_index: int, chapter_title: str = "") -> None:
-    """Thread-safe update appending chunk_index to completed_chunks in progress JSON."""
-    with _progress_lock:
-        if not os.path.exists(progress_path):
-            return
-        try:
-            with open(progress_path, 'r', encoding='utf-8-sig') as f:
-                progress_data = json.load(f)
-
-            chapter_entry = None
-            if chapter_title:
-                ch_title_raw = chapter_title.strip().lower()
-                ch_clean = re.sub(r'\(~[\d,]+\s*words\)', '', chapter_title).strip().lower()
-                ch_num_ext, ch_core = normalize_chapter_title_for_matching(chapter_title)
-
-                for c in progress_data.get("chapters", []):
-                    c_title_raw = c.get("title", "").strip().lower()
-                    c_clean = re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower()
-                    c_num_ext, c_core = normalize_chapter_title_for_matching(c.get("title", ""))
-
-                    if (
-                        (c_title_raw and c_title_raw == ch_title_raw)
-                        or (c_clean and c_clean == ch_clean)
-                        or (c_core and ch_core and c_core == ch_core)
-                        or (c_num_ext is not None and ch_num_ext is not None and c_num_ext == ch_num_ext and c_core == ch_core)
-                    ):
-                        chapter_entry = c
-                        break
-
-            if chapter_entry is None:
-                for c in progress_data.get("chapters", []):
-                    if c.get("num") == chapter_num or str(c.get("num")) == str(chapter_num):
-                        chapter_entry = c
-                        break
-
-            if chapter_entry is not None:
-                completed = chapter_entry.setdefault("completed_chunks", [])
-                if chunk_index not in completed:
-                    completed.append(chunk_index)
-                    with open(progress_path, 'w', encoding='utf-8') as f:
-                        json.dump(progress_data, f, indent=4)
-        except Exception as e:
-            logger.warning("Failed to update completed_chunks in %s: %s", progress_path, e)
 
 
 def normalize_chapter_title_for_matching(title: str):
@@ -138,106 +38,6 @@ def normalize_chapter_title_for_matching(title: str):
     return ch_num, core_text or cleaned
 
 
-def load_or_create_progress_file(progress_path, chapters_data, book_title, book_path="", voice_file="", settings=None):
-    """Loads a progress file if it exists, otherwise creates a new one.
-
-    chapters_data entries may optionally contain 'text' and 'sentences' keys.
-    When creating a new file these are persisted so the CLI can bypass book
-    re-parsing on resume.  When loading an existing file that lacks those keys
-    (older format) we backfill from chapters_data if available.
-    """
-    if os.path.exists(progress_path):
-        logger.info("Found existing progress file. Loading state.")
-        data = None
-        try:
-            with open(progress_path, 'r', encoding='utf-8-sig') as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to load existing progress file %s: %s. Creating fresh state.", progress_path, exc)
-            data = None
-
-        if data and isinstance(data, dict):
-            # Ensure every chapter entry has completed_chunks
-            for c in data.get("chapters", []):
-                if "completed_chunks" not in c:
-                    c["completed_chunks"] = []
-
-            # Backfill text/sentences for chapters that are missing them (old format)
-            existing_chapters = data.get("chapters", [])
-
-            dirty = False
-            for cd in chapters_data:
-                cd_title_raw = cd.get("title", "").strip().lower()
-                cd_clean = re.sub(r'\(~[\d,]+\s*words\)', '', cd.get("title", "")).strip().lower()
-                cd_num_extracted, cd_core = normalize_chapter_title_for_matching(cd.get("title", ""))
-
-                ch = None
-                # Phase 1: High Priority Title Matching
-                for c in existing_chapters:
-                    c_title_raw = c.get("title", "").strip().lower()
-                    c_clean = re.sub(r'\(~[\d,]+\s*words\)', '', c.get("title", "")).strip().lower()
-                    c_num_extracted, c_core = normalize_chapter_title_for_matching(c.get("title", ""))
-
-                    if (
-                        (c_title_raw and c_title_raw == cd_title_raw)
-                        or (c_clean and c_clean == cd_clean)
-                        or (c_core and cd_core and c_core == cd_core)
-                        or (c_num_extracted is not None and cd_num_extracted is not None and c_num_extracted == cd_num_extracted and c_core == cd_core)
-                    ):
-                        ch = c
-                        break
-
-                # Phase 2: Fallback Index Matching if no title match was found
-                if ch is None:
-                    for c in existing_chapters:
-                        c_num_extracted, _ = normalize_chapter_title_for_matching(c.get("title", ""))
-                        if (
-                            (c.get("num") is not None and c.get("num") == cd.get("num"))
-                            or (c.get("num") is not None and str(c.get("num")) == str(cd.get("num")))
-                            or (c_num_extracted is not None and cd_num_extracted is not None and c_num_extracted == cd_num_extracted)
-                        ):
-                            ch = c
-                            break
-
-                if ch is not None:
-                    if ("text" not in ch or not ch["text"]) and cd.get("text"):
-                        ch["text"] = cd["text"]
-                        dirty = True
-                    if ("sentences" not in ch or not ch["sentences"]) and cd.get("sentences"):
-                        ch["sentences"] = cd["sentences"]
-                        dirty = True
-            if dirty:
-                try:
-                    with open(progress_path, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, indent=4)
-                except Exception as e:
-                    logger.warning("Could not backfill text cache into progress file: %s", e)
-            return data
-
-    logger.info("No valid progress file found. Creating a new one.")
-    progress_data = {
-        "book_title": book_title,
-        "book_path": book_path,
-        "voice_file": voice_file,
-        "cover_image_b64": (settings or {}).get("cover_image_b64", ""),
-        "settings": settings or {},
-        "chapters": [
-            {
-                "num": c["num"],
-                "title": c["title"],
-                "status": "pending",
-                "completed_chunks": [],
-                "text": c.get("text", ""),
-                "sentences": c.get("sentences", []),
-            }
-            for c in chapters_data
-        ],
-    }
-    with open(progress_path, 'w', encoding='utf-8') as f:
-        json.dump(progress_data, f, indent=4)
-    return progress_data
-
-
 def format_lrc_timestamp(seconds):
     """
     Converts a time in seconds to LRC timestamp format [mm:ss.xx].
@@ -247,4 +47,3 @@ def format_lrc_timestamp(seconds):
     sec = int(seconds % 60)
     hundredths = int((seconds - (minutes * 60) - sec) * 100)
     return f"[{minutes:02d}:{sec:02d}.{hundredths:02d}]"
-

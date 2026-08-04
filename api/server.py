@@ -71,10 +71,16 @@ async def health_check():
     all_pools = GPUPoolManager.instance().all_pools()
     pools_data = {}
     for name, pool in all_pools.items():
-        dev_info_list = [GPUDetector.get_device_info(d) for d in pool.devices]
+        devices_data = []
+        for device in pool.devices:
+            dev_info = GPUDetector.get_device_info(device)
+            provider_inst = pool._device_map.get(device)
+            dev_info["model_loaded"] = getattr(provider_inst, "is_ready", False) if provider_inst is not None else False
+            devices_data.append(dev_info)
+
         pools_data[name] = {
             "device_count": pool.device_count,
-            "devices": dev_info_list,
+            "devices": devices_data,
         }
 
     return {

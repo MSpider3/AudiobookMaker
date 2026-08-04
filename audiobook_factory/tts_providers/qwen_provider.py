@@ -93,6 +93,9 @@ class QwenTTSProvider(BaseTTSProvider):
         if key in self._x_vector_cache:
             return key
 
+        if self._model is None or not hasattr(self._model, "model") or self._model.model is None:
+            return None
+
         model_type = getattr(self._model.model, "tts_model_type", "base")
         if model_type != "base":
             return None
@@ -218,6 +221,21 @@ class QwenTTSProvider(BaseTTSProvider):
         Thread-safe via self._lock. Caller must hold exclusive ownership of
         this provider — do not call from two threads simultaneously.
         """
+        # Guard: ensure model is initialized before lock acquisition
+        if self._model is None:
+            logger.warning(
+                "Model not initialized on %s at synthesize_batch() entry. "
+                "Calling ensure_ready().",
+                self._device,
+            )
+            self.ensure_ready()
+
+        if self._model is None:
+            raise RuntimeError(
+                f"Model is None on {self._device} after ensure_ready(). "
+                "Cannot synthesize."
+            )
+
         import io
         import soundfile as sf
         import torch
@@ -225,11 +243,12 @@ class QwenTTSProvider(BaseTTSProvider):
         if not texts:
             return []
 
-        x_key = self._ensure_x_vector_cached(voice_ref or self.config.voice_file)
-
         try:
             with self._lock:
                 self._ensure_initialised()
+                x_key = self._ensure_x_vector_cached(voice_ref or self.config.voice_file)
+                if self._model is None or not hasattr(self._model, "model") or self._model.model is None:
+                    raise RuntimeError(f"QwenTTS model instance is not properly loaded on {self._device}.")
                 model_type = getattr(self._model.model, "tts_model_type", "base")
                 languages = [getattr(self.config, "language", "English")] * len(texts)
 
@@ -316,6 +335,20 @@ class QwenTTSProvider(BaseTTSProvider):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def ensure_ready(self) -> None:
+        """Forces model loading and verifies model is non-None.
+
+        Raises:
+            RuntimeError: If model fails to load or is None after initialization.
+        """
+        self._ensure_initialised()
+        if self._model is None:
+            raise RuntimeError(
+                f"Model is None after initialization on {self._device}. "
+                "Check GPU memory and model path."
+            )
+        logger.debug("Provider ready on %s (model loaded).", self._device)
 
     def _ensure_initialised(self) -> None:
         """Ensure the underlying Qwen model is loaded on self._device."""
