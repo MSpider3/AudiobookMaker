@@ -28,7 +28,7 @@ import tempfile
 from pathlib import Path
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Callable, Any
 
 logger = logging.getLogger(__name__)
@@ -148,13 +148,21 @@ class AudiobookConfig:
     # ── Misc ──────────────────────────────────────────────────────────────────
     force_reprocess:          bool  = False  # When True, forces re-extraction & re-synthesis of all chunks from scratch
     resume_incomplete_chunks: bool  = True   # When True, resumes mid-chapter from last completed chunk using disk cache
+    regen_missing:            bool  = True   # When True, regenerates missing/failed chapter audio
     sample_rate:              int   = 24000
     torch_compile:            bool  = False
     quantization:             str   = "none"   # "none" | "int8"
+    selected_chapters:        list  = field(default_factory=list) # Selected chapter titles/labels
 
     # ── Pronunciation fixes ───────────────────────────────────────────────────
     # { regex_pattern: replacement }  applied before TTS
     pronunciation_map:   dict  = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AudiobookConfig":
+        valid_keys = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**filtered)
 
 
 def _validate_config(config: AudiobookConfig) -> None:

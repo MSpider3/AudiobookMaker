@@ -142,7 +142,7 @@ async def api_voice_test(payload: VoiceTestRequest):
     Generates preview speech using the backend's shared loaded model.
     """
     try:
-        cfg = AudiobookConfig(**payload.config)
+        cfg = AudiobookConfig.from_dict(payload.config)
         wav_bytes = preview_tts(payload.text, cfg)
         if wav_bytes is None:
             raise HTTPException(status_code=500, detail="TTS generation returned empty audio data.")

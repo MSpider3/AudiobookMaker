@@ -121,7 +121,7 @@ async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
         await task.add_log(f"🚀 Starting generation task: {task_id}")
 
         try:
-            cfg = AudiobookConfig(**task.config_dict)
+            cfg = AudiobookConfig.from_dict(task.config_dict)
             chapters = [
                 ExtractedChapter(
                     num=ch.get("num", idx + 1),
