@@ -241,8 +241,8 @@ else
     warn "FFmpeg not found — attempting to install..."
     case "$DISTRO" in
         macos)                                brew install ffmpeg ;;
-        ubuntu|linuxmint|pop|debian|kali|zorin) sudo apt-get install -y ffmpeg ;;
-        fedora|rhel|centos|almalinux|rocky)   sudo dnf install -y ffmpeg ;;
+        ubuntu|linuxmint|pop|debian|kali|zorin) sudo apt-get install -y ffmpeg sox libsox-fmt-all ;;
+        fedora|rhel|centos|almalinux|rocky)   sudo dnf install -y ffmpeg sox ;;
         arch|manjaro|endeavouros|garuda)       sudo pacman -Sy --noconfirm ffmpeg ;;
         opensuse*|suse*)                       sudo zypper install -y ffmpeg ;;
         *) warn "Could not auto-install FFmpeg. Please install it manually: https://ffmpeg.org" ;;

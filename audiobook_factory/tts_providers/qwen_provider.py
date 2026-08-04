@@ -376,6 +376,7 @@ class QwenTTSProvider(BaseTTSProvider):
         if quant == "int8":
             try:
                 import bitsandbytes  # noqa: F401
+                from transformers import BitsAndBytesConfig
             except ImportError:
                 raise ImportError(
                     "bitsandbytes is required for INT8 quantization. "
@@ -383,7 +384,7 @@ class QwenTTSProvider(BaseTTSProvider):
                 )
             return {
                 "device_map": self._device,
-                "load_in_8bit": True,
+                "quantization_config": BitsAndBytesConfig(load_in_8bit=True),
             }
         import torch
         return {
