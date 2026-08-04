@@ -1285,6 +1285,7 @@ def build_app():
             except Exception as exc:
                 return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(32)]
                 
+            try:
                 title = data.get("book_title", "")
                 book_path = data.get("book_path", "")
                 voice_file = data.get("voice_file", "")
