@@ -1287,21 +1287,31 @@ def build_app():
                         gr.update()
                     ] + [gr.update() for _ in range(32)]
                 
+                data = None
                 try:
                     data = json.loads(content)
                 except json.JSONDecodeError as json_err:
-                    snippet = content[:200].strip()
-                    if snippet.startswith("<") or "html" in snippet.lower():
+                    # Attempt auto-healing if accidental characters (e.g. 'chp') precede '{'
+                    first_brace = content.find("{")
+                    if first_brace > 0:
+                        try:
+                            data = json.loads(content[first_brace:])
+                        except json.JSONDecodeError:
+                            pass
+                    
+                    if data is None:
+                        snippet = content[:200].strip()
+                        if snippet.startswith("<") or "html" in snippet.lower():
+                            return [
+                                "❌ **Failed to parse progress file**: The uploaded file appears to be an HTML document/webpage, not a JSON progress file.\n\n"
+                                "💡 **How to fix:** If downloading from Kaggle/Colab/cloud storage, ensure you download the raw `generation_progress.json` file instead of saving the web page link.",
+                                gr.update()
+                            ] + [gr.update() for _ in range(32)]
                         return [
-                            "❌ **Failed to parse progress file**: The uploaded file appears to be an HTML document/webpage, not a JSON progress file.\n\n"
-                            "💡 **How to fix:** If downloading from Kaggle/Colab/cloud storage, ensure you download the raw `generation_progress.json` file instead of saving the web page link.",
+                            f"❌ **Failed to parse progress file**: Invalid JSON formatting at line {json_err.lineno}, column {json_err.colno} ({json_err.msg}).\n\n"
+                            f"**Snippet Preview:** `{snippet[:100]}`",
                             gr.update()
                         ] + [gr.update() for _ in range(32)]
-                    return [
-                        f"❌ **Failed to parse progress file**: Invalid JSON formatting at line {json_err.lineno}, column {json_err.colno} ({json_err.msg}).\n\n"
-                        f"**Snippet Preview:** `{snippet[:100]}`",
-                        gr.update()
-                    ] + [gr.update() for _ in range(32)]
 
                 if not isinstance(data, dict):
                     return [
