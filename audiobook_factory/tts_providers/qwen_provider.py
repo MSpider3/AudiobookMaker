@@ -415,9 +415,15 @@ class QwenTTSProvider(BaseTTSProvider):
                 "quantization_config": BitsAndBytesConfig(load_in_8bit=True),
             }
         import torch
+        supports_bf16 = (
+            torch.cuda.is_available()
+            and hasattr(torch.cuda, "is_bf16_supported")
+            and torch.cuda.is_bf16_supported()
+        )
+        dtype = torch.bfloat16 if supports_bf16 else torch.float16
         return {
             "device_map": self._device,
-            "torch_dtype": torch.bfloat16,
+            "torch_dtype": dtype,
         }
 
     def _load_model(self) -> None:

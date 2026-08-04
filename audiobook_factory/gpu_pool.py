@@ -476,8 +476,9 @@ class GPUPoolManager:
                 pool._devices = [d for d in pool._devices if d not in failed_devices]
 
                 if not pool._devices:
+                    details = ", ".join(f"{d}: {futures[d].exception()}" for d in failed_devices)
                     raise RuntimeError(
-                        "All provider warmups failed. Cannot synthesize audio. "
+                        f"All provider warmups failed ({details}). Cannot synthesize audio. "
                         "Check GPU memory and model path."
                     )
 
