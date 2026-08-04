@@ -231,8 +231,26 @@ def _load_config(args) -> tuple[dict, dict, list[dict]]:
         print(_err(f"❌ Config JSON not found: {path}"))
         sys.exit(1)
 
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            content = f.read()
+        if not content or not content.strip():
+            print(_err(f"❌ Config JSON file '{path}' is empty (0 bytes or blank)."))
+            sys.exit(1)
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        snippet = ""
+        try:
+            with open(path, "r", encoding="utf-8-sig") as sf:
+                snippet = sf.read(200).strip()
+        except Exception:
+            pass
+        if snippet.startswith("<") or "html" in snippet.lower():
+            print(_err(f"❌ Config file '{path}' contains an HTML document (webpage/error page), not JSON."))
+            print(_err("💡 If downloaded from Kaggle/Colab/cloud, ensure you download the raw generation_progress.json file instead of saving the web page link."))
+        else:
+            print(_err(f"❌ Failed to parse config JSON ({path}): line {exc.lineno}, col {exc.colno} ({exc.msg})"))
+        sys.exit(1)
 
     meta = {
         "book_title":  data.get("book_title", "Audiobook"),

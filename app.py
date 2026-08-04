@@ -89,7 +89,7 @@ def check_existing_progress(book_title):
     prog_path = os.path.join(_OUTPUT_DIR, sanitized_book_title, "generation_progress.json")
     if os.path.exists(prog_path):
         try:
-            with open(prog_path, "r", encoding="utf-8") as f:
+            with open(prog_path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             chapters = data.get("chapters", [])
             completed = sum(1 for c in chapters if c.get("status") in ("completed", "complete"))
@@ -883,7 +883,7 @@ def build_app():
             if not os.path.exists(prog_json_path):
                 return None
             try:
-                with open(prog_json_path, "r", encoding="utf-8") as f:
+                with open(prog_json_path, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
                 ch_list = data.get("chapters", [])
                 if not ch_list or not all(c.get("text", "").strip() for c in ch_list):
@@ -1271,11 +1271,43 @@ def build_app():
 
         def on_progress_upload(file_obj):
             if file_obj is None:
-                return ["", gr.update()] + [gr.update() for _ in range(27)]
-            path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+                return ["", gr.update()] + [gr.update() for _ in range(32)]
+            path = file_obj.name if hasattr(file_obj, "name") else (file_obj.get("name") if isinstance(file_obj, dict) else str(file_obj))
+            if not path or not os.path.exists(path):
+                return ["❌ Uploaded progress file not found on disk.", gr.update()] + [gr.update() for _ in range(32)]
+            
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    content = f.read()
+                
+                if not content or not content.strip():
+                    return [
+                        "❌ **Failed to parse progress file**: The uploaded JSON file is empty (0 bytes or blank).\n\n"
+                        "💡 **How to fix:** Please ensure you selected a valid, non-empty `generation_progress.json` file.",
+                        gr.update()
+                    ] + [gr.update() for _ in range(32)]
+                
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError as json_err:
+                    snippet = content[:200].strip()
+                    if snippet.startswith("<") or "html" in snippet.lower():
+                        return [
+                            "❌ **Failed to parse progress file**: The uploaded file appears to be an HTML document/webpage, not a JSON progress file.\n\n"
+                            "💡 **How to fix:** If downloading from Kaggle/Colab/cloud storage, ensure you download the raw `generation_progress.json` file instead of saving the web page link.",
+                            gr.update()
+                        ] + [gr.update() for _ in range(32)]
+                    return [
+                        f"❌ **Failed to parse progress file**: Invalid JSON formatting at line {json_err.lineno}, column {json_err.colno} ({json_err.msg}).\n\n"
+                        f"**Snippet Preview:** `{snippet[:100]}`",
+                        gr.update()
+                    ] + [gr.update() for _ in range(32)]
+
+                if not isinstance(data, dict):
+                    return [
+                        "❌ **Failed to parse progress file**: Root content of the JSON file is not a valid JSON object.",
+                        gr.update()
+                    ] + [gr.update() for _ in range(32)]
                 
                 title = data.get("book_title", "")
                 book_path = data.get("book_path", "")
@@ -1598,7 +1630,7 @@ def build_app():
 
                 if os.path.exists(prog_path):
                     try:
-                        with open(prog_path, "r", encoding="utf-8") as f:
+                        with open(prog_path, "r", encoding="utf-8-sig") as f:
                             existing = json.load(f)
                         existing_chapters = existing.get("chapters", [])
                     except Exception:
