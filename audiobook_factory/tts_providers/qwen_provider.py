@@ -73,6 +73,29 @@ class QwenTTSProvider(BaseTTSProvider):
         """Return USD cost estimate for synthesis (0.0 for local model)."""
         return 0.0
 
+    def _resolve_voice_ref(self, voice_ref: str | bytes | None) -> str | None:
+        """Resolves a voice reference (file path string or raw WAV bytes) into a valid file path string.
+
+        If voice_ref is raw bytes, writes it to a cached temporary .wav file (keyed by SHA256)
+        and returns the file path string. This ensures extract_x_vector and generate_voice_clone
+        receive a valid file path string expected by qwen_tts.
+        """
+        if not voice_ref:
+            return None
+        if isinstance(voice_ref, str):
+            return voice_ref
+        if isinstance(voice_ref, bytes):
+            import hashlib
+            import os
+            import tempfile
+            key = hashlib.sha256(voice_ref).hexdigest()[:16]
+            temp_path = os.path.join(tempfile.gettempdir(), f"qwen_voiceref_{key}.wav")
+            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                with open(temp_path, "wb") as f:
+                    f.write(voice_ref)
+            return temp_path
+        return str(voice_ref)
+
     def _ensure_x_vector_cached(self, voice_ref: str | bytes) -> str | None:
         """Pre-compute and cache the speaker x-vector for the reference voice.
 
@@ -83,6 +106,10 @@ class QwenTTSProvider(BaseTTSProvider):
             Cache key string or None.
         """
         if not voice_ref:
+            return None
+
+        ref_path = self._resolve_voice_ref(voice_ref)
+        if not ref_path:
             return None
 
         if isinstance(voice_ref, bytes):
@@ -103,9 +130,9 @@ class QwenTTSProvider(BaseTTSProvider):
         try:
             vec = None
             if hasattr(self._model, "extract_x_vector"):
-                vec = self._model.extract_x_vector(voice_ref)
+                vec = self._model.extract_x_vector(ref_path)
             elif hasattr(self._model, "get_speaker_embedding"):
-                vec = self._model.get_speaker_embedding(voice_ref)
+                vec = self._model.get_speaker_embedding(ref_path)
 
             if vec is not None:
                 self._x_vector_cache[key] = vec
@@ -133,7 +160,8 @@ class QwenTTSProvider(BaseTTSProvider):
             try:
                 with self._lock:
                     self._ensure_initialised()
-                    x_key = self._ensure_x_vector_cached(voice_ref or self.config.voice_file)
+                    ref_path = self._resolve_voice_ref(voice_ref or self.config.voice_file)
+                    x_key = self._ensure_x_vector_cached(ref_path) if ref_path else None
 
                     model_type = getattr(self._model.model, "tts_model_type", "base")
 
@@ -148,7 +176,7 @@ class QwenTTSProvider(BaseTTSProvider):
                         if x_key is not None and x_key in self._x_vector_cache and hasattr(self._model, "generate_voice_clone"):
                             gen_kwargs["x_vector"] = self._x_vector_cache[x_key]
                         else:
-                            gen_kwargs["ref_audio"] = voice_ref or self.config.voice_file
+                            gen_kwargs["ref_audio"] = ref_path
                         wav_data, sr = self._model.generate_voice_clone(**gen_kwargs)
                     elif model_type == "custom_voice":
                         wav_data, sr = self._model.generate_custom_voice(
@@ -246,7 +274,8 @@ class QwenTTSProvider(BaseTTSProvider):
         try:
             with self._lock:
                 self._ensure_initialised()
-                x_key = self._ensure_x_vector_cached(voice_ref or self.config.voice_file)
+                ref_path = self._resolve_voice_ref(voice_ref or self.config.voice_file)
+                x_key = self._ensure_x_vector_cached(ref_path) if ref_path else None
                 if self._model is None or not hasattr(self._model, "model") or self._model.model is None:
                     raise RuntimeError(f"QwenTTS model instance is not properly loaded on {self._device}.")
                 model_type = getattr(self._model.model, "tts_model_type", "base")
@@ -263,8 +292,7 @@ class QwenTTSProvider(BaseTTSProvider):
                     if x_key is not None and x_key in self._x_vector_cache and hasattr(self._model, "generate_voice_clone"):
                         gen_kwargs["x_vector"] = self._x_vector_cache[x_key]
                     else:
-                        voice_ref_val = voice_ref or self.config.voice_file
-                        gen_kwargs["ref_audio"] = [voice_ref_val] * len(texts)
+                        gen_kwargs["ref_audio"] = [ref_path] * len(texts)
                     wav_data_list, sr = self._model.generate_voice_clone(**gen_kwargs)
                 elif model_type == "custom_voice":
                     speakers = [self.config.tts_timbre or "serena"] * len(texts)
