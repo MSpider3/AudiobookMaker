@@ -367,7 +367,7 @@ def _warmup_provider(provider: BaseTTSProvider) -> None:
     try:
         provider.ensure_ready()
         logger.info("Provider on %s warmed up successfully.", provider.device)
-    except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+    except Exception as exc:
         logger.error(
             "Provider warmup failed on %s (%s: %s). "
             "This device will be excluded from the pool.",

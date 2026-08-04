@@ -24,6 +24,31 @@ _TORCH_COMPILE_MODE: str = "max-autotune"
 
 import hashlib
 
+def _sanitize_dict_keys(obj: Any) -> None:
+    """Recursively converts any dict_keys attributes or dict values on obj to lists.
+
+    Fixes Python 3.12 pickling error ('cannot pickle dict_keys object') when transformers,
+    accelerate, or PyTorch deepcopy/pickle model configs or generation configs.
+    """
+    if obj is None:
+        return
+    try:
+        if hasattr(obj, "__dict__"):
+            for k, v in list(obj.__dict__.items()):
+                if type(v).__name__ == "dict_keys":
+                    setattr(obj, k, list(v))
+                elif isinstance(v, dict):
+                    for dk, dv in list(v.items()):
+                        if type(dv).__name__ == "dict_keys":
+                            v[dk] = list(dv)
+        for child_name in ("model", "config", "generation_config"):
+            child = getattr(obj, child_name, None)
+            if child is not None and child is not obj:
+                _sanitize_dict_keys(child)
+    except Exception:
+        pass
+
+
 class QwenTTSProvider(BaseTTSProvider):
     """Local Qwen3-TTS provider supporting all model variants (Base, CustomVoice, VoiceDesign)."""
 
@@ -469,6 +494,8 @@ class QwenTTSProvider(BaseTTSProvider):
             **self._build_model_load_kwargs(self.config),
         )
         self._loaded_model_name = self.config.tts_model_name
+
+        _sanitize_dict_keys(self._model)
 
         gen_cfg = self._model.model.generation_config
         if gen_cfg.pad_token_id is None:
