@@ -85,7 +85,7 @@ class _ProgressState:
 
 def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConfig) -> None:
     """Concatenates chunk WAV files with pause padding into an intermediate partial WAV file without loudnorm."""
-    valid_paths = [p for p in chunk_paths if p and os.path.exists(p)]
+    valid_paths = [p for p in chunk_paths if p and os.path.exists(p) and os.path.getsize(p) >= 100]
     if not valid_paths:
         return
     import numpy as np
@@ -96,9 +96,10 @@ def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConf
     for i, p in enumerate(valid_paths):
         try:
             data, sr = sf.read(p, dtype="float32")
-            segments.append(data)
-            if i < len(valid_paths) - 1:
-                segments.append(pause_samples)
+            if len(data) > 0:
+                segments.append(data)
+                if i < len(valid_paths) - 1:
+                    segments.append(pause_samples)
         except Exception as exc:
             logger.warning("Failed to read chunk %s during partial concat: %s", p, exc)
     if segments:
@@ -108,7 +109,7 @@ def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConf
 
 def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConfig) -> None:
     """Final mastering pass applying loudness normalization (LUFS/true_peak)."""
-    valid_paths = [p for p in partial_paths if p and os.path.exists(p)]
+    valid_paths = [p for p in partial_paths if p and os.path.exists(p) and os.path.getsize(p) >= 100]
     if not valid_paths:
         return
     if _check_rust():
@@ -132,7 +133,8 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
         for p in valid_paths:
             try:
                 data, sr = sf.read(p, dtype="float32")
-                segments.append(data)
+                if len(data) > 0:
+                    segments.append(data)
             except Exception as exc:
                 logger.warning("Failed to read partial %s during final mastering: %s", p, exc)
         if segments:
@@ -191,6 +193,9 @@ def _flush_accumulated_batch(
     for (chunk_index, _), (audio_bytes, duration) in zip(accumulated, results):
         path = os.path.join(out_dir, f"chunk_ch_{chapter_index}_{chunk_index}.wav")
         if isinstance(audio_bytes, bytes):
+            if len(audio_bytes) < 100:
+                master_queue.put(_StageError(RuntimeError(f"Chunk {chunk_index} audio synthesis returned empty data ({len(audio_bytes)} bytes)")))
+                continue
             try:
                 with open(path, "wb") as fh:
                     fh.write(audio_bytes)
@@ -198,8 +203,14 @@ def _flush_accumulated_batch(
             except OSError as exc:
                 master_queue.put(_StageError(exc))
                 continue
-        else:
+        elif isinstance(audio_bytes, str):
+            if not os.path.exists(audio_bytes) or os.path.getsize(audio_bytes) < 100:
+                master_queue.put(_StageError(RuntimeError(f"Chunk {chunk_index} audio file invalid or empty")))
+                continue
             result = _SynthResult(chunk_index, audio=audio_bytes, duration=duration)
+        else:
+            master_queue.put(_StageError(RuntimeError(f"Unexpected audio type: {type(audio_bytes)}")))
+            continue
 
         master_queue.put(result)
         progress_state.increment()
@@ -556,6 +567,10 @@ def run_chapter_pipeline(
                 # Final master concatenation into out_wav_path with LUFS & dBTP normalization
                 if partial_files and not cancel_token.is_cancelled and not _pipeline_failed:
                     _master_final(partial_files, out_wav_path, config)
+
+                if not os.path.exists(out_wav_path) or os.path.getsize(out_wav_path) < 100:
+                    if not cancel_token.is_cancelled and not _pipeline_failed:
+                        raise RuntimeError(f"Mastered chapter audio file was not created or empty at {out_wav_path}")
 
             except Exception as exc:
                 stage_c_exception = exc
