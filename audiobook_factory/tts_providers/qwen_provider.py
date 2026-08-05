@@ -175,7 +175,20 @@ class QwenTTSProvider(BaseTTSProvider):
             key = hashlib.sha256(str(voice_ref).encode("utf-8", errors="replace")).hexdigest()[:16]
 
         if key in self._x_vector_cache:
-            return key
+            cached = self._x_vector_cache[key]
+            if hasattr(cached, "device") and (
+                cached.device.type == "cpu" or
+                str(cached.device) != self._device or
+                cached.numel() == 0
+            ):
+                logger.warning(
+                    "    [QwenTTS] Cached x-vector for key %s is on wrong device "
+                    "or empty (%s vs expected %s). Recomputing.",
+                    key, getattr(cached, "device", "unknown"), self._device,
+                )
+                del self._x_vector_cache[key]
+            else:
+                return key
 
         if self._model is None or not hasattr(self._model, "model") or self._model.model is None:
             return None
@@ -402,11 +415,38 @@ class QwenTTSProvider(BaseTTSProvider):
             return results
 
         output: list[tuple[bytes | str, float]] = []
-        for audio in processed_wavs:
+        for i, audio in enumerate(processed_wavs):
+            if audio is None or (hasattr(audio, "__len__") and len(audio) == 0):
+                logger.error(
+                    "    [QwenTTS] Batch synthesis returned empty audio for chunk %d "
+                    "on %s. Model may be producing silence.",
+                    i, self._device,
+                )
+                raise RuntimeError(
+                    f"Empty audio from batch synthesis on {self._device} "
+                    f"for chunk {i}. Check voice reference and model state."
+                )
+
             buf = io.BytesIO()
             sf.write(buf, audio, sr, format="WAV")
             duration = len(audio) / float(sr) if sr > 0 else 0.0
-            output.append((buf.getvalue(), duration))
+            audio_bytes = buf.getvalue()
+
+            if len(audio_bytes) < 100:
+                logger.error(
+                    "    [QwenTTS] Batch synthesis produced WAV output under 100 bytes (%d bytes) for chunk %d on %s.",
+                    len(audio_bytes), i, self._device,
+                )
+                raise RuntimeError(
+                    f"Empty or corrupted WAV audio ({len(audio_bytes)} bytes) from batch synthesis on {self._device} "
+                    f"for chunk {i}. Check voice reference and model state."
+                )
+
+            logger.debug(
+                "[synth_batch] chunk %d: audio_type=%s audio_len=%d duration=%.2f",
+                i, type(audio_bytes).__name__, len(audio_bytes), duration,
+            )
+            output.append((audio_bytes, duration))
 
         return output
 

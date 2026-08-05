@@ -863,6 +863,12 @@ def _process_chapter(
                 except Exception as exc:
                     log(f"  [Ch{idx}] Warning: Could not read voice_file bytes: {exc}")
 
+            logger.info(
+                "[process_chapter] voice_ref bytes: %d bytes from %s",
+                len(voice_bytes),
+                config.voice_file,
+            )
+
             chapter_wav_path = os.path.join(temp_dir, "chapter_mastered.wav")
             chunk_durations = run_chapter_pipeline(
                 sentences=sentences,

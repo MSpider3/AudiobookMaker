@@ -202,6 +202,14 @@ def _flush_accumulated_batch(
     """
     texts = [" ".join(sentences) for (_, sentences) in accumulated]
 
+    logger.debug(
+        "[flush_batch] voice_ref type=%s len=%s device=%s batch_size=%d",
+        type(voice_ref).__name__,
+        len(voice_ref) if isinstance(voice_ref, bytes) else "N/A",
+        getattr(provider, "device", "unknown"),
+        len(accumulated),
+    )
+
     try:
         results: list[tuple[bytes | str, float]] = provider.synthesize_batch(
             texts=texts,
