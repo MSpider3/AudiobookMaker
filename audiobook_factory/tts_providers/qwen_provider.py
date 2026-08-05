@@ -126,6 +126,16 @@ class QwenTTSProvider(BaseTTSProvider):
         """Return USD cost estimate for synthesis (0.0 for local model)."""
         return 0.0
 
+    def _bind_cuda_device(self) -> None:
+        """Sets the current active CUDA device to self._device to ensure thread safety on multi-GPU systems."""
+        if self._device and self._device.startswith("cuda"):
+            try:
+                import torch
+                idx = int(self._device.split(":")[1]) if ":" in self._device else 0
+                torch.cuda.set_device(idx)
+            except Exception as e:
+                logger.warning("Failed to set CUDA device to %s: %s", self._device, e)
+
     def _resolve_voice_ref(self, voice_ref: str | bytes | None) -> str | None:
         """Resolves a voice reference (file path string or raw WAV bytes) into a valid file path string.
 
@@ -162,6 +172,7 @@ class QwenTTSProvider(BaseTTSProvider):
         Returns:
             Cache key string or None.
         """
+        self._bind_cuda_device()
         if not voice_ref:
             return None
 
@@ -174,6 +185,7 @@ class QwenTTSProvider(BaseTTSProvider):
         else:
             key = hashlib.sha256(str(voice_ref).encode("utf-8", errors="replace")).hexdigest()[:16]
 
+        import torch
         if key in self._x_vector_cache:
             cached = self._x_vector_cache[key]
             if hasattr(cached, "device") and (
@@ -205,8 +217,13 @@ class QwenTTSProvider(BaseTTSProvider):
                 vec = self._model.get_speaker_embedding(ref_path)
 
             if vec is not None:
+                if isinstance(vec, torch.Tensor) and str(vec.device) != self._device:
+                    try:
+                        vec = vec.to(self._device)
+                    except Exception as e:
+                        logger.warning("Failed to move x-vector to device %s: %s", self._device, e)
                 self._x_vector_cache[key] = vec
-                logger.info("    [QwenTTS] ⚡ X-vector cached under key %s", key)
+                logger.info("    [QwenTTS] ⚡ X-vector cached under key %s (device %s)", key, getattr(vec, 'device', 'unknown'))
                 return key
         except Exception as e:
             logger.warning("    [QwenTTS] X-vector caching failed (%s) — will use voice_ref per-call.", e)
@@ -221,6 +238,7 @@ class QwenTTSProvider(BaseTTSProvider):
         return_bytes: bool = False,
     ) -> tuple[str | bytes, float]:
         """Synthesize speech for input text and write output WAV file or return PCM bytes."""
+        self._bind_cuda_device()
         self._validate_voice_ref(voice_ref or self.config.voice_file)
         import io
         import soundfile as sf
@@ -320,6 +338,7 @@ class QwenTTSProvider(BaseTTSProvider):
         Thread-safe via self._lock. Caller must hold exclusive ownership of
         this provider — do not call from two threads simultaneously.
         """
+        self._bind_cuda_device()
         self._validate_voice_ref(voice_ref or self.config.voice_file)
         # Guard: ensure model is initialized before lock acquisition
         if self._model is None:
@@ -452,6 +471,7 @@ class QwenTTSProvider(BaseTTSProvider):
 
     def cleanup(self) -> None:
         """Clean up loaded PyTorch model and free GPU memory."""
+        self._bind_cuda_device()
         import gc
         import torch
         if self._model is not None:
@@ -538,6 +558,7 @@ class QwenTTSProvider(BaseTTSProvider):
         Note: torch.compile is applied at instance-level to self._model.model
         so that each device instance maintains its own compiled PyTorch graph.
         """
+        self._bind_cuda_device()
         import os
         import sys
         import torch

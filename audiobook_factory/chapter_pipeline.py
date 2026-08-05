@@ -622,11 +622,11 @@ def run_chapter_pipeline(
             t.start()
         thread_c.start()
 
-        # ── Join Threads with Timeouts in Strict Order ─────────────────────────
-        thread_a.join(timeout=30.0)
+        # ── Join Threads in Strict Order ─────────────────────────
+        thread_a.join()
         for t in stage_b_threads:
-            t.join(timeout=30.0)
-        thread_c.join(timeout=30.0)
+            t.join()
+        thread_c.join()
 
         if stage_c_exception is None and not cancel_token.is_cancelled and os.path.exists(out_wav_path) and os.path.getsize(out_wav_path) > 0:
             _chapter_succeeded = True
