@@ -442,33 +442,41 @@ class GPUPoolManager:
                 provider_name=provider_name,
             )
 
-            import concurrent.futures as _cf
+            # Sequential warmup — one device at a time.
+            # Parallel warmup exhausts CPU RAM on Kaggle T4 x2 because
+            # accelerate uses CPU as a staging buffer during meta → GPU
+            # weight transfer. Two simultaneous loads require ~14 GB of
+            # staging RAM; Kaggle provides only 13 GB total CPU RAM.
+            # Sequential loading adds ~30s but is reliable.
 
-            futures: dict[str, _cf.Future] = {}
-            with _cf.ThreadPoolExecutor(
-                max_workers=max(1, len(filtered_devices)),
-                thread_name_prefix="provider_warmup",
-            ) as warmup_executor:
-                futures = {
-                    device: warmup_executor.submit(_warmup_provider, provider)
-                    for device, provider in pool._device_map.items()
-                }
-                for future in _cf.as_completed(futures.values()):
-                    pass
+            failed_devices: list[str] = []
 
-            failed_devices = [
-                device for device, future in futures.items()
-                if future.exception() is not None
-            ]
+            for device, provider in pool._device_map.items():
+                try:
+                    logger.info(
+                        "[gpu_pool] Warming up provider on %s "
+                        "(sequential — one device at a time)...",
+                        device,
+                    )
+                    _warmup_provider(provider)
+                    logger.info(
+                        "[gpu_pool] Provider on %s ready.", device
+                    )
+                except (torch.cuda.OutOfMemoryError, RuntimeError, Exception) as exc:
+                    logger.error(
+                        "[gpu_pool] Warmup failed on %s (%s: %s). "
+                        "This device will be excluded from the pool.",
+                        device,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    failed_devices.append(device)
 
             if failed_devices:
                 logger.warning(
                     "Warmup failed for %d device(s): %s. Removing from pool.",
                     len(failed_devices),
-                    ", ".join(
-                        f"{d} ({futures[d].exception()})"
-                        for d in failed_devices
-                    ),
+                    ", ".join(failed_devices),
                 )
                 for device in failed_devices:
                     pool._device_queues.pop(device, None)
@@ -476,7 +484,7 @@ class GPUPoolManager:
                 pool._devices = [d for d in pool._devices if d not in failed_devices]
 
                 if not pool._devices:
-                    details = ", ".join(f"{d}: {futures[d].exception()}" for d in failed_devices)
+                    details = ", ".join(failed_devices)
                     raise RuntimeError(
                         f"All provider warmups failed ({details}). Cannot synthesize audio. "
                         "Check GPU memory and model path."
