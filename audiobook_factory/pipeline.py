@@ -332,6 +332,20 @@ def run_pipeline(
     """
     _validate_config(config)
 
+    from audiobook_factory.preflight import run_preflight_checks, PreflightError
+
+    recommended_dtype = "float16"
+    try:
+        preflight = run_preflight_checks(
+            voice_ref=config.voice_file if config.voice_file else None,
+            check_voice_ref=bool(config.voice_file),
+        )
+        recommended_dtype = preflight.recommended_dtype
+    except PreflightError as exc:
+        for error in exc.result.errors:
+            logger.error("[Pipeline] Pre-flight failed: %s", error)
+        raise
+
     if cancel is None:
         cancel = CancelToken()
 
@@ -450,7 +464,9 @@ def run_pipeline(
     if not config.preview_mode:
         pool = GPUPoolManager.instance().get_pool(
             provider_name=config.tts_provider_name,
-            provider_factory=lambda dev: get_tts_provider(config.tts_provider_name, config, device=dev),
+            provider_factory=lambda dev: get_tts_provider(
+                config.tts_provider_name, config, device=dev, dtype_override=recommended_dtype
+            ),
             min_vram_gb=5.0,
             gpu_count_override=config.gpu_count,
         )
@@ -785,6 +801,21 @@ def _process_chapter(
                         os.remove(os.path.join(temp_dir, f_name))
             except OSError as exc:
                 logger.warning("Could not clear chunk files in %s: %s", temp_dir, exc)
+    elif completed_chunks:
+        from audiobook_factory.chapter_pipeline import _validate_chunk_file
+        missing_files = [
+            chunk_idx for chunk_idx in completed_chunks
+            if not _validate_chunk_file(
+                os.path.join(temp_dir, f"chunk_ch_{idx}_{chunk_idx}.wav")
+            )
+        ]
+        if missing_files:
+            stale_count = len(missing_files)
+            total_claimed = len(completed_chunks)
+            log(
+                f"  [Ch{idx}] Stale checkpoint: {stale_count}/{total_claimed} "
+                f"claimed-complete chunks have no WAV file on disk. These will be re-synthesized."
+            )
 
     prog_path_out = os.path.join(config.output_dir, "generation_progress.json")
     def _chunk_cb(c_idx: int) -> None:

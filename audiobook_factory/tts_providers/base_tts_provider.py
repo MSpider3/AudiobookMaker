@@ -123,13 +123,37 @@ class BaseTTSProvider(ABC):
     def cleanup(self) -> None:
         """Release resources. Override if the provider holds GPU models."""
 
+    @staticmethod
+    def _validate_voice_ref(voice_ref: object) -> None:
+        """Validates voice_ref is bytes or str before synthesis.
+
+        Raises:
+            TypeError: If voice_ref is neither bytes nor str.
+            ValueError: If voice_ref is empty or non-existent file.
+        """
+        if not isinstance(voice_ref, (bytes, str)):
+            raise TypeError(
+                f"voice_ref must be bytes or str, got {type(voice_ref).__name__}. "
+                "Pass either WAV file bytes or a path string."
+            )
+        if isinstance(voice_ref, bytes) and len(voice_ref) < 100:
+            raise ValueError(
+                f"voice_ref bytes too short ({len(voice_ref)}). "
+                "The WAV data appears to be empty or corrupted."
+            )
+        if isinstance(voice_ref, str) and not __import__("os").path.exists(voice_ref):
+            raise ValueError(
+                f"voice_ref path does not exist: {voice_ref}"
+            )
+
     @classmethod
-    def create_for_device(cls, device: str, config: "AudiobookConfig") -> "BaseTTSProvider":
+    def create_for_device(cls, device: str, config: "AudiobookConfig", dtype_override: str | None = None) -> "BaseTTSProvider":
         """Factory classmethod: constructs a provider instance pinned to `device`.
 
         Args:
             device: Target torch device string, e.g. "cuda:0", "cuda:1", "cpu".
             config: AudiobookConfig options.
+            dtype_override: If set, overrides torch_dtype selection.
 
         Returns:
             An instantiated BaseTTSProvider pinned to the device.
@@ -139,7 +163,12 @@ class BaseTTSProvider(ABC):
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
-def get_tts_provider(name: str, config: "AudiobookConfig", device: str | None = None) -> BaseTTSProvider:
+def get_tts_provider(
+    name: str,
+    config: "AudiobookConfig",
+    device: str | None = None,
+    dtype_override: str | None = None,
+) -> BaseTTSProvider:
     """
     Return an instantiated provider for *name*.
 
@@ -154,11 +183,12 @@ def get_tts_provider(name: str, config: "AudiobookConfig", device: str | None = 
     if name in ("qwen", "qwen3", "qwen3-tts", ""):
         from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
         if device is not None:
-            return QwenTTSProvider.create_for_device(device, config)
-        return QwenTTSProvider(config)
+            return QwenTTSProvider.create_for_device(device, config, dtype_override=dtype_override)
+        return QwenTTSProvider(config, device=device, dtype_override=dtype_override)
 
     raise ValueError(
         f"Unknown TTS provider: '{name}'. "
         f"Currently supported: 'qwen'. More providers coming in a future release."
     )
+
 

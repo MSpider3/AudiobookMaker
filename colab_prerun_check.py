@@ -30,6 +30,13 @@ except Exception as e:
     sys.exit(1)
 
 try:
+    from audiobook_factory.preflight import run_preflight_checks, PreflightError
+    print("    audiobook_factory.preflight   ✓")
+except Exception as e:
+    print(f"    audiobook_factory.preflight   ✗  {e}")
+    sys.exit(1)
+
+try:
     from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
     print("    qwen_provider                 ✓")
 except Exception as e:
@@ -41,6 +48,21 @@ try:
     print("    pipeline                      ✓")
 except Exception as e:
     print(f"    pipeline                      ⚠  ({e})")
+
+# ── 1b. Pre-Flight Environment Validation (<30s) ──────────────────────────
+print("\n[1b] Pre-flight environment check …")
+try:
+    res = run_preflight_checks(check_voice_ref=False)
+    print(f"    Pre-flight validation passed  ✓ (recommended dtype: {res.recommended_dtype})")
+    if res.warnings:
+        for w in res.warnings:
+            print(f"    ⚠ Warning: {w}")
+except PreflightError as exc:
+    print("    Pre-flight error(s) found  ✗")
+    for err in exc.result.errors:
+        print(f"      - {err}")
+except Exception as e:
+    print(f"    Pre-flight check warning: {e}  ⚠")
 
 # ── 2. GPU Detection & VRAM Info ─────────────────────────────────────────────
 print("\n[2] GPU detection & memory …")

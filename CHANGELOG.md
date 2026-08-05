@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [v1.2.0] - 2026-08-05
+
+### ⚡ Added
+- **Kaggle & Cloud Pre-Flight Environment Validator (`preflight.py`)**: Created an automated pre-flight validator module (`run_preflight_checks()`) that completes comprehensive environment validation in under 30 seconds before any model loading or generation begins. Checks Python version (3.10+), PyTorch, CUDA device count, per-device bfloat16 capability, transformers API (`BitsAndBytesConfig`), soundfile, FFmpeg, voice reference integrity/existence, and Python 3.12 dict view picklability. Raises `PreflightError` immediately at startup with actionable error reports to prevent wasting GPU time mid-generation.
+- **Voice Reference Safety & Session Hash Caching**: Added `BaseTTSProvider._validate_voice_ref()` boundary validation and implemented module-level SHA-256 hash caching (`_VOICE_REF_CACHE`) in `_resolve_voice_ref()` to prevent writing redundant temp WAV files on disk across hundreds of chunk synthesis calls.
+- **Stale Checkpoint Detection & Corrupted Chunk Recovery**: Added `_validate_chunk_file()` (minimum size guard = 1,000 bytes) in `chapter_pipeline.py`. Missing or corrupted chunk WAV files are automatically detected, logged with a stale checkpoint warning at chapter start, and routed for re-synthesis.
+- **Python 3.12 Pickling Compatibility**: Extended `_sanitize_dict_keys()` in `qwen_provider.py` to recursively sanitize `dict_keys`, `dict_values`, and `dict_items` view objects across model and generation configs for Python 3.12 strict pickling compatibility.
+- **Expanded Hardening Test Suite (`tests/test_hardening.py`)**: Added test coverage for pre-flight check functions, `PreflightResult`, `PreflightError`, voice reference validation, chunk file validation, and Python 3.12 dict view sanitization.
+
+### 🔄 Changed
+- Integrated `run_preflight_checks()` into `run_pipeline()` entry point before GPU pool provider factory allocation.
+- Passed `recommended_dtype` ("float16" or "bfloat16") determined by pre-flight check directly into TTS provider initialization (`dtype_override`).
+
+---
+
 ## [v1.1.0] - 2026-08-05
 
 ### ⚡ Added

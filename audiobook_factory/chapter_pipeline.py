@@ -30,11 +30,36 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["run_chapter_pipeline"]
+__all__ = ["run_chapter_pipeline", "_validate_chunk_file"]
 
 _MAX_IN_MEMORY_CHUNK_SECONDS: float = 30.0
 _PARTIAL_FLUSH_CHUNK_COUNT: int = 20
 _ACQUIRE_POLL_TIMEOUT_SEC: float = 0.5
+_MINIMUM_CHUNK_WAV_BYTES: int = 1000
+# Minimum valid WAV file size. Files smaller than this are corrupted.
+
+
+def _validate_chunk_file(path: str) -> bool:
+    """Returns True if the chunk WAV file exists and is not corrupted.
+
+    Args:
+        path: File path to validate.
+
+    Returns:
+        True if file exists and is >= _MINIMUM_CHUNK_WAV_BYTES bytes.
+    """
+    if not os.path.exists(path):
+        return False
+    size = os.path.getsize(path)
+    if size < _MINIMUM_CHUNK_WAV_BYTES:
+        logger.warning(
+            "Chunk file too small (%d bytes, minimum %d): %s. "
+            "Treating as corrupted and re-synthesizing.",
+            size, _MINIMUM_CHUNK_WAV_BYTES, path,
+        )
+        return False
+    return True
+
 
 _disk_io_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=2,
@@ -370,7 +395,7 @@ def run_chapter_pipeline(
         import soundfile
         for idx, chunk_list in enumerate(all_chunks):
             chunk_path = os.path.join(out_dir, f"chunk_ch_{chapter_index}_{idx}.wav")
-            if idx in completed_chunks and os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
+            if idx in completed_chunks and _validate_chunk_file(chunk_path):
                 try:
                     info = soundfile.info(chunk_path)
                     cached_results[idx] = _SynthResult(idx, audio=chunk_path, duration=info.duration)

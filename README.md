@@ -13,6 +13,8 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 
 ## ✨ Features
 
+- **Kaggle & Cloud Pre-Flight Environment Checker (`preflight.py`)** — Validates the full execution environment in under 30 seconds before any model loading or generation begins. Verifies Python version, PyTorch, CUDA count, bfloat16 hardware support, transformers API (`BitsAndBytesConfig`), soundfile, FFmpeg, voice_ref type/existence, and Python 3.12 dict view picklability. Immediately reports errors with recommendations before spending GPU hours.
+- **Stale Checkpoint Recovery & Voice Ref Hash Caching** — Validates chunk WAV integrity (`_validate_chunk_file`) to detect missing or corrupted files on disk and automatically re-synthesizes them. SHA-256 hash caching (`_VOICE_REF_CACHE`) prevents redundant temporary WAV writes across chunk synthesis calls.
 - **Thread-Safe Atomic Progress I/O (`progress_io.py`)** — Dedicated, thread-safe file I/O layer for `generation_progress.json`. Uses atomic writes (temp file + `os.replace()`), module-level write lock (`_WRITE_LOCK`), UTF-8 BOM auto-decoding, leading garbage stripping, HTML detection, and an atomic read-inside-lock pattern to eliminate TOCTOU race conditions under concurrent GPU execution.
 - **Config Contract Schema Versioning (`AudiobookConfig`)** — Versioned config contract (`_CONFIG_SCHEMA_VERSION = 5`) with hardened `from_dict()` construction, backward-compatible default fallback, unknown key filtering, and human-readable `field_summary()` diagnostics.
 - **Eager Multi-GPU Pool Warmup & Self-Healing (`GPUPoolManager`)** — Parallel model warmup via `ThreadPoolExecutor` during pool creation. Failed/OOM GPU instances are automatically detected and pruned from the active pool, allowing healthy GPUs to continue synthesizing without failing the job.
@@ -89,6 +91,7 @@ AudiobookMaker/
 │   ├── server.py                         ← FastAPI server (task queue, WebSocket progress streaming)
 │   └── worker.py                         ← Background task consumer (concurrent GPU queue)
 └── audiobook_factory/
+    ├── preflight.py                      ← Automated pre-flight environment validator (<30s check)
     ├── chapter_pipeline.py               ← 3-stage overlapped pipeline & chunk-level resume manager
     ├── extractor_engine.py               ← Core AI text extraction engine
     │                                        (DocumentIngestor, MLClassifier, TextNormalizer)
@@ -417,6 +420,12 @@ Modern versions of Gradio implement sandbox security checks that restrict browse
 ---
 
 ## 📝 Recent Changes
+
+### 🛡️ Kaggle Compatibility & Pre-Flight Validation (v1.2)
+- **Pre-Flight Environment Validator (`preflight.py`)**: `run_preflight_checks()` validates Python, PyTorch, CUDA count, bfloat16 hardware support, transformers API, soundfile, FFmpeg, voice reference, and Python 3.12 dict view picklability in under 30 seconds before model loading.
+- **Voice Reference Safety & Hash Caching**: Implemented `BaseTTSProvider._validate_voice_ref()` boundary validation and SHA-256 hash caching (`_VOICE_REF_CACHE`) in `_resolve_voice_ref()` to prevent redundant temp file writes on disk.
+- **Stale Checkpoint Detection**: Added `_validate_chunk_file()` (minimum size guard = 1,000 bytes). Missing or corrupted chunk files on disk are automatically detected, reported with a stale checkpoint warning, and re-synthesized.
+- **Python 3.12 Pickling Support**: Extended `_sanitize_dict_keys()` to cover `dict_keys`, `dict_values`, and `dict_items` view objects across model and generation configs.
 
 ### ⚡ 3-Stage Overlapped Chapter Pipeline & Chunk-Level Resume
 - **3-Stage Overlapped Architecture**: Implemented `chapter_pipeline.py`, featuring CPU text preparation (Stage A), parallel GPU batch synthesis workers (Stage B), and streaming partial mastering with async disk I/O (Stage C).

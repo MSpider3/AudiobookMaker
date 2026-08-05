@@ -24,42 +24,61 @@ _TORCH_COMPILE_MODE: str = "max-autotune"
 
 import hashlib
 
-def _sanitize_dict_keys(obj: Any) -> None:
-    """Recursively converts any dict_keys attributes or dict values on obj to lists.
+_VOICE_REF_CACHE: dict[str, str] = {}
 
-    Fixes Python 3.12 pickling error ('cannot pickle dict_keys object') when transformers,
-    accelerate, or PyTorch deepcopy/pickle model configs or generation configs.
+
+def _sanitize_dict_keys(obj: Any) -> None:
+    """Converts dict view objects to lists in model config attributes.
+
+    Python 3.12 introduced stricter pickling that rejects dict_keys,
+    dict_values, and dict_items view objects. HuggingFace transformers
+    may store these internally in GenerationConfig. This method runs
+    once after model loading to make all config attributes picklable.
+
+    Covers: obj, obj.config, obj.generation_config.
     """
     if obj is None:
         return
-    try:
-        if hasattr(obj, "__dict__"):
-            for k, v in list(obj.__dict__.items()):
-                if type(v).__name__ == "dict_keys":
-                    setattr(obj, k, list(v))
-                elif isinstance(v, dict):
-                    for dk, dv in list(v.items()):
-                        if type(dv).__name__ == "dict_keys":
-                            v[dk] = list(dv)
-        for child_name in ("model", "config", "generation_config"):
-            child = getattr(obj, child_name, None)
-            if child is not None and child is not obj:
-                _sanitize_dict_keys(child)
-    except Exception:
-        pass
+    _VIEW_TYPES = (type({}.keys()), type({}.values()), type({}.items()))
+
+    def _sanitize_obj(target: Any) -> None:
+        if target is None or not hasattr(target, "__dict__"):
+            return
+        for attr_name, value in list(vars(target).items()):
+            if isinstance(value, _VIEW_TYPES):
+                setattr(target, attr_name, list(value))
+            elif isinstance(value, dict):
+                for k, v in list(value.items()):
+                    if isinstance(v, _VIEW_TYPES):
+                        value[k] = list(v)
+
+    _sanitize_obj(obj)
+    _sanitize_obj(getattr(obj, "config", None))
+    _sanitize_obj(getattr(obj, "generation_config", None))
+    if hasattr(obj, "model"):
+        _sanitize_obj(obj.model)
+        _sanitize_obj(getattr(obj.model, "config", None))
+        _sanitize_obj(getattr(obj.model, "generation_config", None))
 
 
 class QwenTTSProvider(BaseTTSProvider):
     """Local Qwen3-TTS provider supporting all model variants (Base, CustomVoice, VoiceDesign)."""
 
-    def __init__(self, config: AudiobookConfig, device: str | None = None) -> None:
+    def __init__(
+        self,
+        config: AudiobookConfig,
+        device: str | None = None,
+        dtype_override: str | None = None,
+    ) -> None:
         """Initialize the Qwen3-TTS provider instance.
 
         Args:
             config: AudiobookConfig settings.
             device: Target torch device string (e.g. "cuda:0", "cuda:1", "cpu").
+            dtype_override: Optional torch_dtype string ("float16", "bfloat16", "float32").
         """
         super().__init__(config)
+        self._dtype_override: str | None = dtype_override
         self._init_with_device(device or getattr(config, "device", "cuda"), config)
 
     def _init_with_device(self, device: str, config: AudiobookConfig) -> None:
@@ -73,17 +92,23 @@ class QwenTTSProvider(BaseTTSProvider):
         self._lock: threading.Lock = threading.Lock()
 
     @classmethod
-    def create_for_device(cls, device: str, config: AudiobookConfig) -> QwenTTSProvider:
+    def create_for_device(
+        cls,
+        device: str,
+        config: AudiobookConfig,
+        dtype_override: str | None = None,
+    ) -> QwenTTSProvider:
         """Factory classmethod: constructs a QwenTTSProvider instance pinned to `device`.
 
         Args:
             device: Target torch device string (e.g. "cuda:0", "cuda:1", "cpu").
             config: AudiobookConfig settings.
+            dtype_override: Optional torch_dtype string ("float16", "bfloat16", "float32").
 
         Returns:
             An instantiated QwenTTSProvider pinned to the device.
         """
-        return cls(config, device=device)
+        return cls(config, device=device, dtype_override=dtype_override)
 
     @property
     def device(self) -> str:
@@ -102,24 +127,28 @@ class QwenTTSProvider(BaseTTSProvider):
         """Resolves a voice reference (file path string or raw WAV bytes) into a valid file path string.
 
         If voice_ref is raw bytes, writes it to a cached temporary .wav file (keyed by SHA256)
-        and returns the file path string. This ensures extract_x_vector and generate_voice_clone
-        receive a valid file path string expected by qwen_tts.
+        and returns the file path string. Subsequent calls with the same bytes return the cached path.
         """
         if not voice_ref:
             return None
         if isinstance(voice_ref, str):
             return voice_ref
         if isinstance(voice_ref, bytes):
-            import hashlib
             import os
             import tempfile
             key = hashlib.sha256(voice_ref).hexdigest()[:16]
+            if key in _VOICE_REF_CACHE:
+                cached = _VOICE_REF_CACHE[key]
+                if os.path.exists(cached) and os.path.getsize(cached) > 0:
+                    return cached
             temp_path = os.path.join(tempfile.gettempdir(), f"qwen_voiceref_{key}.wav")
             if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
                 with open(temp_path, "wb") as f:
                     f.write(voice_ref)
+            _VOICE_REF_CACHE[key] = temp_path
+            logger.debug("Voice ref cached to %s", temp_path)
             return temp_path
-        return str(voice_ref)
+        raise ValueError(f"voice_ref must be bytes or str, got {type(voice_ref).__name__}")
 
     def _ensure_x_vector_cached(self, voice_ref: str | bytes) -> str | None:
         """Pre-compute and cache the speaker x-vector for the reference voice.
@@ -176,6 +205,7 @@ class QwenTTSProvider(BaseTTSProvider):
         return_bytes: bool = False,
     ) -> tuple[str | bytes, float]:
         """Synthesize speech for input text and write output WAV file or return PCM bytes."""
+        self._validate_voice_ref(voice_ref or self.config.voice_file)
         import io
         import soundfile as sf
         import torch
@@ -274,6 +304,7 @@ class QwenTTSProvider(BaseTTSProvider):
         Thread-safe via self._lock. Caller must hold exclusive ownership of
         this provider — do not call from two threads simultaneously.
         """
+        self._validate_voice_ref(voice_ref or self.config.voice_file)
         # Guard: ensure model is initialized before lock acquisition
         if self._model is None:
             logger.warning(
@@ -440,12 +471,19 @@ class QwenTTSProvider(BaseTTSProvider):
                 "quantization_config": BitsAndBytesConfig(load_in_8bit=True),
             }
         import torch
-        supports_bf16 = (
-            torch.cuda.is_available()
-            and hasattr(torch.cuda, "is_bf16_supported")
-            and torch.cuda.is_bf16_supported()
-        )
-        dtype = torch.bfloat16 if supports_bf16 else torch.float16
+        if getattr(self, "_dtype_override", None) == "float16":
+            dtype = torch.float16
+        elif getattr(self, "_dtype_override", None) == "bfloat16":
+            dtype = torch.bfloat16
+        elif getattr(self, "_dtype_override", None) == "float32":
+            dtype = torch.float32
+        else:
+            supports_bf16 = (
+                torch.cuda.is_available()
+                and hasattr(torch.cuda, "is_bf16_supported")
+                and torch.cuda.is_bf16_supported()
+            )
+            dtype = torch.bfloat16 if supports_bf16 else torch.float16
         return {
             "device_map": self._device,
             "torch_dtype": dtype,
