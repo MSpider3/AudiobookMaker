@@ -105,7 +105,13 @@ class _ProgressState:
             self._done += 1
             done = self._done
         if self.callback is not None:
-            self.callback(done, self.total)
+            try:
+                self.callback(done, self.total)
+            except TypeError:
+                try:
+                    self.callback(done / self.total if self.total > 0 else 0.0)
+                except Exception as exc:
+                    logger.warning("Progress callback failed: %s", exc)
 
 
 def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConfig) -> None:
