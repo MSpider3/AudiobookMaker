@@ -129,8 +129,7 @@ def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConf
             data, sr = sf.read(p, dtype="float32")
             if len(data) > 0:
                 segments.append(data)
-                if i < len(valid_paths) - 1:
-                    segments.append(pause_samples)
+                segments.append(pause_samples)
         except Exception as exc:
             logger.warning("Failed to read chunk %s during partial concat: %s", p, exc)
     if segments:
