@@ -83,6 +83,9 @@ class QwenTTSProvider(BaseTTSProvider):
 
     def _init_with_device(self, device: str, config: AudiobookConfig) -> None:
         """Initialize instance variables pinned to target device."""
+        from audiobook_factory.preflight import _apply_python312_pickle_patch
+        _apply_python312_pickle_patch()
+
         import torch
         self.config = config
         self._device: str = device

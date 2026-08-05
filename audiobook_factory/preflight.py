@@ -14,6 +14,67 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["run_preflight_checks", "PreflightResult", "PreflightError"]
 
+_PICKLE_PATCH_APPLIED: bool = False
+# Module-level flag preventing duplicate registration.
+
+
+def _apply_python312_pickle_patch() -> None:
+    """Registers pickle reducers for dict view types on Python 3.12+.
+
+    Python 3.12 introduced stricter pickling that rejects dict_keys,
+    dict_values, and dict_items view objects. HuggingFace transformers
+    uses copy.deepcopy() internally during from_pretrained() which
+    triggers this failure on Python 3.12, crashing model loading before
+    any post-load sanitization can run.
+
+    This function registers copyreg reducers that convert these view
+    objects to plain lists whenever pickle or deepcopy encounters them.
+    Once registered, the patch applies globally for the entire process
+    lifetime — all subsequent pickle and deepcopy calls handle these
+    types correctly, including those inside third-party libraries.
+
+    Safe to call multiple times — applies only once per process.
+    Safe to call on Python < 3.12 — copyreg.pickle is a no-op if the
+    type already supports pickling natively.
+
+    Must be called BEFORE any transformers model loading.
+    """
+    global _PICKLE_PATCH_APPLIED
+    if _PICKLE_PATCH_APPLIED:
+        return
+
+    import copyreg
+    import sys
+
+    _dict_keys_type = type({}.keys())
+    _dict_values_type = type({}.values())
+    _dict_items_type = type({}.items())
+
+    def _reduce_to_list(obj):
+        """Reducer: converts any dict view to a list for pickling."""
+        return (list, (list(obj),))
+
+    try:
+        copyreg.pickle(_dict_keys_type, _reduce_to_list)
+        copyreg.pickle(_dict_values_type, _reduce_to_list)
+        copyreg.pickle(_dict_items_type, _reduce_to_list)
+        _PICKLE_PATCH_APPLIED = True
+        logger.info(
+            "[preflight] Python 3.12 pickle patch applied "
+            "(dict_keys, dict_values, dict_items → list). "
+            "Python %d.%d.%d",
+            *sys.version_info[:3],
+        )
+    except Exception as exc:
+        # copyreg.pickle may fail if the type has a conflicting
+        # __reduce__ already registered. Log and continue — the
+        # patch is best-effort.
+        logger.warning(
+            "[preflight] Could not apply Python 3.12 pickle patch: %s. "
+            "Model loading may fail on dict view objects.",
+            exc,
+        )
+
 
 @dataclass
 class PreflightResult:
@@ -252,27 +313,42 @@ def _check_voice_ref_type(voice_ref: object) -> tuple[bool, str]:
 
 
 def _check_dict_keys_picklability() -> tuple[bool, str]:
-    """Checks whether dict_keys objects are picklable in this Python version.
-
-    Python 3.12 introduced stricter pickling that rejects dict_keys views.
-    HuggingFace transformers GenerationConfig may store dict_keys internally.
-    This check detects the issue before model loading.
+    """Checks dict view picklability and verifies the patch is applied.
 
     Returns:
-        Tuple of (passed, message). Never fatal — will apply sanitization.
+        Tuple of (passed, message). Always returns passed=True.
+        The patch is applied in run_preflight_checks() before this runs.
     """
     import pickle
     import sys
+
+    # Apply patch first (no-op if already applied)
+    _apply_python312_pickle_patch()
+
     v = sys.version_info
-    test_keys = {"a": 1, "b": 2}.keys()
-    try:
-        pickle.dumps(test_keys)
-        return True, f"dict_keys picklable on Python {v.major}.{v.minor}"
-    except (TypeError, Exception):
+    test_cases = [
+        ("dict_keys", {"a": 1}.keys()),
+        ("dict_values", {"a": 1}.values()),
+        ("dict_items", {"a": 1}.items()),
+    ]
+    still_failing = []
+    for name, obj in test_cases:
+        try:
+            pickle.dumps(obj)
+        except (TypeError, Exception):
+            still_failing.append(name)
+
+    if still_failing:
+        # Patch failed to register for these types
         return True, (
-            f"Python {v.major}.{v.minor}: dict_keys not picklable — "
-            "model config sanitization will be applied automatically after loading"
-        )  # warning, not error — we handle this in _sanitize_dict_keys()
+            f"Python {v.major}.{v.minor}: "
+            f"pickle patch incomplete — {', '.join(still_failing)} "
+            "still not picklable. Model loading may fail."
+        )
+    return True, (
+        f"Python {v.major}.{v.minor}: "
+        "dict views picklable (patch active)"
+    )
 
 
 def run_preflight_checks(
@@ -294,6 +370,10 @@ def run_preflight_checks(
     Raises:
         PreflightError: If any fatal checks fail. Contains the full result.
     """
+    # Apply Python 3.12 pickle patch BEFORE anything else.
+    # This must run before any transformers model loading.
+    _apply_python312_pickle_patch()
+
     import sys
     errors: list[str] = []
     warnings: list[str] = []
