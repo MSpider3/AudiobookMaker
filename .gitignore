@@ -37,13 +37,7 @@ env/
 chapter_classifier.json
 
 # ── Input books ───────────────────────────────────────────────────────────────
-# Keep the folder structure but ignore actual book files
-LOTM/*.epub
-LOTM/*.mobi
-LOTM/*.pdf
-LOTM/*.docx
-LOTM/*.odt
-LOTM/*.txt
+LOTM/
 
 # ── Voice samples ─────────────────────────────────────────────────────────────
 narrator_voice/
@@ -52,6 +46,11 @@ audiobook_output/narrator_voice_processed.wav
 
 # ── Generated audiobook output ────────────────────────────────────────────────
 audiobook_output/
+
+# ── Scratch / test data ───────────────────────────────────────────────────────
+scratch/
+test_narrator_voices/
+tests/
 
 # ── Debug / extraction output ─────────────────────────────────────────────────
 debug_extraction_output/
@@ -64,9 +63,10 @@ desktop.ini
 *.swp
 *~
 
-# ── IDEs ─────────────────────────────────────────────────────────────────────
+# ── IDEs / agent workspaces ──────────────────────────────────────────────────
 .vscode/
 .idea/
+.hermes/
 *.sublime-project
 *.sublime-workspace
 

@@ -78,20 +78,53 @@ from audiobook_factory.utils import format_lrc_timestamp
 _MAX_PARALLEL_CHAPTERS: int = 0
 # 0 = auto (matches GPU count). >0 = override. Set at module level.
 
-def _get_chapter_parallelism(pool: Any) -> int:
+def _get_chapter_parallelism(
+    pool: Any,
+    config: AudiobookConfig | None = None,
+) -> int:
     """Returns the number of chapters to process simultaneously.
 
-    Equals pool.device_count when _MAX_PARALLEL_CHAPTERS == 0.
-    Capped at pool.device_count to prevent VRAM contention.
+    When parallel_mode="chunks" (default): returns 1, meaning one
+    chapter is processed at a time with ALL GPUs splitting its chunks
+    via Stage A's static contiguous distribution. pinned_device=None
+    must be passed to the chapter pipeline for this to take effect.
+
+    When parallel_mode="chapters": returns pool.device_count, meaning
+    multiple chapters run simultaneously with each chapter pinned to
+    one GPU. Each chapter uses only its assigned GPU.
+
+    Args:
+        pool: The active ProviderPool with device count information.
+        config: AudiobookConfig controlling parallelism mode.
+                If None, defaults to "chunks" behavior.
 
     Returns:
-        Number of chapters to process in parallel (always >= 1).
+        Integer >= 1. Number of concurrent chapter pipelines.
     """
     if pool is None or not hasattr(pool, "device_count") or pool.device_count <= 0:
         return 1
+
     if _MAX_PARALLEL_CHAPTERS > 0:
-        return max(1, min(_MAX_PARALLEL_CHAPTERS, pool.device_count))
-    return max(1, pool.device_count)
+        return min(_MAX_PARALLEL_CHAPTERS, pool.device_count)
+
+    parallel_mode = getattr(config, "parallel_mode", "chunks")
+
+    if parallel_mode == "chapters":
+        logger.info(
+            "[pipeline] Chapter-mode: %d chapters simultaneously, "
+            "one GPU per chapter.",
+            pool.device_count,
+        )
+        return pool.device_count
+
+    # Default: "chunks" mode — one chapter at a time, all GPUs
+    # split the chapter's chunks across devices.
+    logger.info(
+        "[pipeline] Chunk-mode: 1 chapter at a time, all %d GPU(s) "
+        "splitting chunks via Stage A static distribution.",
+        pool.device_count,
+    )
+    return 1
 
 
 _CONFIG_SCHEMA_VERSION: int = 5
@@ -575,7 +608,7 @@ def run_pipeline(
             _update_chapter_prog(idx, 1.0)
 
     try:
-        max_parallel = _get_chapter_parallelism(pool)
+        max_parallel = _get_chapter_parallelism(pool, config)
         if max_parallel > 1:
             log(f"[Pipeline] 🚀 Inter-chapter parallelism active: processing up to {max_parallel} chapters simultaneously...")
             devices = pool.devices if pool else []
@@ -602,7 +635,7 @@ def run_pipeline(
                 if cancel.is_cancelled:
                     log("[Pipeline] ⛔ Cancelled.")
                     break
-                _process(t)
+                _process(t, pinned_device=None)
 
         progress(total, total)
 
