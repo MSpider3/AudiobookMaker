@@ -71,8 +71,65 @@ from audiobook_factory.progress_io import (
     write_progress_file,
     update_chapter_status,
     update_chapter_chunk,
+    update_chapter_retry,
 )
 from audiobook_factory.utils import format_lrc_timestamp
+
+_MINIMUM_CHAPTER_WAV_BYTES: int = 10_000
+
+
+def _mark_chapter_completed(progress_path: str, chapter_num: int, output_wav_path: str) -> None:
+    """Validates chapter output WAV and marks chapter completed in progress JSON.
+
+    Enforces file existence and minimum file size (_MINIMUM_CHAPTER_WAV_BYTES).
+    Does not update status if file is missing or corrupted.
+    """
+    if not output_wav_path or not os.path.exists(output_wav_path):
+        logger.warning(
+            "[Pipeline] Cannot mark chapter %d completed — file not found: %s",
+            chapter_num, output_wav_path,
+        )
+        return
+    size = os.path.getsize(output_wav_path)
+    if size < _MINIMUM_CHAPTER_WAV_BYTES:
+        logger.warning(
+            "[Pipeline] Cannot mark chapter %d completed — WAV size too small (%d < %d bytes): %s",
+            chapter_num, size, _MINIMUM_CHAPTER_WAV_BYTES, output_wav_path,
+        )
+        return
+    try:
+        update_chapter_status(progress_path, chapter_num, "completed", reset_chunks=True)
+    except Exception as exc:
+        logger.debug("[Pipeline] Could not update chapter %d status in %s: %s", chapter_num, progress_path, exc)
+
+
+def _finalize_progress_file(progress_path: str, chapters: list) -> None:
+    """Writes top-level generation_summary to progress JSON on run completion."""
+    if not os.path.exists(progress_path):
+        return
+    try:
+        data = read_progress_file(progress_path)
+        chapter_entries = data.get("chapters", [])
+        completed_count = sum(1 for c in chapter_entries if c.get("status") == "completed")
+        failed_entries = [c for c in chapter_entries if c.get("status") == "failed"]
+        failed_count = len(failed_entries)
+        failed_chapters = [c.get("num") for c in failed_entries if c.get("num") is not None]
+        total_ch = len(chapter_entries) if chapter_entries else len(chapters)
+        all_complete = (completed_count == total_ch and total_ch > 0)
+
+        from datetime import datetime, timezone
+        data["generation_summary"] = {
+            "total_chapters": total_ch,
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "failed_chapters": failed_chapters,
+            "all_complete": all_complete,
+            "finalized_at": datetime.now(timezone.utc).isoformat(),
+        }
+        write_progress_file(progress_path, data)
+    except Exception as exc:
+        logger.warning("[Pipeline] Could not finalize progress file %s: %s", progress_path, exc)
+
 
 
 _MAX_PARALLEL_CHAPTERS: int = 0
@@ -127,7 +184,7 @@ def _get_chapter_parallelism(
     return 1
 
 
-_CONFIG_SCHEMA_VERSION: int = 5
+_CONFIG_SCHEMA_VERSION: int = 6
 # Increment this integer whenever AudiobookConfig fields are added,
 # removed, or renamed. Used to detect stale generation_progress.json
 # files from older versions.
@@ -166,10 +223,11 @@ class AudiobookConfig:
     lufs:                int   = -18
     true_peak:           float = -1.5
 
-    # ── Parallelism ───────────────────────────────────────────────────────────
+    # ── Parallelism & Hardware Optimization ───────────────────────────────────
     worker_count:        int   = 1       # chapters/chunks in parallel
     parallel_mode:       str   = "chunks" # "chapters" | "chunks"
     gpu_count:           int   = 0       # 0 = auto-detect at runtime
+    vram_headroom_gb:    float = 2.0     # GB reserved VRAM headroom for dynamic batching
 
     # ── Multi-Model Qwen3 ─────────────────────────────────────────────────────
     device:              str   = "cuda"
@@ -184,6 +242,10 @@ class AudiobookConfig:
     export_srt:          bool  = False   # write .srt subtitles
     export_vtt:          bool  = False   # write .webvtt subtitles
     single_file_mode:    bool  = False   # combine all into one big file
+
+    # ── Retries & Resilience ──────────────────────────────────────────────────
+    max_chapter_retries: int   = 2       # Max retry attempts per chapter on failure
+    retry_failed_at_end: bool  = True    # Run a final pass for remaining failed chapters at end of pipeline
 
     # ── Misc ──────────────────────────────────────────────────────────────────
     force_reprocess:          bool  = False  # When True, forces re-extraction & re-synthesis of all chunks from scratch
@@ -579,31 +641,29 @@ def run_pipeline(
 
         log(f"\n[Chapter {idx}/{total}] '{chapter.title}'")
         try:
-            path = _process_chapter(
-                config, chapter, idx, total, log, cancel, provider, pool=pool,
+            path = _process_chapter_with_retry(
+                config=config,
+                chapter=chapter,
+                idx=idx,
+                total=total,
+                log=log,
+                cancel=cancel,
+                provider=provider,
+                pool=pool,
                 prog_cb=lambda f: _update_chapter_prog(idx, f),
                 pinned_device=pinned_device,
                 subtitle_futures=subtitle_futures,
                 subtitle_futures_lock=subtitle_futures_lock,
                 completed_chunks=completed_chunks,
+                prog_path_out=prog_path_out,
+                prog_path_tmp=prog_path_tmp,
             )
             if path:
                 with _lock:
-                    output_files.append(path)
+                    if path not in output_files:
+                        output_files.append(path)
                 log(f"[Chapter {idx}/{total}] ✅ → {os.path.basename(path)}")
-                
-                # Update checkpoint files
-                for p in [prog_path_out, prog_path_tmp]:
-                    try:
-                        update_chapter_status(p, idx, "completed", reset_chunks=True)
-                    except Exception as exc:
-                        logger.debug("Could not update progress file: %s", exc)
             return path
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            log(f"[Chapter {idx}/{total}] ❌ Error: {e}")
-            return None
         finally:
             _update_chapter_prog(idx, 1.0)
 
@@ -644,6 +704,29 @@ def run_pipeline(
             output_files.sort()
             return output_files
 
+        # ── End-of-Run Retry Pass ─────────────────────────────────────────────────
+        if getattr(config, "retry_failed_at_end", True) and not cancel.is_cancelled:
+            try:
+                curr_prog = read_progress_file(prog_path_out)
+                failed_tasks = []
+                for t in tasks:
+                    t_idx, _ = t
+                    for c in curr_prog.get("chapters", []):
+                        if (c.get("num") == t_idx or str(c.get("num")) == str(t_idx)) and c.get("status") == "failed":
+                            failed_tasks.append(t)
+                            break
+                if failed_tasks:
+                    log(f"\n[Pipeline] 🔄 End-of-run retry pass starting for {len(failed_tasks)} failed chapter(s)...")
+                    for t in failed_tasks:
+                        if cancel.is_cancelled:
+                            break
+                        t_idx, _ = t
+                        for p in [prog_path_out, prog_path_tmp]:
+                            update_chapter_status(p, t_idx, "pending")
+                        _process(t, pinned_device=None)
+            except Exception as exc:
+                logger.warning("[Pipeline] End-of-run retry pass encountered error: %s", exc)
+
         # ── Single File Mode (Combine all chapters) ───────────────────────────────
         if config.single_file_mode and len(output_files) > 1:
             log("\n[Pipeline] 📦 Combining chapters into a single file...")
@@ -683,6 +766,8 @@ def run_pipeline(
         return output_files
 
     finally:
+        for p in [prog_path_out, prog_path_tmp]:
+            _finalize_progress_file(p, chapters)
         _await_subtitle_futures(subtitle_futures, cancel)
         if provider is not None:
             try:
@@ -800,8 +885,88 @@ def _await_subtitle_futures(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Chapter processing
+# Chapter processing & retries
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _process_chapter_with_retry(
+    config: AudiobookConfig,
+    chapter: ExtractedChapter,
+    idx: int,
+    total: int,
+    log: Callable[[str], None],
+    cancel: CancelToken,
+    provider: Any = None,
+    pool: Any = None,
+    prog_cb: Callable[[float], None] | None = None,
+    pinned_device: str | None = None,
+    subtitle_futures: list | None = None,
+    subtitle_futures_lock: Any = None,
+    completed_chunks: list[int] | None = None,
+    prog_path_out: str | None = None,
+    prog_path_tmp: str | None = None,
+) -> str | None:
+    """Wraps _process_chapter with automatic retry logic and backoff.
+
+    Retries up to config.max_chapter_retries times. Clears CUDA cache before retrying.
+    Updates progress JSON with retry count and error messages on failure.
+    """
+    max_attempts = max(1, config.max_chapter_retries + 1)
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        if cancel.is_cancelled:
+            break
+
+        if attempt > 1:
+            backoff = min(30, 5 * (attempt - 1))
+            log(f"  [Ch{idx}] 🔄 Retry attempt {attempt}/{max_attempts} after {backoff}s backoff...")
+            import time
+            time.sleep(backoff)
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        try:
+            path = _process_chapter(
+                config, chapter, idx, total, log, cancel, provider, pool=pool,
+                prog_cb=prog_cb,
+                pinned_device=pinned_device,
+                subtitle_futures=subtitle_futures,
+                subtitle_futures_lock=subtitle_futures_lock,
+                completed_chunks=completed_chunks if attempt == 1 else [],
+            )
+
+            if path and os.path.exists(path) and os.path.getsize(path) >= _MINIMUM_CHAPTER_WAV_BYTES:
+                for p in [prog_path_out, prog_path_tmp]:
+                    if p:
+                        _mark_chapter_completed(p, idx, path)
+                return path
+            else:
+                msg = f"Output WAV file missing or under size threshold ({_MINIMUM_CHAPTER_WAV_BYTES} bytes)"
+                last_error = RuntimeError(msg)
+                log(f"  [Ch{idx}] ⚠ Attempt {attempt} failed: {msg}")
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            last_error = exc
+            log(f"  [Ch{idx}] ❌ Attempt {attempt} failed with error: {exc}")
+
+        # Persist retry details to progress JSON
+        for p in [prog_path_out, prog_path_tmp]:
+            if p:
+                try:
+                    update_chapter_retry(p, idx, attempt, str(last_error or "Unknown error"))
+                except Exception as e:
+                    logger.debug("Could not write retry status to %s: %s", p, e)
+
+    log(f"[Chapter {idx}/{total}] ❌ Failed after {max_attempts} attempts.")
+    return None
+
 
 def _process_chapter(
     config:  AudiobookConfig,

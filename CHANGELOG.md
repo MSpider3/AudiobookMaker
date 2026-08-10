@@ -4,6 +4,21 @@ All notable changes to **AudiobookMaker** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.3.0] - 2026-08-11
+
+### ⚡ Added
+- **Fail-Safe Chapter Retry System with Exponential Backoff (`pipeline.py`, `progress_io.py`)**: Added automatic chapter-level retry handling (up to `config.max_chapter_retries` attempts) with CUDA memory flushing (`torch.cuda.empty_cache()` and `gc.collect()`) and backoff delays. Implemented `update_chapter_retry()` in `progress_io.py` to persist `retry_count` and `last_error` (truncated to 500 chars) under thread-safe write locks. Added an automatic end-of-run retry pass for remaining failed chapters (`retry_failed_at_end`).
+- **New Modular TTS Providers (`VibeVoice-1.5B` & `F5-TTS`)**: Added `VibeVoiceTTSProvider` (`vibevoice_provider.py`) for `bezzam/VibeVoice-1.5B-hf` and `F5TTSProvider` (`f5tts_provider.py`) for zero-shot voice cloning. Updated `get_tts_provider()` registry and exported all providers in `audiobook_factory.tts_providers`.
+- **Single-GPU VRAM Optimization & Dynamic Batching (`gpu_pool.py`)**: Added `vram_headroom_gb: float = 2.0` field to `AudiobookConfig` and updated `GPUDetector.suggest_batch_size()` to calculate free usable VRAM after headroom subtraction. Added preflight warnings for low-VRAM GPUs (<= 8.5 GB).
+- **Completion Validation & Top-Level Summary Finalizer (`pipeline.py`)**: Implemented `_mark_chapter_completed()` with minimum WAV file size guard (`_MINIMUM_CHAPTER_WAV_BYTES = 10_000`) and disk existence checks. Implemented `_finalize_progress_file()` writing a top-level `generation_summary` block (completed/failed counts, failed chapter numbers, ISO timestamp) to progress JSON.
+- **WebSocket Keep-Alive & Session End Event (`server.py`, `worker.py`, `app.py`)**: Added a 15-second background `_ws_keepalive()` ping loop in `api/server.py`, extended WebSocket connection closure grace period to 3.0s, and broadcasted `session_end` events from `api/worker.py`. Updated Gradio client loop (`app.py`) to process `session_end` and ignore `ping` messages.
+- **API Production Hardening & Graceful Shutdown (`server.py`, `worker.py`)**: Added `@app.on_event("shutdown")` in FastAPI server to flag active task cancellation tokens, allow checkpoint flushing, and shut down `GPUPoolManager`. Isolated task execution in `_run_task_safely()` in `api/worker.py`.
+
+### 🔄 Changed
+- Bumped `_CONFIG_SCHEMA_VERSION` from `5` to `6` in `audiobook_factory/pipeline.py`.
+- Updated Gradio UI TTS Provider dropdown in `app.py` to support `qwen`, `vibevoice`, and `f5tts`.
+- Extended unit test suite in `tests/test_hardening.py` to 51 tests covering completion guards, summary finalization, retry persistence, provider resolution, and VRAM headroom batch suggestions.
+
 ---
 
 ## [v1.2.0] - 2026-08-05

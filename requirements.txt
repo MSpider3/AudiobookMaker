@@ -30,6 +30,7 @@ huggingface-hub     # Model download
 einops              # Required for Qwen transformer ops
 qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git  # Direct from source
 bitsandbytes>=0.41.0  # INT8 model quantization support
+# f5-tts              # Optional F5-TTS provider backend
 # flash-attn        # Performance speedup (Installed via install scripts)
 
 # ── BookNLP (story / character analysis) ─────────────────────────────────────

@@ -137,6 +137,7 @@ class GPUDetector:
     def suggest_batch_size(
         device: str,
         base_chunk_chars: int = _DEFAULT_CHUNK_CHARS,
+        vram_headroom_gb: float = 2.0,
     ) -> int:
         """Suggests a TTS batch size based on available VRAM for the device.
 
@@ -146,6 +147,7 @@ class GPUDetector:
         Args:
             device: CUDA device string (e.g. "cuda:0") or "cpu".
             base_chunk_chars: Character count per TTS chunk (default: 399).
+            vram_headroom_gb: Headroom in GB to keep free (default: 2.0).
 
         Returns:
             Integer batch size suggestion for this device.
@@ -153,7 +155,7 @@ class GPUDetector:
         if device == "cpu":
             return _MIN_BATCH_SIZE
         info = GPUDetector.get_device_info(device)
-        free_gb = info["free_vram_gb"]
+        free_gb = max(0.0, info["free_vram_gb"] - vram_headroom_gb)
         chars_scaling = base_chunk_chars / _DEFAULT_CHUNK_CHARS if _DEFAULT_CHUNK_CHARS > 0 else 1.0
         denom = _VRAM_PER_CHUNK_GB * chars_scaling
         estimated_batches = int(free_gb / denom) if denom > 0 else _MIN_BATCH_SIZE

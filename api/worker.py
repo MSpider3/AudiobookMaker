@@ -148,11 +148,23 @@ async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
             if task.cancel_token.is_cancelled:
                 await task.update_status("cancelled")
                 await task.add_log("⛔ Generation task cancelled by user.")
+                await task.broadcast({
+                    "type": "session_end",
+                    "files": [],
+                    "task_id": task_id,
+                    "status": "cancelled",
+                })
             else:
                 task.output_files = out_files
                 await task.update_status("completed")
                 await task.add_log(f"✅ Generation complete. Processed {len(out_files)} files.")
                 await task.broadcast({"type": "completed", "files": out_files})
+                await task.broadcast({
+                    "type": "session_end",
+                    "files": out_files,
+                    "task_id": task_id,
+                    "status": "completed",
+                })
 
         except Exception as e:
             import traceback
@@ -161,9 +173,25 @@ async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
             task.error_message = str(e)
             await task.add_log(err_msg)
             await task.update_status("failed")
+            await task.broadcast({
+                "type": "session_end",
+                "files": [],
+                "task_id": task_id,
+                "status": "failed",
+                "error": str(e),
+            })
 
         finally:
             task_queue.task_done()
+
+
+async def _run_task_safely(task_id: str, sem: asyncio.Semaphore) -> None:
+    """Isolated task runner ensuring exceptions never crash the worker consumer loop."""
+    try:
+        await _process_single_task(task_id, sem)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("Unhandled exception in task runner for task %s: %s", task_id, exc)
 
 
 async def worker_loop() -> None:
@@ -177,4 +205,4 @@ async def worker_loop() -> None:
         task_id = await task_queue.get()
         active_gpu_count = _get_active_gpu_count()
         semaphore = _get_or_resize_semaphore(active_gpu_count)
-        asyncio.create_task(_process_single_task(task_id, semaphore))
+        asyncio.create_task(_run_task_safely(task_id, semaphore))

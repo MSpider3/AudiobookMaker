@@ -13,10 +13,15 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 
 ## ✨ Features
 
+- **Fail-Safe Chapter Retry System with Exponential Backoff (`pipeline.py`, `progress_io.py`)** — Configurable per-chapter retries (`max_chapter_retries: int = 2`) with CUDA cache clearing (`torch.cuda.empty_cache()` and `gc.collect()`), exponential backoff delay, thread-safe retry persistence (`update_chapter_retry`), and an automatic end-of-run retry pass (`retry_failed_at_end`).
+- **Pluggable Provider System (Qwen3-TTS, VibeVoice-1.5B, F5-TTS)** — Multi-provider architecture supporting Qwen3-TTS, VibeVoice-1.5B (`bezzam/VibeVoice-1.5B-hf`), and F5-TTS zero-shot voice cloning.
+- **Single-GPU VRAM Optimization & Dynamic Batching (`gpu_pool.py`)** — Configurable VRAM headroom (`vram_headroom_gb: float = 2.0`) to compute safe batch sizes on lower-memory GPUs (e.g. 8 GB cards). Includes preflight low-VRAM auto-detection warnings (<= 8.5 GB).
+- **Completion Validation & Top-Level Summary Finalizer (`pipeline.py`)** — Enforces minimum WAV file size guard (`_MINIMUM_CHAPTER_WAV_BYTES = 10_000`) and outputs a top-level `generation_summary` block (completed/failed counts, failed chapter numbers, ISO timestamp) to `generation_progress.json` upon run completion.
+- **WebSocket Keep-Alive & Session End Protocol** — Background keep-alive pings (15s) and dedicated `session_end` WebSocket events for cloud proxy reliability (Kaggle/Colab).
 - **Kaggle & Cloud Pre-Flight Environment Checker (`preflight.py`)** — Validates the full execution environment in under 30 seconds before any model loading or generation begins. Verifies Python version, PyTorch, CUDA count, bfloat16 hardware support, transformers API (`BitsAndBytesConfig`), soundfile, FFmpeg, voice_ref type/existence, and Python 3.12 dict view picklability. Immediately reports errors with recommendations before spending GPU hours.
 - **Stale Checkpoint Recovery & Voice Ref Hash Caching** — Validates chunk WAV integrity (`_validate_chunk_file`) to detect missing or corrupted files on disk and automatically re-synthesizes them. SHA-256 hash caching (`_VOICE_REF_CACHE`) prevents redundant temporary WAV writes across chunk synthesis calls.
 - **Thread-Safe Atomic Progress I/O (`progress_io.py`)** — Dedicated, thread-safe file I/O layer for `generation_progress.json`. Uses atomic writes (temp file + `os.replace()`), module-level write lock (`_WRITE_LOCK`), UTF-8 BOM auto-decoding, leading garbage stripping, HTML detection, and an atomic read-inside-lock pattern to eliminate TOCTOU race conditions under concurrent GPU execution.
-- **Config Contract Schema Versioning (`AudiobookConfig`)** — Versioned config contract (`_CONFIG_SCHEMA_VERSION = 5`) with hardened `from_dict()` construction, backward-compatible default fallback, unknown key filtering, and human-readable `field_summary()` diagnostics.
+- **Config Contract Schema Versioning (`AudiobookConfig`)** — Versioned config contract (`_CONFIG_SCHEMA_VERSION = 6`) with hardened `from_dict()` construction, backward-compatible default fallback, unknown key filtering, and human-readable `field_summary()` diagnostics.
 - **Eager Multi-GPU Pool Warmup & Self-Healing (`GPUPoolManager`)** — Parallel model warmup via `ThreadPoolExecutor` during pool creation. Failed/OOM GPU instances are automatically detected and pruned from the active pool, allowing healthy GPUs to continue synthesizing without failing the job.
 - **3-Stage Overlapped Pipeline & Chunk-Level Resume** — `chapter_pipeline.py` implements a high-throughput 3-stage pipeline (Stage A: CPU text preparation, Stage B: parallel GPU synthesis workers, Stage C: streaming audio mastering and async disk I/O). Sentence audio chunks are cached incrementally in `.temp_chunks/` — if interrupted, generation resumes mid-chapter without re-synthesizing completed chunks.
 - **Rust PyO3 SIMD Acceleration (`audiobook_rust`)** — High-performance Rust extension providing 5.5× faster audio mastering, SIMD sentence splitting, and ultra-fast text normalization compiled with `maturin` (with transparent Python fallbacks).
@@ -46,7 +51,7 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 - **`torch.compile()` Speed Optimization** — Enable kernel fusion rendering to compile Qwen3 TTS model via the GPU compiler, speeding up audio generation throughput on RTX GPUs.
 - **Smart Attention Backend** — Automatically detects whether `flash_attn` is installed. Uses **Flash Attention 2** if available, otherwise gracefully falls back to PyTorch's built-in **SDPA** — no crashes on T4 or other GPUs that don't have `flash_attn`.
 - **Re-generate missing files control** — New checkbox on the Generate tab lets you decide whether chapters marked "completed" but missing audio should be re-generated or silently skipped.
-- **Modular TTS provider system** — Qwen3-TTS built-in; async processing keeps your GPU at peak utilization.
+- **Modular TTS provider system** — Qwen3-TTS, VibeVoice-1.5B, and F5-TTS built-in; async processing keeps your GPU at peak utilization.
 - **Google Colab & Kaggle support** — Full end-to-end pipeline works directly in Google Colab (`AudiobookMaker_Colab.ipynb`) and Kaggle (`AudiobookMaker_Kaggle.ipynb`) with public shareable Gradio links.
 
 ---
@@ -107,7 +112,9 @@ AudiobookMaker/
     ├── utils.py                          ← Shared utilities (LRC timestamping, SRT formatting)
     └── tts_providers/                    ← Modular TTS provider abstraction
         ├── base_tts_provider.py          ← BaseTTSProvider ABC + get_tts_provider() factory
-        └── qwen_provider.py              ← QwenTTSProvider (per-device binding, Flash Attention 2 / SDPA auto-detect)
+        ├── qwen_provider.py              ← QwenTTSProvider (per-device binding, Flash Attention 2 / SDPA auto-detect)
+        ├── vibevoice_provider.py         ← VibeVoiceTTSProvider (bezzam/VibeVoice-1.5B-hf)
+        └── f5tts_provider.py             ← F5TTSProvider (f5_tts zero-shot voice cloning)
 ```
 
 ---
@@ -421,6 +428,14 @@ Modern versions of Gradio implement sandbox security checks that restrict browse
 
 ## 📝 Recent Changes
 
+### 🚀 Hardening, Fail-Safe Retries & New TTS Providers (v1.3)
+- **Fail-Safe Chapter Retry System (`pipeline.py`, `progress_io.py`)**: Automatic chapter retries (`max_chapter_retries: int = 2`) with CUDA cache clearing (`torch.cuda.empty_cache()` and `gc.collect()`), exponential backoff delay, retry persistence (`update_chapter_retry`), and end-of-run retry pass (`retry_failed_at_end`).
+- **Pluggable Provider Architecture & New TTS Providers**: Native support for **VibeVoice-1.5B** ([`bezzam/VibeVoice-1.5B-hf`](https://huggingface.co/bezzam/VibeVoice-1.5B-hf)) and **F5-TTS** ([`SWAVE-LAB/F5-TTS`](https://github.com/SWAVE-LAB/F5-TTS)) zero-shot voice cloning alongside Qwen3-TTS.
+- **Single-GPU VRAM Optimization**: Configurable reserved VRAM headroom (`vram_headroom_gb: float = 2.0`) to calculate safe batch sizes on lower-memory GPUs (e.g. 8 GB cards). Low-VRAM preflight warnings (<= 8.5 GB).
+- **Completion Validation & Progress Finalizer**: Enforces minimum WAV size guard (`_MINIMUM_CHAPTER_WAV_BYTES = 10_000`) and outputs a top-level `generation_summary` block (completed/failed counts, failed chapter numbers, ISO timestamp) to `generation_progress.json` upon run completion.
+- **WebSocket Keep-Alive & Session End Protocol**: Background 15s keep-alive pings (`{"type": "ping"}`) and dedicated `session_end` WebSocket events for cloud proxy reliability (Kaggle/Colab).
+- **FastAPI Graceful Shutdown & Task Error Isolation**: Added `@app.on_event("shutdown")` in FastAPI server to flag task cancellation, flush checkpoints, and shut down `GPUPoolManager`. Isolated worker task execution in `_run_task_safely()`.
+
 ### 🛡️ Kaggle Compatibility & Pre-Flight Validation (v1.2)
 - **Pre-Flight Environment Validator (`preflight.py`)**: `run_preflight_checks()` validates Python, PyTorch, CUDA count, bfloat16 hardware support, transformers API, soundfile, FFmpeg, voice reference, and Python 3.12 dict view picklability in under 30 seconds before model loading.
 - **Voice Reference Safety & Hash Caching**: Implemented `BaseTTSProvider._validate_voice_ref()` boundary validation and SHA-256 hash caching (`_VOICE_REF_CACHE`) in `_resolve_voice_ref()` to prevent redundant temp file writes on disk.
@@ -471,8 +486,14 @@ Modern versions of Gradio implement sandbox security checks that restrict browse
 This project would not have been possible without the incredible work from these projects:
 
 ### [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by QwenLM
-The voice cloning and TTS engine powering all audio generation in this project.
+The voice cloning and TTS engine powering high-quality audio generation.
 State-of-the-art text-to-speech with zero-shot voice cloning from a short reference clip.
+
+### [VibeVoice-1.5B](https://huggingface.co/bezzam/VibeVoice-1.5B-hf) by bezzam
+High-quality multi-lingual voice-cloning text-to-speech model integrated as a provider option in AudiobookMaker.
+
+### [F5-TTS](https://github.com/SWAVE-LAB/F5-TTS) by SWAVE-LAB
+Fast, lightweight zero-shot text-to-speech voice cloning model integrated as a provider option in AudiobookMaker.
 
 ### [Mangio-RVC-Fork](https://github.com/Mangio621/Mangio-RVC-Fork) by Mangio621
 The voice preprocessing pipeline in this project (noise reduction, noise gate, high-pass filter, silence removal, formant shifting) is directly inspired by the preprocessing architecture used in Mangio-RVC-Fork.

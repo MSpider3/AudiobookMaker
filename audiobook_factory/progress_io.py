@@ -11,6 +11,7 @@ __all__ = [
     "write_progress_file",
     "update_chapter_status",
     "update_chapter_chunk",
+    "update_chapter_retry",
 ]
 
 import json
@@ -230,6 +231,50 @@ def update_chapter_chunk(
                 "Failed to persist chunk completion for chapter %d chunk %d: %s",
                 chapter_num,
                 chunk_index,
+                exc,
+            )
+
+
+
+def update_chapter_retry(
+    path: str,
+    chapter_num: int,
+    attempt: int,
+    error_message: str,
+) -> None:
+    """Updates a chapter's retry count, last error, and status in progress JSON.
+
+    Thread-safe. Reads, modifies, and writes atomically under _WRITE_LOCK.
+
+    Args:
+        path: Path to generation_progress.json.
+        chapter_num: 1-based chapter number.
+        attempt: Retry attempt count.
+        error_message: Error string (truncated to 500 characters).
+    """
+    with _WRITE_LOCK:
+        try:
+            data = read_progress_file(path)
+        except (FileNotFoundError, ValueError) as exc:
+            logger.warning(
+                "Cannot update retry info — progress file unreadable: %s",
+                exc,
+            )
+            return
+
+        for ch in data.get("chapters", []):
+            if ch.get("num") == chapter_num or str(ch.get("num")) == str(chapter_num):
+                ch["retry_count"] = attempt
+                ch["last_error"] = str(error_message)[:500]
+                ch["status"] = "failed"
+                break
+
+        try:
+            _write_unlocked(path, data)
+        except OSError as exc:
+            logger.warning(
+                "Failed to write retry update for chapter %d: %s",
+                chapter_num,
                 exc,
             )
 

@@ -323,7 +323,9 @@ def _stage_b_device_worker(
 
             accumulated.append(item)
 
-            batch_size = GPUDetector.suggest_batch_size(device, config.max_len)
+            batch_size = GPUDetector.suggest_batch_size(
+                device, config.max_len, getattr(config, "vram_headroom_gb", 2.0)
+            )
             if len(accumulated) >= batch_size:
                 _flush_accumulated_batch(
                     accumulated, provider, voice_ref, config,

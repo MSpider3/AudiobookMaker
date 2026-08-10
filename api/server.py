@@ -62,6 +62,22 @@ async def startup_event():
     threading.Thread(target=_warmup_gpu_pool, daemon=True).start()
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("[API Server] Shutdown event triggered. Cancelling active tasks...")
+    for task_id, task in list(tasks.items()):
+        if task.status in ("queued", "running"):
+            task.cancel_token.cancel()
+            await task.add_log("⛔ Server shutdown requested. Cancelling task.")
+    await asyncio.sleep(5.0)
+    try:
+        from audiobook_factory.gpu_pool import GPUPoolManager
+        GPUPoolManager.instance().shutdown()
+        print("[API Server] GPUPoolManager shut down cleanly.")
+    except Exception as exc:
+        print(f"[API Server] GPUPoolManager shutdown warning: {exc}")
+
+
 from audiobook_factory.gpu_pool import GPUDetector, GPUPoolManager
 
 
@@ -239,6 +255,16 @@ async def task_websocket_endpoint(websocket: WebSocket, task_id: str):
     if task.status == "completed" and task.output_files:
         await websocket.send_json({"type": "completed", "files": task.output_files})
         
+    async def _ws_keepalive():
+        while True:
+            await asyncio.sleep(15.0)
+            try:
+                await websocket.send_json({"type": "ping"})
+            except Exception:
+                break
+
+    ping_task = asyncio.create_task(_ws_keepalive())
+
     try:
         while True:
             # Poll updates from the task channel queue and send to client
@@ -247,9 +273,9 @@ async def task_websocket_endpoint(websocket: WebSocket, task_id: str):
             ws_queue.task_done()
             
             # If task terminates, we can close the socket connection cleanly
-            if data.get("type") in ("completed", "status") and data.get("status") in ("completed", "failed", "cancelled"):
-                # Brief sleep to ensure any trailing logs finish sending
-                await asyncio.sleep(0.5)
+            if data.get("type") in ("completed", "session_end", "status") and data.get("status") in ("completed", "failed", "cancelled"):
+                # Grace period to ensure all network proxies process the completion payload
+                await asyncio.sleep(3.0)
                 break
                 
     except WebSocketDisconnect:
@@ -257,6 +283,7 @@ async def task_websocket_endpoint(websocket: WebSocket, task_id: str):
     except Exception as e:
         print(f"[WebSocket] Event transmission exception: {e}")
     finally:
+        ping_task.cancel()
         if ws_queue in task.subscribers:
             task.subscribers.remove(ws_queue)
         try:

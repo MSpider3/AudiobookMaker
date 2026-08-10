@@ -411,9 +411,9 @@ def build_app():
                 with gr.Row():
                     tts_provider_dd = gr.Dropdown(
                         label="TTS Provider",
-                        choices=["qwen"],
+                        choices=["qwen", "vibevoice", "f5tts"],
                         value="qwen",
-                        info="Currently: Qwen3-TTS (local). More providers coming soon.",
+                        info="Choose TTS provider: Qwen3-TTS (local), VibeVoice-1.5B, or F5-TTS.",
                         interactive=True,
                     )
                 with gr.Row():
@@ -1081,7 +1081,9 @@ def build_app():
                         while True:
                             msg = await ws.recv()
                             data = json.loads(msg)
-                            if data["type"] == "log":
+                            if data["type"] == "ping":
+                                continue
+                            elif data["type"] == "log":
                                 log_q.put(data["message"])
                             elif data["type"] == "progress":
                                 prog_val = data["progress"]
@@ -1090,8 +1092,8 @@ def build_app():
                                 status = data["status"]
                                 if status in ("failed", "cancelled"):
                                     break
-                            elif data["type"] == "completed":
-                                paths = ",".join(data["files"])
+                            elif data["type"] in ("completed", "session_end"):
+                                paths = ",".join(data.get("files", []))
                                 log_q.put(f"__DONE__::{paths}")
                                 break
                 except Exception as e:

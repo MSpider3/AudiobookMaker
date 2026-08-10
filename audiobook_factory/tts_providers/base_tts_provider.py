@@ -186,9 +186,21 @@ def get_tts_provider(
             return QwenTTSProvider.create_for_device(device, config, dtype_override=dtype_override)
         return QwenTTSProvider(config, device=device, dtype_override=dtype_override)
 
+    if name in ("vibevoice", "vibe-voice", "vibevoice-1.5b"):
+        from audiobook_factory.tts_providers.vibevoice_provider import VibeVoiceTTSProvider
+        if device is not None:
+            return VibeVoiceTTSProvider.create_for_device(device, config, dtype_override=dtype_override)
+        return VibeVoiceTTSProvider(config, device=device, dtype_override=dtype_override)
+
+    if name in ("f5tts", "f5-tts", "f5_tts"):
+        from audiobook_factory.tts_providers.f5tts_provider import F5TTSProvider
+        if device is not None:
+            return F5TTSProvider.create_for_device(device, config, dtype_override=dtype_override)
+        return F5TTSProvider(config, device=device, dtype_override=dtype_override)
+
     raise ValueError(
         f"Unknown TTS provider: '{name}'. "
-        f"Currently supported: 'qwen'. More providers coming in a future release."
+        f"Currently supported: 'qwen', 'vibevoice', 'f5tts'."
     )
 
 

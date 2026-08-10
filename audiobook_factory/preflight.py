@@ -451,11 +451,17 @@ def run_preflight_checks(
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 free, total = torch.cuda.mem_get_info(i)
+                total_gb = round(total / 1e9, 2)
+                if total_gb <= 8.5:
+                    warnings.append(
+                        f"GPU cuda:{i} ({torch.cuda.get_device_name(i)}) has {total_gb} GB VRAM (<= 8.5 GB). "
+                        "Consider setting vram_headroom_gb=1.0 or quantization='int8' for optimal stability."
+                    )
                 device_info.append({
                     "device": f"cuda:{i}",
                     "name": torch.cuda.get_device_name(i),
                     "free_vram_gb": round(free / 1e9, 2),
-                    "total_vram_gb": round(total / 1e9, 2),
+                    "total_vram_gb": total_gb,
                     "bf16_supported": hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported(i),
                 })
     except Exception as exc:
