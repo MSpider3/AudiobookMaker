@@ -59,9 +59,10 @@ class F5TTSProvider(BaseTTSProvider):
                 try:
                     from f5_tts.api import F5TTS
                     self._model = F5TTS(device=self._device)
-                except ImportError:
-                    logger.warning("[F5-TTS] f5_tts module not installed. Running in stub mode.")
-                    self._model = "stub"
+                except ImportError as imp_err:
+                    msg = "F5-TTS python package is not installed. Run 'pip install f5-tts' to use F5-TTS."
+                    logger.error("[F5-TTS] %s", msg)
+                    raise RuntimeError(msg) from imp_err
                 logger.info("[F5-TTS] Initialized successfully.")
             except Exception as exc:
                 logger.error("[F5-TTS] Initialization failed: %s", exc)
@@ -95,11 +96,21 @@ class F5TTSProvider(BaseTTSProvider):
                     ref_file = tf.name
 
             try:
-                wav_out, sr, _ = self._model.infer(
-                    ref_file=ref_file,
-                    ref_text="",
-                    gen_text=text,
-                )
+                nfe_step = getattr(self.config, "nfe_step", 32)
+                speed = getattr(self.config, "speed", 1.0)
+                seed = getattr(self.config, "seed", -1)
+
+                infer_kwargs: dict[str, Any] = {
+                    "ref_file": ref_file,
+                    "ref_text": "",
+                    "gen_text": text,
+                    "nfe_step": nfe_step,
+                    "speed": speed,
+                }
+                if seed >= 0:
+                    infer_kwargs["seed"] = seed
+
+                wav_out, sr, _ = self._model.infer(**infer_kwargs)
                 audio_data = wav_out
                 sample_rate = sr
             except Exception as exc:

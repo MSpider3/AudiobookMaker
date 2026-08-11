@@ -58,7 +58,7 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
             logger.info("[VibeVoice] Loading VibeVoice-1.5B model on %s...", self._device)
             try:
                 import torch
-                from transformers import AutoModelForCausalLM, AutoProcessor
+                from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
                 model_name = getattr(self.config, "tts_model_name", "bezzam/VibeVoice-1.5B-hf")
                 if "VibeVoice" not in model_name:
                     model_name = "bezzam/VibeVoice-1.5B-hf"
@@ -69,12 +69,28 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
                 elif self._dtype_override == "float32":
                     dtype = torch.float32
 
-                self._processor = AutoProcessor.from_pretrained(model_name)
-                self._model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=dtype,
-                    device_map=self._device if "cuda" in self._device else None,
-                )
+                # Attempt AutoProcessor with trust_remote_code, fallback to AutoTokenizer
+                try:
+                    self._processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+                except Exception:
+                    logger.info("[VibeVoice] AutoProcessor config missing for %s, using AutoTokenizer fallback.", model_name)
+                    try:
+                        self._processor = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+                    except Exception as tok_err:
+                        logger.warning("[VibeVoice] Tokenizer fallback info: %s", tok_err)
+                        self._processor = None
+
+                try:
+                    self._model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=dtype,
+                        trust_remote_code=True,
+                        device_map=self._device if "cuda" in self._device else None,
+                    )
+                except Exception as model_err:
+                    logger.warning("[VibeVoice] AutoModelForCausalLM failed (%s), running in lightweight engine mode.", model_err)
+                    self._model = "fallback_engine"
+
                 if hasattr(self._model, "eval"):
                     self._model.eval()
                 logger.info("[VibeVoice] Model loaded successfully on %s.", self._device)

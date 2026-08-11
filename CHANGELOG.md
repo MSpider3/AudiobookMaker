@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Prominent TTS Provider Selection in Voice Studio (`app.py`)**: Moved `tts_provider_dd` (`qwen`, `vibevoice`, `f5tts`) to Tab 3 (Voice Studio) with dynamic UI group toggles for Qwen parameters vs VibeVoice / F5-TTS provider info boxes.
 - **Audio Encoding Controls (`app.py`, `pipeline.py`)**: Added `sample_rate_dd` (22050–48000 Hz), `bitrate_dd` (64–320 kbps), and `channels_radio` (Mono/Stereo) to Tab 4 (Advanced) and `AudiobookConfig`. Updated FFmpeg command builders in `pipeline.py` to enforce `-ar`, `-ac`, and `-b:a` encoding flags across lossy/lossless audio format outputs.
+- **Advanced TTS Tuning Parameters (`AudiobookConfig`, `app.py`)**: Added `repetition_penalty` (default: 1.05), `top_k` (default: 50), `speed` (default: 1.0), `nfe_step` (default: 32), and `seed` (default: -1) to `AudiobookConfig`, provider backends (`qwen`, `vibevoice`, `f5tts`), and Tab 4 UI controls.
+- **Provider Preflight Dependency Checks (`preflight.py`)**: Added automatic preflight checking for optional provider dependencies (`f5_tts` and `protobuf`).
 
 ### 🔄 Changed
 - Bumped `_CONFIG_SCHEMA_VERSION` from `5` to `6` in `audiobook_factory/pipeline.py`.

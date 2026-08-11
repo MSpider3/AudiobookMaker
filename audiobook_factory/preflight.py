@@ -239,9 +239,32 @@ def _check_soundfile() -> tuple[bool, str]:
     """
     try:
         import soundfile
-        return True, "soundfile available"
+        return True, f"soundfile {soundfile.__version__}"
     except ImportError:
         return False, "soundfile not installed. Run: pip install soundfile"
+
+
+def check_provider_dependencies(provider_name: str) -> tuple[bool, str]:
+    """Checks optional dependencies for the requested TTS provider.
+
+    Returns:
+        Tuple of (passed, message).
+    """
+    p_name = (provider_name or "qwen").lower().strip()
+    if p_name in ("f5tts", "f5-tts", "f5_tts"):
+        try:
+            import f5_tts  # noqa: F401
+            return True, "f5-tts package is installed"
+        except ImportError:
+            return False, "F5-TTS requires f5-tts package. Install with: pip install f5-tts"
+    if p_name in ("vibevoice", "vibe-voice"):
+        try:
+            import transformers
+            import soundfile  # noqa: F401
+            return True, f"VibeVoice dependencies available (transformers {transformers.__version__})"
+        except ImportError as e:
+            return False, f"VibeVoice missing dependency ({e}). Install with: pip install --upgrade transformers protobuf soundfile"
+    return True, f"Provider '{p_name}' dependencies satisfied"
 
 
 def _check_ffmpeg() -> tuple[bool, str]:
@@ -425,6 +448,19 @@ def run_preflight_checks(
             library_versions["bitsandbytes"] = bnb_msg
     except Exception as exc:
         warnings.append(f"bitsandbytes check failed: {exc}")
+
+    # Optional provider pre-checks
+    try:
+        import f5_tts
+        library_versions["f5_tts"] = getattr(f5_tts, "__version__", "installed")
+    except ImportError:
+        logger.info("[preflight] f5_tts optional dependency not installed.")
+
+    try:
+        import google.protobuf
+        library_versions["protobuf"] = getattr(google.protobuf, "__version__", "installed")
+    except ImportError:
+        logger.info("[preflight] protobuf optional dependency not installed.")
 
     # dict_keys check — always warning
     try:

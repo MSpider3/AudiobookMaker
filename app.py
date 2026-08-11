@@ -476,6 +476,29 @@ def build_app():
                         info="1 = Mono (recommended for audiobooks), 2 = Stereo.",
                         interactive=True,
                     )
+                gr.Markdown("#### 🎛️ Advanced TTS Tuning Parameters")
+                with gr.Row():
+                    rep_penalty_sl = gr.Slider(
+                        label="Repetition Penalty",
+                        minimum=0.8, maximum=2.0, value=1.05, step=0.05,
+                        info="Prevents speech stuttering or word repetition. Default: 1.05."
+                    )
+                    top_k_sl = gr.Slider(
+                        label="Top-K Sampling",
+                        minimum=1, maximum=100, value=50, step=1,
+                        info="Controls token sampling candidate pool size. Default: 50."
+                    )
+                    nfe_step_sl = gr.Slider(
+                        label="F5-TTS NFE Steps",
+                        minimum=8, maximum=64, value=32, step=1,
+                        info="ODE solver steps for F5-TTS provider. Default: 32."
+                    )
+                with gr.Row():
+                    seed_num = gr.Number(
+                        label="Random Seed (-1 = random)",
+                        value=-1, precision=0,
+                        info="Set seed >= 0 for deterministic generation. Default: -1."
+                    )
                 with gr.Row():
                     epub_ocr_chk      = gr.Checkbox(label="Enable EasyOCR for EPUB image text", value=False)
                     force_repro_chk   = gr.Checkbox(label="Force re-process (ignore saved progress)", value=False)
@@ -869,7 +892,8 @@ def build_app():
         def on_test_voice(
             voice_path, text, temp, top_p, speed,
             provider, mname, timbre, instruct,
-            sample_rate, bitrate_kbps, channels
+            sample_rate, bitrate_kbps, channels,
+            rep_penalty, top_k, nfe_step, seed
         ):
             if ("Base" in (mname or "") or (provider or "qwen") != "qwen") and not voice_path:
                 return None, "⚠️ Upload or set a narrator voice first."
@@ -880,6 +904,7 @@ def build_app():
                 voice_file=voice_path,
                 temperature=temp,
                 top_p=top_p,
+                speed=float(speed or 1.0),
                 tts_provider_name=provider or "qwen",
                 tts_model_name=mname,
                 tts_timbre=timbre.split()[-1] if timbre else "",
@@ -887,6 +912,10 @@ def build_app():
                 sample_rate=int(sample_rate or 24000),
                 bitrate_kbps=int(bitrate_kbps or 64),
                 channels=int(channels or 1),
+                repetition_penalty=float(rep_penalty or 1.05),
+                top_k=int(top_k or 50),
+                nfe_step=int(nfe_step or 32),
+                seed=int(seed if seed is not None else -1),
             )
 
             wav_bytes = None
@@ -916,7 +945,8 @@ def build_app():
             inputs=[
                 voice_studio_upload, test_text, temp_slider, topp_slider, speed_slider,
                 tts_provider_dd, tts_model_name, tts_timbre, tts_instruct,
-                sample_rate_dd, bitrate_dd, channels_radio
+                sample_rate_dd, bitrate_dd, channels_radio,
+                rep_penalty_sl, top_k_sl, nfe_step_sl, seed_num
             ],
             outputs=[test_audio, test_status],
         )
@@ -1033,6 +1063,7 @@ def build_app():
             single_file, export_lrc, export_srt, export_vtt,
             torch_compile, regen_missing, quantization, resume_incomplete_chunks,
             sample_rate, bitrate_kbps, channels,
+            rep_penalty, top_k, speed, nfe_step, seed,
             progress=gr.Progress(track_tqdm=False)
         ):
             if file_obj is None:
@@ -1136,6 +1167,11 @@ def build_app():
                 sample_rate=int(sample_rate or 24000),
                 bitrate_kbps=int(bitrate_kbps or 64),
                 channels=int(channels or 1),
+                repetition_penalty=float(rep_penalty or 1.05),
+                top_k=int(top_k or 50),
+                speed=float(speed or 1.0),
+                nfe_step=int(nfe_step or 32),
+                seed=int(seed if seed is not None else -1),
             )
 
             log_q  = queue.Queue()
@@ -1328,7 +1364,8 @@ def build_app():
                 tts_model_name, tts_timbre, tts_instruct,
                 single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
                 torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk,
-                sample_rate_dd, bitrate_dd, channels_radio
+                sample_rate_dd, bitrate_dd, channels_radio,
+                rep_penalty_sl, top_k_sl, speed_slider, nfe_step_sl, seed_num
             ],
             outputs=[log_box, prog_html, download_col, download_files, cancel_state],
         )
@@ -1447,6 +1484,11 @@ def build_app():
                 sample_rate_val = val("sample_rate", 24000)
                 bitrate_val = val("bitrate_kbps", 64)
                 channels_val = val("channels", 1)
+                rep_penalty_val = val("repetition_penalty", 1.05)
+                top_k_val = val("top_k", 50)
+                speed_val = val("speed", 1.0)
+                nfe_step_val = val("nfe_step", 32)
+                seed_val = val("seed", -1)
 
                 # Restore pronunciation map if present
                 pron_map = val("pronunciation_map", {})
@@ -1499,12 +1541,17 @@ def build_app():
                     gr.update(value=sample_rate_val),
                     gr.update(value=bitrate_val),
                     gr.update(value=channels_val),
+                    gr.update(value=rep_penalty_val),
+                    gr.update(value=top_k_val),
+                    gr.update(value=speed_val),
+                    gr.update(value=nfe_step_val),
+                    gr.update(value=seed_val),
                     pron_file_update,
                     gr.update(value=saved_chapters) if saved_chapters else gr.update(),
                     saved_chapters or None,   # json_selected_chapters_state
                 )
             except Exception as e:
-                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(35)]
+                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(40)]
 
         progress_file_upload.upload(
             on_progress_upload,
@@ -1518,6 +1565,7 @@ def build_app():
                 export_text_chk, single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
                 torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk,
                 sample_rate_dd, bitrate_dd, channels_radio,
+                rep_penalty_sl, top_k_sl, speed_slider, nfe_step_sl, seed_num,
                 pronunciation_file, chapter_check,
                 json_selected_chapters_state,
             ]
@@ -1537,6 +1585,7 @@ def build_app():
             single_file, export_lrc, export_srt, export_vtt,
             torch_compile, regen_missing, quantization, resume_incomplete_chunks,
             sample_rate, bitrate_kbps, channels,
+            rep_penalty, top_k, speed, nfe_step, seed,
         ):
             """Parse the book, cache chapter text, and write a self-contained
             generation_progress.json — without starting TTS generation."""
@@ -1653,6 +1702,11 @@ def build_app():
                     sample_rate=int(sample_rate or 24000),
                     bitrate_kbps=int(bitrate_kbps or 64),
                     channels=int(channels or 1),
+                    repetition_penalty=float(rep_penalty or 1.05),
+                    top_k=int(top_k or 50),
+                    speed=float(speed or 1.0),
+                    nfe_step=int(nfe_step or 32),
+                    seed=int(seed if seed is not None else -1),
                 )
                 settings_dict = dataclasses.asdict(cfg)
 
@@ -1801,6 +1855,7 @@ def build_app():
                 single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
                 torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk,
                 sample_rate_dd, bitrate_dd, channels_radio,
+                rep_penalty_sl, top_k_sl, speed_slider, nfe_step_sl, seed_num,
             ],
             outputs=[export_cfg_status, export_config_file, export_cfg_accordion],
         )

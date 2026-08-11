@@ -256,6 +256,11 @@ class AudiobookConfig:
     sample_rate:              int   = 24000
     bitrate_kbps:             int   = 64
     channels:                 int   = 1
+    repetition_penalty:       float = 1.05
+    top_k:                    int   = 50
+    speed:                    float = 1.0
+    nfe_step:                 int   = 32
+    seed:                     int   = -1
     torch_compile:            bool  = False
     quantization:             str   = "none"   # "none" | "int8"
     selected_chapters:        list  = field(default_factory=list) # Selected chapter titles/labels
@@ -1377,4 +1382,5 @@ def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
                     return f.read()
         except Exception as e:
             logger.warning("[preview_tts] Error: %s", e)
+            raise e
     return None
