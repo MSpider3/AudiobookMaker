@@ -321,42 +321,57 @@ def build_app():
                     sent_pause_sl  = gr.Slider(label="Sentence pause (s)", minimum=0.2, maximum=2.0, value=0.5, step=0.1)
                     para_pause_sl  = gr.Slider(label="Paragraph pause (s)", minimum=0.5, maximum=3.0, value=1.2, step=0.1)
 
-                gr.Markdown("#### Qwen3 Model Configuration")
-                with gr.Row():
-                    tts_model_name = gr.Dropdown(
-                        label="TTS Model Variant",
-                        choices=[
-                            "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-                            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-                            "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                            "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-                            "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-                        ],
-                        value="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                    )
-                    tts_timbre = gr.Dropdown(
-                        label="Premium Timbre (CustomVoice only)",
-                        choices=[
-                            "[Chinese] vivian",
-                            "[Chinese] serena",
-                            "[Chinese] uncle_fu",
-                            "[Chinese (Beijing Dialect)] dylan",
-                            "[Chinese (Sichuan Dialect)] eric",
-                            "[English] ryan",
-                            "[English] aiden",
-                            "[Japanese] ono_anna",
-                            "[Korean] sohee"
-                        ],
-                        value="[English] ryan",
-                        visible=False
-                    )
-                
-                tts_instruct = gr.Textbox(
-                    label="Voice Design / Style Instruction",
-                    placeholder="e.g. 'A mature male narrator with a deep resonant voice' or 'Energetic and youthful'",
-                    visible=False,
-                    lines=2
+                gr.Markdown("#### TTS Engine & Provider Selection")
+                tts_provider_dd = gr.Dropdown(
+                    label="TTS Provider",
+                    choices=["qwen", "vibevoice", "f5tts"],
+                    value="qwen",
+                    info="Choose TTS Engine: Qwen3-TTS (local model), VibeVoice-1.5B, or F5-TTS.",
+                    interactive=True,
                 )
+
+                provider_info_md = gr.Markdown(
+                    value="",
+                    visible=False,
+                )
+
+                with gr.Group() as qwen_group:
+                    gr.Markdown("#### Qwen3 Model Configuration")
+                    with gr.Row():
+                        tts_model_name = gr.Dropdown(
+                            label="TTS Model Variant",
+                            choices=[
+                                "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+                                "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                                "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                                "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                                "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                            ],
+                            value="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                        )
+                        tts_timbre = gr.Dropdown(
+                            label="Premium Timbre (CustomVoice only)",
+                            choices=[
+                                "[Chinese] vivian",
+                                "[Chinese] serena",
+                                "[Chinese] uncle_fu",
+                                "[Chinese (Beijing Dialect)] dylan",
+                                "[Chinese (Sichuan Dialect)] eric",
+                                "[English] ryan",
+                                "[English] aiden",
+                                "[Japanese] ono_anna",
+                                "[Korean] sohee"
+                            ],
+                            value="[English] ryan",
+                            visible=False
+                        )
+                    
+                    tts_instruct = gr.Textbox(
+                        label="Voice Design / Style Instruction",
+                        placeholder="e.g. 'A mature male narrator with a deep resonant voice' or 'Energetic and youthful'",
+                        visible=False,
+                        lines=2
+                    )
 
                 def on_model_change(mname):
                     # Show/hide relevant options
@@ -373,6 +388,36 @@ def build_app():
                     on_model_change,
                     inputs=[tts_model_name],
                     outputs=[voice_studio_upload, tts_timbre, tts_instruct]
+                )
+
+                def on_provider_change(provider):
+                    p = (provider or "qwen").lower().strip()
+                    if p == "qwen":
+                        return [
+                            gr.update(visible=True),   # qwen_group
+                            gr.update(visible=False),  # provider_info_md
+                            gr.update(visible=True),   # voice_studio_upload
+                        ]
+                    elif p == "vibevoice":
+                        info = "### 🎙️ VibeVoice-1.5B Provider\n* **Model:** `bezzam/VibeVoice-1.5B-hf`\n* **Capabilities:** High-quality zero-shot multi-lingual voice cloning from reference WAV files."
+                        return [
+                            gr.update(visible=False),  # qwen_group
+                            gr.update(value=info, visible=True), # provider_info_md
+                            gr.update(visible=True),   # voice_studio_upload
+                        ]
+                    elif p == "f5tts":
+                        info = "### 🎙️ F5-TTS Provider\n* **Model:** `f5_tts.api.F5TTS`\n* **Capabilities:** Fast and lightweight zero-shot voice cloning with reference audio clips."
+                        return [
+                            gr.update(visible=False),  # qwen_group
+                            gr.update(value=info, visible=True), # provider_info_md
+                            gr.update(visible=True),   # voice_studio_upload
+                        ]
+                    return [gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)]
+
+                tts_provider_dd.change(
+                    on_provider_change,
+                    inputs=[tts_provider_dd],
+                    outputs=[qwen_group, provider_info_md, voice_studio_upload]
                 )
 
                 gr.Markdown("#### Voice test")
@@ -408,12 +453,27 @@ def build_app():
                         info="chapters: process multiple chapters at once (high VRAM). chunks: process chunks of the same chapter at once (recommended).",
                         interactive=True,
                     )
+                gr.Markdown("#### 🔊 Audio Encoding & Quality Settings")
                 with gr.Row():
-                    tts_provider_dd = gr.Dropdown(
-                        label="TTS Provider",
-                        choices=["qwen", "vibevoice", "f5tts"],
-                        value="qwen",
-                        info="Choose TTS provider: Qwen3-TTS (local), VibeVoice-1.5B, or F5-TTS.",
+                    sample_rate_dd = gr.Dropdown(
+                        label="Sample Rate (Hz)",
+                        choices=[22050, 24000, 44100, 48000],
+                        value=24000,
+                        info="Output audio sample rate in Hz. Default: 24000 Hz.",
+                        interactive=True,
+                    )
+                    bitrate_dd = gr.Dropdown(
+                        label="Audio Bitrate (kbps)",
+                        choices=[64, 96, 128, 192, 256, 320],
+                        value=64,
+                        info="Target bitrate for lossy formats (MP3 / M4B). Default: 64 kbps.",
+                        interactive=True,
+                    )
+                    channels_radio = gr.Radio(
+                        label="Audio Channels",
+                        choices=[1, 2],
+                        value=1,
+                        info="1 = Mono (recommended for audiobooks), 2 = Stereo.",
                         interactive=True,
                     )
                 with gr.Row():
@@ -808,10 +868,11 @@ def build_app():
         # ── Voice Studio: Test Voice ──────────────────────────────────────────
         def on_test_voice(
             voice_path, text, temp, top_p, speed,
-            mname, timbre, instruct
+            provider, mname, timbre, instruct,
+            sample_rate, bitrate_kbps, channels
         ):
-            if ("Base" in mname) and not voice_path:
-                return None, "⚠️ Upload or set a narrator voice first for Base models."
+            if ("Base" in (mname or "") or (provider or "qwen") != "qwen") and not voice_path:
+                return None, "⚠️ Upload or set a narrator voice first."
             if not text.strip():
                 return None, "⚠️ Enter some text to test."
 
@@ -819,9 +880,13 @@ def build_app():
                 voice_file=voice_path,
                 temperature=temp,
                 top_p=top_p,
+                tts_provider_name=provider or "qwen",
                 tts_model_name=mname,
                 tts_timbre=timbre.split()[-1] if timbre else "",
-                tts_instruct=instruct
+                tts_instruct=instruct,
+                sample_rate=int(sample_rate or 24000),
+                bitrate_kbps=int(bitrate_kbps or 64),
+                channels=int(channels or 1),
             )
 
             wav_bytes = None
@@ -850,7 +915,8 @@ def build_app():
             on_test_voice,
             inputs=[
                 voice_studio_upload, test_text, temp_slider, topp_slider, speed_slider,
-                tts_model_name, tts_timbre, tts_instruct
+                tts_provider_dd, tts_model_name, tts_timbre, tts_instruct,
+                sample_rate_dd, bitrate_dd, channels_radio
             ],
             outputs=[test_audio, test_status],
         )
@@ -966,6 +1032,7 @@ def build_app():
             mname, timbre, instruct,
             single_file, export_lrc, export_srt, export_vtt,
             torch_compile, regen_missing, quantization, resume_incomplete_chunks,
+            sample_rate, bitrate_kbps, channels,
             progress=gr.Progress(track_tqdm=False)
         ):
             if file_obj is None:
@@ -1066,6 +1133,9 @@ def build_app():
                 quantization=str(quantization or "none"),
                 selected_chapters=selected_chapters or [],
                 regen_missing=bool(regen_missing),
+                sample_rate=int(sample_rate or 24000),
+                bitrate_kbps=int(bitrate_kbps or 64),
+                channels=int(channels or 1),
             )
 
             log_q  = queue.Queue()
@@ -1257,7 +1327,8 @@ def build_app():
                 worker_count_sl, parallel_mode_dd, export_text_chk, pronunciation_file, progress_file_upload, tts_provider_dd,
                 tts_model_name, tts_timbre, tts_instruct,
                 single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
-                torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk
+                torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk,
+                sample_rate_dd, bitrate_dd, channels_radio
             ],
             outputs=[log_box, prog_html, download_col, download_files, cancel_state],
         )
@@ -1271,21 +1342,21 @@ def build_app():
 
         def on_progress_upload(file_obj):
             if file_obj is None:
-                return ["", gr.update()] + [gr.update() for _ in range(32)]
+                return ["", gr.update()] + [gr.update() for _ in range(35)]
             path = file_obj.name if hasattr(file_obj, "name") else (file_obj.get("name") if isinstance(file_obj, dict) else str(file_obj))
             if not path or not os.path.exists(path):
-                return ["❌ Uploaded progress file not found on disk.", gr.update()] + [gr.update() for _ in range(32)]
+                return ["❌ Uploaded progress file not found on disk.", gr.update()] + [gr.update() for _ in range(35)]
             
             try:
                 data = read_progress_file(path)
             except FileNotFoundError as exc:
                 gr.Warning(str(exc))
-                return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(32)]
+                return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(35)]
             except ValueError as exc:
                 gr.Warning(str(exc))
-                return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(32)]
+                return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(35)]
             except Exception as exc:
-                return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(32)]
+                return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(35)]
                 
             try:
                 title = data.get("book_title", "")
@@ -1373,6 +1444,9 @@ def build_app():
                 regen_missing_val = val("regen_missing", True)
                 quantization_val = val("quantization", "none")
                 resume_chunks_val = val("resume_incomplete_chunks", False)
+                sample_rate_val = val("sample_rate", 24000)
+                bitrate_val = val("bitrate_kbps", 64)
+                channels_val = val("channels", 1)
 
                 # Restore pronunciation map if present
                 pron_map = val("pronunciation_map", {})
@@ -1422,12 +1496,15 @@ def build_app():
                     gr.update(value=regen_missing_val),
                     gr.update(value=quantization_val),
                     gr.update(value=resume_chunks_val),
+                    gr.update(value=sample_rate_val),
+                    gr.update(value=bitrate_val),
+                    gr.update(value=channels_val),
                     pron_file_update,
                     gr.update(value=saved_chapters) if saved_chapters else gr.update(),
                     saved_chapters or None,   # json_selected_chapters_state
                 )
             except Exception as e:
-                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(32)]
+                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(35)]
 
         progress_file_upload.upload(
             on_progress_upload,
@@ -1439,7 +1516,9 @@ def build_app():
                 tts_timbre, tts_instruct, max_len_sl, lufs_adv, worker_count_sl,
                 parallel_mode_dd, tts_provider_dd, epub_ocr_chk, force_repro_chk,
                 export_text_chk, single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
-                torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk, pronunciation_file, chapter_check,
+                torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk,
+                sample_rate_dd, bitrate_dd, channels_radio,
+                pronunciation_file, chapter_check,
                 json_selected_chapters_state,
             ]
         )
@@ -1457,6 +1536,7 @@ def build_app():
             mname, timbre, instruct,
             single_file, export_lrc, export_srt, export_vtt,
             torch_compile, regen_missing, quantization, resume_incomplete_chunks,
+            sample_rate, bitrate_kbps, channels,
         ):
             """Parse the book, cache chapter text, and write a self-contained
             generation_progress.json — without starting TTS generation."""
@@ -1570,6 +1650,9 @@ def build_app():
                     selected_chapters=selected_chapters or [],
                     regen_missing=bool(regen_missing),
                     resume_incomplete_chunks=bool(resume_incomplete_chunks),
+                    sample_rate=int(sample_rate or 24000),
+                    bitrate_kbps=int(bitrate_kbps or 64),
+                    channels=int(channels or 1),
                 )
                 settings_dict = dataclasses.asdict(cfg)
 
@@ -1717,6 +1800,7 @@ def build_app():
                 tts_model_name, tts_timbre, tts_instruct,
                 single_file_mode, export_lrc_chk, export_srt_chk, export_vtt_chk,
                 torch_compile_chk, regen_missing_chk, quantization_radio, resume_chunks_chk,
+                sample_rate_dd, bitrate_dd, channels_radio,
             ],
             outputs=[export_cfg_status, export_config_file, export_cfg_accordion],
         )

@@ -219,9 +219,11 @@ class AudiobookConfig:
     pause:               float = 0.5     # seconds between sentences
     para_pause:          float = 1.2     # seconds between paragraphs
 
-    # ── Audio mastering ───────────────────────────────────────────────────────
+    # ── Audio mastering & Encoding ────────────────────────────────────────────
     lufs:                int   = -18
     true_peak:           float = -1.5
+    bitrate_kbps:        int   = 64       # Audio encoding bitrate (kbps)
+    channels:            int   = 1        # Audio channels (1 = mono, 2 = stereo)
 
     # ── Parallelism & Hardware Optimization ───────────────────────────────────
     worker_count:        int   = 1       # chapters/chunks in parallel
@@ -252,6 +254,8 @@ class AudiobookConfig:
     resume_incomplete_chunks: bool  = True   # When True, resumes mid-chapter from last completed chunk using disk cache
     regen_missing:            bool  = True   # When True, regenerates missing/failed chapter audio
     sample_rate:              int   = 24000
+    bitrate_kbps:             int   = 64
+    channels:                 int   = 1
     torch_compile:            bool  = False
     quantization:             str   = "none"   # "none" | "int8"
     selected_chapters:        list  = field(default_factory=list) # Selected chapter titles/labels
@@ -1205,7 +1209,10 @@ def _process_chapter(
                         cmd = ["ffmpeg", "-y", "-i", master_target]
                         if include_cover and valid_cover:
                             cmd += ["-i", valid_cover]
+                        cmd += ["-ar", str(config.sample_rate), "-ac", str(getattr(config, "channels", 1))]
                         cmd += audio_settings
+                        if config.output_format in ("mp3", "m4b", "m4a", "aac", "ogg"):
+                            cmd += ["-b:a", f"{getattr(config, 'bitrate_kbps', 64)}k"]
                         cmd += _get_cover_flags(config.output_format, include_cover)
                         cmd += [
                             "-metadata", f"title={chapter.title}",
@@ -1270,13 +1277,15 @@ def _process_chapter(
                 "ffmpeg", "-y",
                 "-f", "f32le",
                 "-ar", str(config.sample_rate),
-                "-ac", "1",
+                "-ac", str(getattr(config, "channels", 1)),
                 "-i", "pipe:0",
             ]
             if include_cover and valid_cover:
                 cmd += ["-i", valid_cover]
             cmd += ["-af", f"loudnorm=I={config.lufs}:TP={config.true_peak}:LRA=11"]
             cmd += audio_settings
+            if config.output_format in ("mp3", "m4b", "m4a", "aac", "ogg"):
+                cmd += ["-b:a", f"{getattr(config, 'bitrate_kbps', 64)}k"]
             cmd += _get_cover_flags(config.output_format, include_cover)
             cmd += [
                 "-metadata", f"title={chapter.title}",

@@ -14,10 +14,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **WebSocket Keep-Alive & Session End Event (`server.py`, `worker.py`, `app.py`)**: Added a 15-second background `_ws_keepalive()` ping loop in `api/server.py`, extended WebSocket connection closure grace period to 3.0s, and broadcasted `session_end` events from `api/worker.py`. Updated Gradio client loop (`app.py`) to process `session_end` and ignore `ping` messages.
 - **API Production Hardening & Graceful Shutdown (`server.py`, `worker.py`)**: Added `@app.on_event("shutdown")` in FastAPI server to flag active task cancellation tokens, allow checkpoint flushing, and shut down `GPUPoolManager`. Isolated task execution in `_run_task_safely()` in `api/worker.py`.
 
+- **Prominent TTS Provider Selection in Voice Studio (`app.py`)**: Moved `tts_provider_dd` (`qwen`, `vibevoice`, `f5tts`) to Tab 3 (Voice Studio) with dynamic UI group toggles for Qwen parameters vs VibeVoice / F5-TTS provider info boxes.
+- **Audio Encoding Controls (`app.py`, `pipeline.py`)**: Added `sample_rate_dd` (22050–48000 Hz), `bitrate_dd` (64–320 kbps), and `channels_radio` (Mono/Stereo) to Tab 4 (Advanced) and `AudiobookConfig`. Updated FFmpeg command builders in `pipeline.py` to enforce `-ar`, `-ac`, and `-b:a` encoding flags across lossy/lossless audio format outputs.
+
 ### 🔄 Changed
 - Bumped `_CONFIG_SCHEMA_VERSION` from `5` to `6` in `audiobook_factory/pipeline.py`.
 - Updated Gradio UI TTS Provider dropdown in `app.py` to support `qwen`, `vibevoice`, and `f5tts`.
-- Extended unit test suite in `tests/test_hardening.py` to 51 tests covering completion guards, summary finalization, retry persistence, provider resolution, and VRAM headroom batch suggestions.
+- Extended unit test suite in `tests/test_hardening.py` to 53 tests covering completion guards, summary finalization, retry persistence, provider resolution, VRAM headroom batch suggestions, and audio encoding options.
 
 ---
 
