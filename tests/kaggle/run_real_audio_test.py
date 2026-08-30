@@ -50,7 +50,8 @@ def run_real_audio_tests() -> dict:
     # Search for real voice file
     voice_patterns = [
         "narrator_voice/*.wav", "narrator_voice/*.mp3", "narrator_voice/*.m4a",
-        "input_assets/*.wav", "input_assets/*.mp3"
+        "narrator_voice/*.flac", "narrator_voice/*.ogg", "narrator_voice/*.aac",
+        "input_assets/*.wav", "input_assets/*.mp3", "input_assets/*.flac"
     ]
     real_voice = find_asset(voice_patterns)
 
