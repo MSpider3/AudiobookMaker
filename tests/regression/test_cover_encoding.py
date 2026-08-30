@@ -37,7 +37,7 @@ class TestCoverEncodingRegression:
             arr = np.zeros((100, 100, 4), dtype=np.uint8)
             arr[:, :, 0] = 200  # Red
             arr[:, :, 3] = 255  # Alpha
-            img = Image.fromarray(arr, mode="RGBA")
+            img = Image.fromarray(arr)
             img.save(tf.name)
             path = tf.name
         yield path

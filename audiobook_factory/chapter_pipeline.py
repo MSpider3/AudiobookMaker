@@ -169,6 +169,23 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
                 logger.warning("Failed to read partial %s during final mastering: %s", p, exc)
         if segments:
             raw = np.concatenate(segments)
+            # Apply EBU R128 loudness normalization & true peak limiting in pure-Python
+            try:
+                import pyloudnorm as pyln
+                meter = pyln.Meter(int(config.sample_rate))
+                input_loudness = meter.integrated_loudness(raw)
+                if not np.isneginf(input_loudness) and not np.isnan(input_loudness):
+                    target_lufs = float(config.lufs)
+                    gain_db = target_lufs - input_loudness
+                    target_tp_linear = 10.0 ** (float(config.true_peak) / 20.0)
+                    gain_linear = 10.0 ** (gain_db / 20.0)
+                    peak = float(np.max(np.abs(raw)))
+                    if peak > 0 and (peak * gain_linear) > target_tp_linear:
+                        gain_linear = target_tp_linear / peak
+                    raw = raw * gain_linear
+            except Exception as norm_err:
+                logger.warning("pyloudnorm mastering normalization fallback error: %s", norm_err)
+
             sf.write(out_path, raw, config.sample_rate)
 
 
