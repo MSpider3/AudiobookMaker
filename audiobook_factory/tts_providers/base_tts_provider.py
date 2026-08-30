@@ -198,9 +198,15 @@ def get_tts_provider(
             return F5TTSProvider.create_for_device(device, config, dtype_override=dtype_override)
         return F5TTSProvider(config, device=device, dtype_override=dtype_override)
 
+    if name in ("mock", "dummy", "test"):
+        from tests.fixtures.mock_provider import MockTTSProvider
+        if device is not None:
+            return MockTTSProvider.create_for_device(device, config, dtype_override=dtype_override)
+        return MockTTSProvider(config, device=device or "cpu")
+
     raise ValueError(
         f"Unknown TTS provider: '{name}'. "
-        f"Currently supported: 'qwen', 'vibevoice', 'f5tts'."
+        f"Currently supported: 'qwen', 'vibevoice', 'f5tts', 'mock'."
     )
 
 

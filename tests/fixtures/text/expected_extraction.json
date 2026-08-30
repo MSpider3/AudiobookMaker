@@ -1,0 +1,29 @@
+{
+  "metadata": {
+    "title": "The Chronicles of Antiquity",
+    "author": "Dr. Arthur Pendelton, Ph.D.",
+    "language": "en",
+    "description": "A synthetic multi-chapter test novel for AudiobookMaker validation."
+  },
+  "chapter_count": 3,
+  "chapters": [
+    {
+      "num": 1,
+      "title": "Chapter 1 - The Crimson Tower",
+      "paragraph_count": 4,
+      "full_text": "Dr. Arthur Pendelton adjusted his gold-rimmed spectacles, gazing up at the ominous silhouette of the Crimson Tower. The clock tower in the town square struck 12:45 PM with a resounding chime.\n\n\"We must proceed with utmost caution,\" whispered Eleanor, checking her brass compass. \"The magnetic anomalies began at exactly 3.14159 MHz, just as Prof. Moriarty predicted in his 1888 journal.\"\n\nThe heavy iron doors groaned on rusty hinges as they stepped across the marble threshold. Dust particles danced in the amber sunbeams filtering through stained-glass arches. On the wall hung a faded tapestry depicting the battle of Saint-Germain in A.D. 1492.\n\n\"Look here, Arthur!\" she exclaimed, pointing to an inscribed inscription: 'Ignorantia juris non excusat\u2014knowledge is the only true shield.' Could this ancient proverb hold the secret to the cipher?"
+    },
+    {
+      "num": 2,
+      "title": "Chapter 2 - Whispers in the Archive",
+      "paragraph_count": 4,
+      "full_text": "Inside the subterranean library, towering mahogany shelves held thousands of vellum folios. The air smelled of aged cedar, dried lavender, and old ink.\n\nEleanor retrieved a leather-bound volume stamped with the emblem of the Royal Philosophical Society. She flipped to page 247, scanning the meticulous handwritten notes of Mrs. H. G. Wells.\n\n\"According to section 4(b),\" Arthur murmured, studying the celestial chart, \"the planetary alignment will occur on Nov. 15th, 2026. That gives us less than 72 hours.\"\n\nSuddenly, a sharp noise echoed from the corridor\u2014a rhythmic clacking sound, like boots on flagstone. Step, click, step, click. Someone\u2014or something\u2014was approaching with chilling deliberate speed."
+    },
+    {
+      "num": 3,
+      "title": "Chapter 3 - The Obsidian Key",
+      "paragraph_count": 4,
+      "full_text": "Arthur grasped the obsidian key firmly in his right palm. Its surface was cold as glacial ice, vibrating with a subtle, rhythmic frequency of 440 Hz.\n\n\"Insert it into the central cylinder,\" Eleanor urged, holding her lantern high to illuminate the bronze keyhole.\n\nWith a decisive twist, the tumblers aligned with three distinct clicks. A hidden compartment sprang open, revealing a velvet-lined casket containing the golden astrolabe of King Solomon.\n\nThey had solved the riddle of the Crimson Tower. The truth of antiquity was finally theirs to safeguard for generations to come."
+    }
+  ]
+}

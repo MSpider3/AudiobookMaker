@@ -1,0 +1,11 @@
+{
+  "file_path": "/run/media/mehulgolecha/Extra Volume/Projects/Audio_Book_Maker/tests/fixtures/audio/synthetic_voice_reference.wav",
+  "sample_rate": 24000,
+  "channels": 1,
+  "duration_sec": 4.0,
+  "total_samples": 96000,
+  "rms": 0.11999999731779099,
+  "peak_amplitude": 0.30871617794036865,
+  "format": "WAV",
+  "subtype": "PCM_16"
+}

@@ -109,6 +109,12 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
         self.ensure_ready()
         self._validate_voice_ref(voice_ref)
 
+        if self._model == "fallback_engine" or not hasattr(self._model, "synthesize"):
+            raise RuntimeError(
+                "VibeVoice model inference is not available. Ensure model weights and dependencies "
+                "are loaded, or switch to a supported TTS provider."
+            )
+
         import numpy as np
         import soundfile as sf
 
@@ -116,8 +122,7 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
         sample_rate = getattr(self.config, "sample_rate", 24000)
         # Approximate duration based on word count
         est_duration = max(0.5, len(text.split()) * 0.35)
-        length = int(sample_rate * est_duration)
-        audio_data = np.zeros(length, dtype=np.float32)
+        audio_data = self._model.synthesize(text, voice_ref)
 
         if out_path:
             dir_name = os.path.dirname(out_path)

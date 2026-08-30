@@ -29,7 +29,13 @@ from pathlib import Path
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 from dataclasses import dataclass, field, fields, MISSING
-from typing import Callable, Any
+from typing import Callable, Any, TYPE_CHECKING
+
+import numpy as np
+import soundfile as sf
+
+if TYPE_CHECKING:
+    from audiobook_factory.tts_providers.base_tts_provider import BaseTTSProvider
 
 logger = logging.getLogger(__name__)
 
@@ -325,23 +331,23 @@ def _validate_config(config: AudiobookConfig) -> None:
     """Validate AudiobookConfig options before running the pipeline.
 
     Raises:
-        ValueError: If config.quantization is not one of _VALID_QUANTIZATION_MODES.
+        ValueError: If configuration values are invalid.
     """
     if config.quantization not in _VALID_QUANTIZATION_MODES:
         raise ValueError(
             f"Invalid quantization mode '{config.quantization}'. "
             f"Supported options: {sorted(_VALID_QUANTIZATION_MODES)}"
         )
-
-    # ── Resume / selection ────────────────────────────────────────────────────
-    # Raw chapter labels chosen in the UI (e.g. "1. Chapter 1 (~500 words)")
-    # Stored in progress JSON so the user doesn't have to re-select on resume.
-    selected_chapters:   list  = field(default_factory=list)
-
-    # When True (default), chapters marked 'completed' in the progress JSON
-    # but whose audio file is missing on disk will be automatically re-generated.
-    # When False, such chapters are logged and silently skipped.
-    regen_missing:       bool  = True
+    if config.output_format not in ("mp3", "wav", "flac", "m4b"):
+        raise ValueError(
+            f"Invalid output_format '{config.output_format}'. "
+            f"Supported options: ['flac', 'm4b', 'mp3', 'wav']"
+        )
+    if config.parallel_mode not in ("chunks", "chapters"):
+        raise ValueError(
+            f"Invalid parallel_mode '{config.parallel_mode}'. "
+            f"Supported options: ['chapters', 'chunks']"
+        )
 
 
 

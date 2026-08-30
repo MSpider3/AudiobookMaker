@@ -34,6 +34,10 @@ import signal
 import sys
 import threading
 import time
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from audiobook_factory.pipeline import AudiobookConfig
 
 # ── Ensure project root is on sys.path ───────────────────────────────────────
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -56,6 +60,7 @@ def _h(text): return f"{_BOLD}{text}{_RESET}"
 def _ok(text): return f"{_GREEN}{text}{_RESET}"
 def _info(text): return f"{_CYAN}{text}{_RESET}"
 def _warn(text): return f"{_YELL}{text}{_RESET}"
+def _err(text): return f"{_RED}{text}{_RESET}"
 def _print_banner():
     print()
     print(_h("━" * 50))
@@ -85,8 +90,11 @@ def _display_progress(
 ) -> None:
     """Displays progress in TTY mode (overwriting line) or notebook mode (new line)."""
     pct = (chunk_num / total_chunks) * 100 if total_chunks > 0 else 0
+    title_display = chapter_title
+    if len(title_display) > 35:
+        title_display = title_display[:32] + "..."
     line = (
-        f"[{chapter_num}/{total_chapters}] {chapter_title} "
+        f"[{chapter_num}/{total_chapters}] {title_display} "
         f"— chunk {chunk_num}/{total_chunks} ({pct:.1f}%)"
     )
     if _IS_TTY:
@@ -220,12 +228,13 @@ def _build_parser() -> argparse.ArgumentParser:
 # Load JSON config and merge CLI overrides
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _load_config(args) -> tuple[dict, dict, list[dict]]:
+def _load_config(args) -> tuple[dict, dict, list[dict], str]:
     """
-    Returns (meta, settings, chapters_raw).
+    Returns (meta, settings, chapters_raw, path).
     meta     — top-level keys: book_title, book_path, voice_file
     settings — the 'settings' sub-dict
     chapters_raw — the 'chapters' list (may include text/sentences)
+    path     — absolute path to the loaded progress JSON
     """
     path = os.path.abspath(args.config_json)
     try:

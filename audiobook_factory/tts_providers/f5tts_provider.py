@@ -86,38 +86,39 @@ class F5TTSProvider(BaseTTSProvider):
         est_duration = max(0.5, len(text.split()) * 0.35)
         length = int(sample_rate * est_duration)
 
-        if self._model != "stub" and hasattr(self._model, "infer"):
-            # Actual infer call if library is available
-            ref_file = voice_ref if isinstance(voice_ref, str) else None
-            if isinstance(voice_ref, bytes):
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-                    tf.write(voice_ref)
-                    ref_file = tf.name
+        if self._model == "stub" or not hasattr(self._model, "infer"):
+            raise RuntimeError(
+                "F5-TTS model is not loaded. Please install f5-tts (pip install f5-tts) or switch providers."
+            )
 
-            try:
-                nfe_step = getattr(self.config, "nfe_step", 32)
-                speed = getattr(self.config, "speed", 1.0)
-                seed = getattr(self.config, "seed", -1)
+        ref_file = voice_ref if isinstance(voice_ref, str) else None
+        if isinstance(voice_ref, bytes):
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                tf.write(voice_ref)
+                ref_file = tf.name
 
-                infer_kwargs: dict[str, Any] = {
-                    "ref_file": ref_file,
-                    "ref_text": "",
-                    "gen_text": text,
-                    "nfe_step": nfe_step,
-                    "speed": speed,
-                }
-                if seed >= 0:
-                    infer_kwargs["seed"] = seed
+        try:
+            nfe_step = getattr(self.config, "nfe_step", 32)
+            speed = getattr(self.config, "speed", 1.0)
+            seed = getattr(self.config, "seed", -1)
 
-                wav_out, sr, _ = self._model.infer(**infer_kwargs)
-                audio_data = wav_out
-                sample_rate = sr
-            except Exception as exc:
-                logger.warning("[F5-TTS] Inference error, falling back to silent frame: %s", exc)
-                audio_data = np.zeros(length, dtype=np.float32)
-        else:
-            audio_data = np.zeros(length, dtype=np.float32)
+            infer_kwargs: dict[str, Any] = {
+                "ref_file": ref_file,
+                "ref_text": "",
+                "gen_text": text,
+                "nfe_step": nfe_step,
+                "speed": speed,
+            }
+            if seed >= 0:
+                infer_kwargs["seed"] = seed
+
+            wav_out, sr, _ = self._model.infer(**infer_kwargs)
+            audio_data = wav_out
+            sample_rate = sr
+        except Exception as exc:
+            logger.error("[F5-TTS] Inference error: %s", exc)
+            raise RuntimeError(f"F5-TTS synthesis failed: {exc}") from exc
 
         if out_path:
             dir_name = os.path.dirname(out_path)

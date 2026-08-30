@@ -65,11 +65,14 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     print("[API Server] Shutdown event triggered. Cancelling active tasks...")
+    active_found = False
     for task_id, task in list(tasks.items()):
         if task.status in ("queued", "running"):
+            active_found = True
             task.cancel_token.cancel()
             await task.add_log("⛔ Server shutdown requested. Cancelling task.")
-    await asyncio.sleep(5.0)
+    if active_found:
+        await asyncio.sleep(0.2)
     try:
         from audiobook_factory.gpu_pool import GPUPoolManager
         GPUPoolManager.instance().shutdown()

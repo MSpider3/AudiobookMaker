@@ -82,10 +82,13 @@ def _get_cache_dir() -> str:
 
 
 def _get_cache_path(input_bytes: bytes, config: PreprocessConfig) -> str:
-    """Generate SHA-256 cache filename based on audio content and PreprocessConfig."""
+    """Generate SHA-256 cache filename based on audio content and canonical PreprocessConfig."""
+    import dataclasses
+    import json
     audio_hash = hashlib.sha256(input_bytes).hexdigest()[:_CACHE_HASH_LENGTH]
-    config_str = repr(config)
-    config_hash = hashlib.sha256(config_str.encode("utf-8")).hexdigest()[:_CACHE_HASH_LENGTH]
+    config_dict = dataclasses.asdict(config)
+    config_json = json.dumps(config_dict, sort_keys=True)
+    config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()[:_CACHE_HASH_LENGTH]
     filename = f"voice_{audio_hash}_{config_hash}{_CACHE_ENTRY_SUFFIX}"
     return os.path.join(_get_cache_dir(), filename)
 

@@ -50,7 +50,6 @@ audiobook_output/
 # ── Scratch / test data ───────────────────────────────────────────────────────
 scratch/
 test_narrator_voices/
-tests/
 
 # ── Debug / extraction output ─────────────────────────────────────────────────
 debug_extraction_output/
@@ -74,6 +73,7 @@ desktop.ini
 .ipynb_checkpoints/
 *.ipynb
 !AudiobookMaker_Colab.ipynb
+!program_testing.ipynb
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
@@ -82,10 +82,16 @@ logs/
 # ── Temp files ────────────────────────────────────────────────────────────────
 tmp/
 temp/
+output/
+results/
 *.tmp
-abm_ch*/          # Temp chapter processing dirs created by pipeline.py
-test_output_speed/  # Benchmark test output
-audiobook_factory/.voice_cache/  # Voice preprocessing cache
+# Temp chapter processing dirs created by pipeline.py
+abm_ch*/
+# Benchmark test output
+test_output_speed/
+# Voice preprocessing cache
+.voice_cache/
+audiobook_factory/.voice_cache/
 plan.md
 
 # ── Rust ──────────────────────────────────────────────────────────────────────
