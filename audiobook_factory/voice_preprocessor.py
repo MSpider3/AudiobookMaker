@@ -81,10 +81,21 @@ def _get_cache_dir() -> str:
     return cache_dir
 
 
-def _get_cache_path(input_bytes: bytes, config: PreprocessConfig) -> str:
+def _get_cache_path(input_audio: bytes | str | os.PathLike, config: PreprocessConfig) -> str:
     """Generate SHA-256 cache filename based on audio content and canonical PreprocessConfig."""
     import dataclasses
     import json
+    if isinstance(input_audio, (str, os.PathLike)):
+        if os.path.exists(input_audio) and os.path.isfile(input_audio):
+            with open(input_audio, "rb") as f:
+                input_bytes = f.read()
+        else:
+            input_bytes = str(input_audio).encode("utf-8")
+    elif isinstance(input_audio, (bytes, bytearray)):
+        input_bytes = bytes(input_audio)
+    else:
+        input_bytes = str(input_audio).encode("utf-8")
+
     audio_hash = hashlib.sha256(input_bytes).hexdigest()[:_CACHE_HASH_LENGTH]
     config_dict = dataclasses.asdict(config)
     config_json = json.dumps(config_dict, sort_keys=True)
@@ -241,25 +252,40 @@ def _run_preprocessing_pipeline(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def preprocess(
-    input_bytes: bytes,
+    input_audio: bytes | str | os.PathLike,
     config: PreprocessConfig | None = None,
     log_fn=None,
     use_cache: bool = True,
 ) -> bytes:
     """
-    Process a raw WAV byte-string through the configured pipeline.
+    Process a raw WAV byte-string or audio file path through the configured pipeline.
 
     Parameters
     ----------
-    input_bytes : raw audio bytes (WAV format)
-    config      : PreprocessConfig; uses defaults if None
-    log_fn      : optional callable(str) for progress reporting
-    use_cache   : bool; if True, checks and populates disk cache
+    input_audio : bytes | str | os.PathLike
+        Raw audio bytes (WAV format) or file path to an audio file on disk.
+    config : PreprocessConfig, optional
+        Preprocessing parameters; uses defaults if None.
+    log_fn : callable, optional
+        Optional callable(str) for progress reporting.
+    use_cache : bool, default True
+        If True, checks and populates disk cache.
 
     Returns
     -------
     bytes : processed WAV audio bytes
     """
+    if isinstance(input_audio, (str, os.PathLike)):
+        if os.path.exists(input_audio) and os.path.isfile(input_audio):
+            with open(input_audio, "rb") as f:
+                input_bytes = f.read()
+        else:
+            input_bytes = str(input_audio).encode("utf-8")
+    elif isinstance(input_audio, (bytes, bytearray)):
+        input_bytes = bytes(input_audio)
+    else:
+        raise TypeError(f"input_audio must be bytes or str/path, got {type(input_audio)}")
+
     if config is None:
         config = PreprocessConfig()
 

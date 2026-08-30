@@ -81,7 +81,7 @@ def generate_report() -> str:
     lines.append("\n---\n")
 
     # 4. Real Audio & Real Book Generation (Google Drive Assets)
-    if real.get("real_assets_found"):
+    if real.get("real_assets_found") or real.get("real_voice_found"):
         lines.append("## 4. Real Audio & Real Book Generation (Google Drive Assets)\n")
         st = "✅ PASS" if real.get("status") == "passed" else "❌ FAIL"
         lines.append(f"- **Status:** {st}")

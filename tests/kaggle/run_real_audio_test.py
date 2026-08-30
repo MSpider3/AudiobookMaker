@@ -81,6 +81,7 @@ def run_real_audio_tests() -> dict:
         return results
 
     results["real_voice_found"] = True
+    results["real_assets_found"] = True
     results["voice_path"] = real_voice
     results["book_path"] = book_source
     print(f"  ✓ Using Real Voice: {real_voice}")
@@ -88,8 +89,11 @@ def run_real_audio_tests() -> dict:
 
     # 1. Preprocess Real Voice Reference
     print("\n[Step 1] Running 7-step DSP cleaning on real voice reference...")
-    cleaned_voice_path = preprocess(real_voice, PreprocessConfig())
-    print(f"  ✓ Cleaned voice reference cached at: {cleaned_voice_path}")
+    cleaned_voice_bytes = preprocess(real_voice, PreprocessConfig())
+    cleaned_voice_path = os.path.join(os.path.dirname(real_voice), "cleaned_voice.wav")
+    with open(cleaned_voice_path, "wb") as f:
+        f.write(cleaned_voice_bytes)
+    print(f"  ✓ Cleaned voice reference saved at: {cleaned_voice_path}")
 
     # 2. Extract Chapters from Fixture Document
     print(f"\n[Step 2] Extracting text from document ({os.path.basename(book_source)})...")

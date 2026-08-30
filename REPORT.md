@@ -1,6 +1,6 @@
 # AudiobookMaker — Kaggle GPU Verification & QA Audit Report
 
-**Generated:** 2026-08-26 18:01:03 UTC
+**Generated:** 2026-08-30 19:55:28 UTC
 
 **Branch:** `qa/full-audit`
 
@@ -37,6 +37,19 @@
 | **EPUB** | ✅ PASS | 3 | 3 | 2.21s |
 | **TXT** | ✅ PASS | 1 | 1 | 0.16s |
 | **DOCX** | ✅ PASS | 1 | 1 | 0.21s |
+
+---
+
+## 4. Real Audio & Real Book Generation (Google Drive Assets)
+
+- **Status:** ✅ PASS
+- **Voice Source:** `/run/media/mehulgolecha/Extra Volume/Projects/Audio_Book_Maker/narrator_voice/real_voice.wav`
+- **Book Source:** `/run/media/mehulgolecha/Extra Volume/Projects/Audio_Book_Maker/tests/fixtures/source_documents/dummy_book.epub`
+- **Elapsed Time:** 2.83s
+
+| Output File | Duration | RMS | Valid Audio | LRC | SRT | VTT |
+|---|---|---|---|---|---|---|
+| `Chapter 1 - The Crimson Tower.mp3` | 61.73s | 0.0715 | ✅ | ✅ | ✅ | ✅ |
 
 ---
 
