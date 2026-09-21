@@ -122,6 +122,26 @@ async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
 
         try:
             cfg = AudiobookConfig.from_dict(task.config_dict)
+            # Security: /api/v1/generate is unauthenticated, so output_dir from
+            # the request body must never reach the pipeline's
+            # makedirs/os.remove/write sinks as-is. Contain it inside the
+            # server output base (default <project root>/audiobook_output;
+            # override with the ABM_OUTPUT_BASE environment variable).
+            _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            _base = os.path.realpath(
+                os.environ.get(
+                    "ABM_OUTPUT_BASE", os.path.join(_root, "audiobook_output")
+                )
+            )
+            _raw = os.path.expanduser(str(cfg.output_dir or ""))
+            if not os.path.isabs(_raw):
+                _raw = os.path.join(_base, _raw)
+            _out = os.path.realpath(_raw)
+            if _out != _base and not _out.startswith(_base + os.sep):
+                raise ValueError(
+                    "output_dir must resolve inside the server output base directory"
+                )
+            cfg.output_dir = _out
             chapters = [
                 ExtractedChapter(
                     num=ch.get("num", idx + 1),

@@ -224,6 +224,57 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# ── Settings allowlists for progress JSON (BUG-R4-C1-A4-H1) ─────────────────
+_ALLOWED_PROVIDERS: set[str] = {
+    "qwen", "qwen3", "qwen3-tts",
+    "vibevoice", "vibe-voice", "vibevoice-1.5b",
+    "f5tts", "f5-tts", "f5_tts",
+    "mock", "dummy", "test", "",
+}
+
+_ALLOWED_VIBEVOICE_MODELS: set[str] = {
+    "bezzam/VibeVoice-1.5B-hf",
+    "microsoft/VibeVoice-1.5B",
+}
+
+_ALLOWED_QWEN_MODELS: set[str] = {
+    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+}
+
+
+def _validate_loaded_settings(settings: dict, args: Any, path: str) -> None:
+    """Validate untrusted configuration loaded from progress JSON (BUG-R4-C1-A4-H1)."""
+    # 1. Provider validation
+    provider = str(settings.get("tts_provider_name", "qwen")).lower().strip()
+    if provider not in _ALLOWED_PROVIDERS:
+        raise ValueError(f"Untrusted or invalid tts_provider_name '{provider}' in progress JSON settings.")
+
+    # 2. Model name validation
+    model = str(settings.get("tts_model_name", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")).strip()
+    if provider in ("vibevoice", "vibe-voice", "vibevoice-1.5b"):
+        if model not in _ALLOWED_VIBEVOICE_MODELS:
+            raise ValueError(f"Untrusted or invalid tts_model_name '{model}' for VibeVoice provider in config settings.")
+    elif provider in ("qwen", "qwen3", "qwen3-tts", ""):
+        if not (model in _ALLOWED_QWEN_MODELS or model.startswith("Qwen/Qwen3-TTS-")):
+            raise ValueError(f"Untrusted or invalid tts_model_name '{model}' for Qwen provider in config settings.")
+
+    # 3. Output dir validation
+    # If not explicitly overridden by the user via CLI --output-dir, ensure output_dir stays within safe bounds
+    if settings.get("output_dir") and not getattr(args, "output_dir", None):
+        out_dir = settings["output_dir"]
+        norm_out = os.path.realpath(os.path.abspath(out_dir))
+        allowed_roots = [
+            os.path.realpath(os.path.abspath(os.path.join(_ROOT, "audiobook_output"))),
+            os.path.realpath(os.path.abspath(os.path.dirname(path))),
+        ]
+        if not any(norm_out == r or norm_out.startswith(r + os.sep) for r in allowed_roots):
+            raise ValueError(f"Untrusted output_dir '{out_dir}' in progress JSON: path outside allowed output directories.")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Load JSON config and merge CLI overrides
 # ══════════════════════════════════════════════════════════════════════════════
@@ -282,6 +333,9 @@ def _load_config(args) -> tuple[dict, dict, list[dict], str]:
         settings["quantization"] = args.quantization
     if getattr(args, "no_resume_chunks", False):
         settings["resume_incomplete_chunks"] = False
+
+    # Validate settings against allowlists to prevent settings poisoning
+    _validate_loaded_settings(settings, args, path)
 
     return meta, settings, chapters_raw, path
 

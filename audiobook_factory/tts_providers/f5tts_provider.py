@@ -65,6 +65,7 @@ class F5TTSProvider(BaseTTSProvider):
                     raise RuntimeError(msg) from imp_err
                 logger.info("[F5-TTS] Initialized successfully.")
             except Exception as exc:
+                self._model = None
                 logger.error("[F5-TTS] Initialization failed: %s", exc)
                 raise RuntimeError(f"F5-TTS initialization failed: {exc}") from exc
 
@@ -84,9 +85,8 @@ class F5TTSProvider(BaseTTSProvider):
 
         sample_rate = getattr(self.config, "sample_rate", 24000)
         est_duration = max(0.5, len(text.split()) * 0.35)
-        length = int(sample_rate * est_duration)
 
-        if self._model == "stub" or not hasattr(self._model, "infer"):
+        if self._model is None or not hasattr(self._model, "infer"):
             raise RuntimeError(
                 "F5-TTS model is not loaded. Please install f5-tts (pip install f5-tts) or switch providers."
             )
@@ -120,17 +120,19 @@ class F5TTSProvider(BaseTTSProvider):
             logger.error("[F5-TTS] Inference error: %s", exc)
             raise RuntimeError(f"F5-TTS synthesis failed: {exc}") from exc
 
+        duration = len(audio_data) / float(sample_rate) if sample_rate > 0 else est_duration
+
         if out_path:
             dir_name = os.path.dirname(out_path)
             if dir_name:
                 os.makedirs(dir_name, exist_ok=True)
             sf.write(out_path, audio_data, sample_rate)
-            return out_path, est_duration
+            return out_path, duration
         else:
             buf = io.BytesIO()
             sf.write(buf, audio_data, sample_rate, format="WAV")
             buf.seek(0)
-            return buf.read(), est_duration
+            return buf.read(), duration
 
     def synthesize_batch(
         self,

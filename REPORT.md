@@ -43,8 +43,8 @@
 ## 4. Real Audio & Real Book Generation (Google Drive Assets)
 
 - **Status:** ✅ PASS
-- **Voice Source:** `/run/media/mehulgolecha/Extra Volume/Projects/Audio_Book_Maker/narrator_voice/real_voice.wav`
-- **Book Source:** `/run/media/mehulgolecha/Extra Volume/Projects/Audio_Book_Maker/tests/fixtures/source_documents/dummy_book.epub`
+- **Voice Source:** `narrator_voice/real_voice.wav`
+- **Book Source:** `tests/fixtures/source_documents/dummy_book.epub`
 - **Elapsed Time:** 2.83s
 
 | Output File | Duration | RMS | Valid Audio | LRC | SRT | VTT |

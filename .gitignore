@@ -50,6 +50,7 @@ audiobook_output/
 # ── Scratch / test data ───────────────────────────────────────────────────────
 scratch/
 test_narrator_voices/
+dogfood-output/
 
 # ── Debug / extraction output ─────────────────────────────────────────────────
 debug_extraction_output/

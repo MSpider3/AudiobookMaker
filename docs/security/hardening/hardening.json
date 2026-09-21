@@ -1,0 +1,310 @@
+{
+  "documentType": "codex-security.hardening-analysis",
+  "schemaVersion": "1.0",
+  "analysisId": "hardening_20260921_audiobookmaker",
+  "sourceEvidence": {
+    "kind": "document_collection",
+    "label": "MSpider3/AudiobookMaker vulnerability disclosures",
+    "collectionSha256": "43928a64fb5dc2ca81f440a7a0300df28a798f3957eb0a0ad52f85fa2210a40d",
+    "artifactCount": 13,
+    "sourceDrift": "none"
+  },
+  "assessment": {
+    "outcome": "opportunities_identified",
+    "summary": "Two systemic hardening opportunities developed: centralized archive pre-flight validation and session-scoped workspace isolation."
+  },
+  "constraints": {
+    "profile": "balanced",
+    "changeHorizons": [
+      "incremental",
+      "medium_term"
+    ],
+    "nonNegotiables": [
+      "Preserve CLI headless operation",
+      "Maintain pure-Python fallbacks",
+      "Zero regression in generation latency"
+    ],
+    "assumptions": [
+      "Single-node or workstation deployment target with optional shared web access."
+    ]
+  },
+  "opportunities": [
+    {
+      "opportunityId": "unified-session-workspace",
+      "title": "Unified Session-Scoped Workspace and Path Isolation Boundary",
+      "summary": "Isolate user workspaces, progress state, and generated media across multi-tenant web sessions and API tasks.",
+      "diagnosis": "FastAPI and Gradio previously operated on global title-based paths in audiobook_output without tenant ownership.",
+      "evidence": [
+        {
+          "claimType": "observed",
+          "sourceKind": "finding",
+          "evidenceId": "VULN-02",
+          "path": "api/worker.py",
+          "claim": "FastAPI worker allowed arbitrary output_dir paths escaping workspace."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "finding",
+          "evidenceId": "VULN-12",
+          "path": "app.py",
+          "claim": "Gradio UI permitted cross-session overwrite of progress state by matching book title."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "finding",
+          "evidenceId": "VULN-13",
+          "path": "app.py",
+          "claim": "Cached chapter text was disclosed across sessions on title collision."
+        }
+      ],
+      "desiredInvariants": [
+        "Every progress read/write evaluates session ownership against the caller.",
+        "Output directories resolve strictly within ABM_OUTPUT_BASE."
+      ],
+      "proposalPath": "proposals/unified-session-workspace.md",
+      "options": [
+        {
+          "optionId": "in-memory-ownership",
+          "title": "In-Memory Ownership Registry & Strict Subpath Anchoring",
+          "kind": "baseline",
+          "summary": "Enforce session ownership in Gradio handlers and canonicalize API output paths to ABM_OUTPUT_BASE.",
+          "diagramPaths": {
+            "before": "diagrams/unified-session-workspace-before.mmd",
+            "after": "diagrams/unified-session-workspace-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "VULN-02",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Directly anchors API worker output_dir within ABM_OUTPUT_BASE."
+            },
+            {
+              "evidenceId": "VULN-12",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Registers progress owners per session and blocks unauthorized overwrites."
+            },
+            {
+              "evidenceId": "VULN-13",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Prevents unauthorized loading of cached chapter text across sessions."
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Neutralizes path traversal and title-collision data disclosure.",
+              "validationPlan": "Run automated session ownership and output dir tests."
+            },
+            {
+              "dimension": "performance",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "O(1) memory lookup for session tokens adds no latency.",
+              "validationPlan": "Verify response latency on UI events."
+            },
+            {
+              "dimension": "memory",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Negligible memory overhead for ownership dictionary.",
+              "validationPlan": "Inspect heap size under concurrent session simulation."
+            },
+            {
+              "dimension": "reliability",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Eliminates accidental race conditions where users overwrite each other's progress.",
+              "validationPlan": "Simulate simultaneous generation tasks with matching titles."
+            },
+            {
+              "dimension": "operability",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "No external infrastructure or database dependencies introduced.",
+              "validationPlan": "Verify standard start script behavior."
+            },
+            {
+              "dimension": "migration",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Fully backwards compatible with existing local setups.",
+              "validationPlan": "Verify existing progress files continue to load."
+            }
+          ],
+          "residualRisks": [
+            "In-memory registry resets on process restart."
+          ],
+          "implementationReadiness": {
+            "affectedComponents": [
+              "app.py",
+              "api/worker.py"
+            ],
+            "workPackages": [
+              "Implement _owns_progress and _register_progress_owner in app.py.",
+              "Anchor API worker output_dir to ABM_OUTPUT_BASE."
+            ],
+            "acceptanceCriteria": [
+              "Cross-session access returns permission warning.",
+              "Path traversal payload in API returns sanitized bounded path."
+            ],
+            "migrationNotes": [],
+            "rollback": "Revert session checks and path anchoring commits."
+          }
+        }
+      ],
+      "recommendedOptionId": "in-memory-ownership",
+      "recommendation": "Adopt Option 1 immediately as verified by automated test suite."
+    },
+    {
+      "opportunityId": "centralize-archive-containment",
+      "title": "Centralized Archive Pre-flight Ingestion & Resource Sandboxing",
+      "summary": "Introduce strict uncompressed size, member count, and structural geometry limits before archive extraction.",
+      "diagnosis": "Parsers decompressed untrusted zip entries (EPUB/DOCX/ODT) and expanded huge table/page ranges into memory without limits.",
+      "evidence": [
+        {
+          "claimType": "observed",
+          "sourceKind": "finding",
+          "evidenceId": "VULN-04",
+          "path": "audiobook_factory/extractor_engine.py",
+          "claim": "Docling engine uncompressed nested EPUB zip bombs to gigabytes in memory."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "finding",
+          "evidenceId": "VULN-07",
+          "path": "audiobook_factory/text_extractor.py",
+          "claim": "PDF page range expansion allowed unbounded page iteration causing DoS."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "finding",
+          "evidenceId": "VULN-08",
+          "path": "audiobook_factory/extractor_engine.py",
+          "claim": "HTML table colspan/rowspan attributes in EPUB caused 100k x 100k matrix allocations."
+        }
+      ],
+      "desiredInvariants": [
+        "No archive file exceeding 512 MiB uncompressed size or 2000 entries is decompressed.",
+        "PDF page range extractions are bounded to max 5000 pages and 20M characters.",
+        "HTML table spans are clamped to max 1000 cells."
+      ],
+      "proposalPath": "proposals/centralize-archive-containment.md",
+      "options": [
+        {
+          "optionId": "preflight-quotas",
+          "title": "Unified Pre-Flight Archive & Structural Quotas",
+          "kind": "baseline",
+          "summary": "Pre-flight validation using _assert_zip_safe and geometry clamping before passing to parsers.",
+          "diagramPaths": {
+            "before": "diagrams/centralize-archive-containment-before.mmd",
+            "after": "diagrams/centralize-archive-containment-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "VULN-04",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Enforces 512 MiB and 2000 member limits on EPUB archives."
+            },
+            {
+              "evidenceId": "VULN-07",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Caps PDF page extraction to 5,000 pages and 20M characters."
+            },
+            {
+              "evidenceId": "VULN-08",
+              "effect": "addresses",
+              "tacticalFixRequired": true,
+              "rationale": "Clamps colspan and rowspan to 1000 in HTML preprocessing."
+            }
+          ],
+          "tradeoffs": [
+            {
+              "dimension": "security",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Neutralizes zip bomb expansion and parser algorithmic complexity attacks.",
+              "validationPlan": "Run bomb fixtures and verify clean rejection."
+            },
+            {
+              "dimension": "performance",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Zip header inspection takes less than 5ms.",
+              "validationPlan": "Benchmark extraction time on standard documents."
+            },
+            {
+              "dimension": "memory",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Guarantees process memory cannot be exhausted by crafted archives.",
+              "validationPlan": "Measure memory footprint during malicious file ingestion."
+            },
+            {
+              "dimension": "reliability",
+              "direction": "improves",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Prevents host out-of-memory kernel kills.",
+              "validationPlan": "Test continuous server operation under adversarial inputs."
+            },
+            {
+              "dimension": "operability",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Pure Python implementation with no OS-specific configuration.",
+              "validationPlan": "Test on Linux, macOS, and Windows."
+            },
+            {
+              "dimension": "migration",
+              "direction": "neutral",
+              "confidence": "high",
+              "basis": "source-derived",
+              "assessment": "Legitimate books easily fit well within the 512 MiB / 5,000 page quota.",
+              "validationPlan": "Verify extraction of typical books."
+            }
+          ],
+          "residualRisks": [
+            "Extremely large encyclopedic documents (>512 MiB uncompressed text) require configuration override."
+          ],
+          "implementationReadiness": {
+            "affectedComponents": [
+              "audiobook_factory/text_extractor.py",
+              "audiobook_factory/extractor_engine.py"
+            ],
+            "workPackages": [
+              "Add _assert_zip_safe in text_extractor.py and extractor_engine.py.",
+              "Enforce page range caps in _extract_pdf_ranges.",
+              "Add regex table span clamping in _preprocess_html."
+            ],
+            "acceptanceCriteria": [
+              "Zip bomb archives raise ValueError and return empty/fail cleanly.",
+              "Unbounded PDF page ranges are clamped."
+            ],
+            "migrationNotes": [],
+            "rollback": "Revert pre-flight quota checks."
+          }
+        }
+      ],
+      "recommendedOptionId": "preflight-quotas",
+      "recommendation": "Adopt Option 1 immediately as verified by automated test suite."
+    }
+  ],
+  "openQuestions": []
+}

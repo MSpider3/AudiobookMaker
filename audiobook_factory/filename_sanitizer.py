@@ -98,6 +98,13 @@ def make_safe_filename(
         raise ValueError("ext must be non-empty")
     if not ext.startswith("."):
         ext = "." + ext
+    # ext reaches this function from request-controlled config
+    # (AudiobookConfig.output_format, joined at pipeline.py:1180/746/639).
+    # It must remain a plain suffix: any path character here escapes
+    # output_dir once the returned name is joined (CWE-22).
+    _body = ext[1:]
+    if not _body or any(ch in _FORBIDDEN or ch == "." or ord(ch) < 32 for ch in _body):
+        raise ValueError(f"ext must be a simple extension suffix, got {ext!r}")
 
     name_max = _detect_name_max(output_dir)
     effective_name_max = max(64, min(name_max, 255))

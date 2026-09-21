@@ -58,10 +58,17 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
             logger.info("[VibeVoice] Loading VibeVoice-1.5B model on %s...", self._device)
             try:
                 import torch
-                from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+                from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+                _BLESSED_VIBEVOICE_MODELS = {"bezzam/VibeVoice-1.5B-hf", "microsoft/VibeVoice-1.5B"}
                 model_name = getattr(self.config, "tts_model_name", "bezzam/VibeVoice-1.5B-hf")
-                if "VibeVoice" not in model_name:
+                if not model_name or model_name.startswith("Qwen/"):
                     model_name = "bezzam/VibeVoice-1.5B-hf"
+                elif model_name not in _BLESSED_VIBEVOICE_MODELS:
+                    raise ValueError(
+                        f"Refusing to load unapproved VibeVoice model '{model_name}': "
+                        "this provider enables trust_remote_code, and only the "
+                        "reviewed upstream model id may be loaded."
+                    )
 
                 dtype = torch.float16
                 if self._dtype_override == "bfloat16":
@@ -80,21 +87,24 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
                         logger.warning("[VibeVoice] Tokenizer fallback info: %s", tok_err)
                         self._processor = None
 
-                try:
-                    self._model = AutoModelForCausalLM.from_pretrained(
-                        model_name,
-                        torch_dtype=dtype,
-                        trust_remote_code=True,
-                        device_map=self._device if "cuda" in self._device else None,
-                    )
-                except Exception as model_err:
-                    logger.warning("[VibeVoice] AutoModelForCausalLM failed (%s), running in lightweight engine mode.", model_err)
-                    self._model = "fallback_engine"
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                    device_map=self._device if "cuda" in self._device else None,
+                )
 
                 if hasattr(self._model, "eval"):
                     self._model.eval()
                 logger.info("[VibeVoice] Model loaded successfully on %s.", self._device)
+            except ValueError as val_err:
+                if "Refusing to load unapproved VibeVoice model" in str(val_err):
+                    raise
+                self._model = None
+                logger.error("[VibeVoice] Failed to load VibeVoice model: %s", val_err)
+                raise RuntimeError(f"VibeVoice initialization failed: {val_err}") from val_err
             except Exception as exc:
+                self._model = None
                 logger.error("[VibeVoice] Failed to load VibeVoice model: %s", exc)
                 raise RuntimeError(f"VibeVoice initialization failed: {exc}") from exc
 
@@ -109,7 +119,7 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
         self.ensure_ready()
         self._validate_voice_ref(voice_ref)
 
-        if self._model == "fallback_engine" or not hasattr(self._model, "synthesize"):
+        if self._model is None or not hasattr(self._model, "synthesize"):
             raise RuntimeError(
                 "VibeVoice model inference is not available. Ensure model weights and dependencies "
                 "are loaded, or switch to a supported TTS provider."
@@ -120,21 +130,23 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
 
         # Synthesize audio segment
         sample_rate = getattr(self.config, "sample_rate", 24000)
-        # Approximate duration based on word count
-        est_duration = max(0.5, len(text.split()) * 0.35)
         audio_data = self._model.synthesize(text, voice_ref)
+        if hasattr(audio_data, "__len__") and sample_rate > 0:
+            duration = len(audio_data) / float(sample_rate)
+        else:
+            duration = max(0.5, len(text.split()) * 0.35)
 
         if out_path:
             dir_name = os.path.dirname(out_path)
             if dir_name:
                 os.makedirs(dir_name, exist_ok=True)
             sf.write(out_path, audio_data, sample_rate)
-            return out_path, est_duration
+            return out_path, duration
         else:
             buf = io.BytesIO()
             sf.write(buf, audio_data, sample_rate, format="WAV")
             buf.seek(0)
-            return buf.read(), est_duration
+            return buf.read(), duration
 
     def synthesize_batch(
         self,

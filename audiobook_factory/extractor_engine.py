@@ -34,6 +34,9 @@ _ROOT = Path(__file__).resolve().parent.parent
 _TEMP_DIR = _ROOT / "temp"
 _TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── Safe table span limit to prevent Docling OOM (BUG-R2-C3-A4-H1) ───────────
+_MAX_TABLE_SPAN: int = 1000
+
 # ── sys.path so the project root is importable ───────────────────────────────
 # This file lives in audiobook_factory/, so go up one level to find the project root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -633,6 +636,18 @@ class DocumentIngestor:
 
                 span.unwrap()   # merge single-char drop-cap with following word
 
+        # ── Clamp table colspan and rowspan to prevent Docling OOM (BUG-R2-C3-A4-H1) ──
+        for cell in soup.find_all(["td", "th"]):
+            for attr in ("colspan", "rowspan"):
+                val = cell.get(attr)
+                if val:
+                    try:
+                        num = int(val)
+                        if num > _MAX_TABLE_SPAN:
+                            cell[attr] = str(_MAX_TABLE_SPAN)
+                    except (ValueError, TypeError):
+                        pass
+
         # ── In-flight EPUB Image OCR ──
         if epub_book is not None:
             try:
@@ -801,6 +816,8 @@ class DocumentIngestor:
         classifier: MLClassifier,
         normalizer: TextNormalizer,
     ) -> tuple[list[ChapterItem], list[SkippedItem], list[TocEntry]]:
+        from audiobook_factory.text_extractor import _assert_zip_safe  # type: ignore
+        _assert_zip_safe(epub_path)
 
         book  = epub.read_epub(epub_path)
         items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))

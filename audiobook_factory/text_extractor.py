@@ -213,11 +213,41 @@ def scan(path: str) -> ScanResult:
         return ScanResult(file_type=ftype, has_toc=False, page_count=0)
 
 
+_ZIP_MAX_UNCOMPRESSED = 512 * 1024 * 1024   # 512 MiB total uncompressed
+_ZIP_MAX_MEMBERS = 2000
+
+
+def _assert_zip_safe(path: str) -> None:
+    """Reject archive-based documents whose declared uncompressed payload
+    exceeds safe bounds BEFORE any eager whole-archive reader decompresses it.
+    CPython's zipfile never inflates beyond a member's declared file_size, so capping
+    the declared sizes bounds the memory an archive reader can allocate."""
+    import zipfile
+    with zipfile.ZipFile(path, "r") as z:
+        infos = z.infolist()
+        if len(infos) > _ZIP_MAX_MEMBERS:
+            raise ValueError(f"Archive too large: too many archive members ({len(infos)})")
+        total = 0
+        for info in infos:
+            total += info.file_size
+            if info.file_size > _ZIP_MAX_UNCOMPRESSED:
+                raise ValueError(
+                    f"Archive too large: member {info.filename!r} declares "
+                    f"{info.file_size} bytes uncompressed (limit {_ZIP_MAX_UNCOMPRESSED})"
+                )
+        if total > _ZIP_MAX_UNCOMPRESSED:
+            raise ValueError(
+                f"Archive too large when decompressed "
+                f"({total} bytes, limit {_ZIP_MAX_UNCOMPRESSED})"
+            )
+
+
 def _scan_epub(path: str, ftype: str) -> ScanResult:
     from ebooklib import epub
     from audiobook_factory.extractor_engine import DocumentIngestor  # type: ignore
 
     try:
+        _assert_zip_safe(path)
         book = epub.read_epub(path)
         title, author, cover_data = _epub_metadata(book)
 
@@ -270,6 +300,7 @@ def _scan_pdf(path: str) -> ScanResult:
 def _scan_docx(path: str) -> ScanResult:
     page_count = 0
     try:
+        _assert_zip_safe(path)
         import docx2txt  # type: ignore
         # docx doesn't expose page count easily; count sections as proxy
         from docx import Document as _DocxDoc  # type: ignore
@@ -285,6 +316,7 @@ def _scan_docx(path: str) -> ScanResult:
 def _scan_odt(path: str) -> ScanResult:
     page_count = 0
     try:
+        _assert_zip_safe(path)
         from odf.opendocument import load as odf_load  # type: ignore
         from odf.text import P  # type: ignore
         doc = odf_load(path)
@@ -337,6 +369,7 @@ def _extract_epub(
     enable_ocr: bool,
     log,
 ) -> tuple[list[ExtractedChapter], bytes | None]:
+    _assert_zip_safe(path)
     from audiobook_factory.extractor_engine import (  # type: ignore
         DocumentIngestor, MLClassifier, TextNormalizer
     )
@@ -426,6 +459,11 @@ def _extract_pdf_ranges(path, page_ranges, ingestor, normalizer, log):
     from audiobook_factory.extractor_engine import TextNormalizer  # type: ignore
     from audiobook_factory.text_processing import smart_sentence_splitter
 
+    # ── Resource-safety caps (pre-auth anonymous surface) ──────────────────
+    MAX_RANGES        = 64
+    MAX_PAGES         = 5_000
+    MAX_EXTRACT_CHARS = 20_000_000
+
     try:
         import fitz
     except ImportError:
@@ -434,20 +472,49 @@ def _extract_pdf_ranges(path, page_ranges, ingestor, normalizer, log):
 
     doc = fitz.open(path)
     results = []
+    pages_left = MAX_PAGES
+    chars_left = MAX_EXTRACT_CHARS
+
+    def _page_text(i):
+        nonlocal chars_left
+        t = doc[i].get_text("text")
+        chars_left -= len(t)
+        return t
 
     if not page_ranges:
         # Whole document
-        all_text = "\n\n".join(doc[i].get_text("text") for i in range(doc.page_count))
+        parts = []
+        for i in range(min(doc.page_count, pages_left)):
+            parts.append(_page_text(i))
+            if chars_left <= 0:
+                log("[WARN] Extracted-text limit reached — truncating extraction.")
+                break
+        all_text = "\n\n".join(parts)
+        del parts
         text = normalizer.normalize(all_text, title="", ocr_block_texts=[])
+        del all_text
         results.append(ExtractedChapter(
             num=1, title="Full Book", text=text,
             sentences=smart_sentence_splitter(text)
         ))
     else:
-        for idx, (start, end) in enumerate(page_ranges, 1):
+        seen: set[tuple[int, int]] = set()
+        idx = 0
+        for start, end in page_ranges:
+            if idx >= MAX_RANGES or pages_left <= 0 or chars_left <= 0:
+                log("[WARN] Page-range limits reached — stopping extraction.")
+                break
+            if (start, end) in seen:   # identical ranges are pure duplicates
+                continue
+            seen.add((start, end))
             pages = range(max(0, start - 1), min(end, doc.page_count))
-            raw   = "\n\n".join(doc[i].get_text("text") for i in pages)
+            if len(pages) > pages_left:
+                pages = pages[:pages_left]
+            pages_left -= len(pages)
+            raw   = "\n\n".join(_page_text(i) for i in pages)
+            idx  += 1
             text  = normalizer.normalize(raw, title="", ocr_block_texts=[])
+            del raw
             results.append(ExtractedChapter(
                 num=idx,
                 title=f"Chapter {idx} (pp. {start}–{end})",
@@ -455,6 +522,9 @@ def _extract_pdf_ranges(path, page_ranges, ingestor, normalizer, log):
                 sentences=smart_sentence_splitter(text),
             ))
             log(f"  ✓ Extracted pages {start}–{end}")
+            if pages_left <= 0 or chars_left <= 0:
+                log("[WARN] Page/extracted-text limits reached — stopping extraction.")
+                break
 
     doc.close()
     return results
@@ -462,6 +532,11 @@ def _extract_pdf_ranges(path, page_ranges, ingestor, normalizer, log):
 
 def _extract_docx(path, page_ranges, normalizer, log):
     from audiobook_factory.text_processing import smart_sentence_splitter
+    try:
+        _assert_zip_safe(path)
+    except Exception as e:
+        log(f"[ERROR] Rejected unsafe DOCX archive: {e}")
+        return []
     try:
         from docx import Document as _DocxDoc  # type: ignore
     except ImportError:
@@ -476,6 +551,11 @@ def _extract_docx(path, page_ranges, normalizer, log):
 
 def _extract_odt(path, page_ranges, normalizer, log):
     from audiobook_factory.text_processing import smart_sentence_splitter
+    try:
+        _assert_zip_safe(path)
+    except Exception as e:
+        log(f"[ERROR] Rejected unsafe ODT archive: {e}")
+        return []
     try:
         from odf.opendocument import load as odf_load  # type: ignore
         from odf.text import P  # type: ignore

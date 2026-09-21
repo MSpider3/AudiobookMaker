@@ -1,0 +1,24 @@
+flowchart TD
+    subgraph Client["Untrusted Web / API Clients"]
+        Alice["User Alice (Session A)"]
+        Mallory["User Mallory (Session M)"]
+    end
+
+    subgraph SecurityBoundary["Session & Path Isolation Boundary"]
+        SessionMgr["Session & Token Authorizer\n(_get_session_id & _PROGRESS_OWNERS)"]
+        PathSanitizer["Path Containment Validator\n(ABM_OUTPUT_BASE anchor & canonicalization)"]
+    end
+
+    subgraph SandboxedStorage["Tenant-Isolated Storage (ABM_OUTPUT_BASE)"]
+        AliceDir["Session A Workspace\n./audiobook_output/session_a/{title}/"]
+        MalloryDir["Session M Workspace\n./audiobook_output/session_m/{title}/"]
+    end
+
+    Alice -->|"Request with Session A"| SessionMgr
+    Mallory -->|"Request with Session M"| SessionMgr
+
+    SessionMgr -->|"Authorized access to Session A state"| PathSanitizer
+    SessionMgr -.->|"403 Forbidden on cross-session access"| Mallory
+
+    PathSanitizer -->|"Constrained path write"| AliceDir
+    PathSanitizer -->|"Constrained path write"| MalloryDir

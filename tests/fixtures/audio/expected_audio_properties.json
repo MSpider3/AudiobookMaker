@@ -1,5 +1,5 @@
 {
-  "file_path": "/run/media/mehulgolecha/Extra Volume/Projects/Audio_Book_Maker/tests/fixtures/audio/synthetic_voice_reference.wav",
+  "file_path": "tests/fixtures/audio/synthetic_voice_reference.wav",
   "sample_rate": 24000,
   "channels": 1,
   "duration_sec": 4.0,

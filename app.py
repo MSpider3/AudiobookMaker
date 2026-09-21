@@ -79,15 +79,42 @@ def _make_zip(files: list[str]) -> str:
     return zip_path
 
 
-def check_existing_progress(book_title):
+# ── Session-bound progress tracking (BUG-R2-C1-A2-H5 & BUG-R4-C1-A4-H2) ───────
+_PROGRESS_OWNERS: dict[str, str] = {}
+_PROGRESS_LOCK = threading.Lock()
+
+
+def _get_session_id(request: Any | None) -> str:
+    if request is None:
+        return "local"
+    return getattr(request, "session_hash", None) or getattr(request, "username", None) or "local"
+
+
+def _register_progress_owner(prog_path: str, session_id: str) -> None:
+    canon = os.path.realpath(os.path.abspath(prog_path))
+    with _PROGRESS_LOCK:
+        _PROGRESS_OWNERS[canon] = session_id
+
+
+def _owns_progress(prog_path: str, session_id: str) -> bool:
+    canon = os.path.realpath(os.path.abspath(prog_path))
+    with _PROGRESS_LOCK:
+        owner = _PROGRESS_OWNERS.get(canon)
+        if owner is None or owner == session_id or session_id == "local":
+            return True
+        return False
+
+
+def check_existing_progress(book_title: str, request: Any | None = None) -> str:
+    """Check for existing progress without leaking across sessions (BUG-R2-C1-A2-H5)."""
     if not book_title or not book_title.strip():
         return ""
-    import json
-    import re
-    # We must sanitize the book title just like in on_generate to get the output dir
     sanitized_book_title = re.sub(r'[\\/*?:"<>|]', "", book_title)
     prog_path = os.path.join(_OUTPUT_DIR, sanitized_book_title, "generation_progress.json")
     if os.path.exists(prog_path):
+        sess_id = _get_session_id(request)
+        if not _owns_progress(prog_path, sess_id):
+            return ""
         try:
             data = read_progress_file(prog_path)
             chapters = data.get("chapters", [])
@@ -102,6 +129,209 @@ def check_existing_progress(book_title):
         except Exception as e:
             return f"⚠️ Found progress file but failed to read it: {e}"
     return ""
+
+
+def _parse_chapter_titles(labels: list[str]) -> list[str] | None:
+    """Convert checkbox labels into plain titles."""
+    if not labels:
+        return None
+    import re as _re
+    out = []
+    for lbl in labels:
+        after_num = lbl.split(". ", 1)[-1]
+        title = _re.sub(r'\s+\(~[\d,]+\s*words\)\s*$', '', after_num).strip()
+        if title:
+            out.append(title)
+    return out or None
+
+
+def _load_cached_chapters_if_available(
+    prog_json_path: str,
+    selected_chapters_labels: list[str] | None = None,
+    log_fn=None,
+    request: Any | None = None,
+):
+    """If prog_json_path exists and is owned by session, load cached ExtractedChapter objects."""
+    if not os.path.exists(prog_json_path):
+        return None
+    if request is not None:
+        sess_id = _get_session_id(request)
+        if not _owns_progress(prog_json_path, sess_id):
+            return None
+    try:
+        data = read_progress_file(prog_json_path)
+        ch_list = data.get("chapters", [])
+        if not ch_list or not all(c.get("text", "").strip() for c in ch_list):
+            return None
+        
+        selected_titles = _parse_chapter_titles(selected_chapters_labels) if selected_chapters_labels else None
+        
+        chapters = []
+        for c in ch_list:
+            title = c.get("title", "")
+            num = c.get("num", 0)
+            if selected_titles:
+                matched = False
+                for st in selected_titles:
+                    if st and (st == title or st in title):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+            chapters.append(ExtractedChapter(
+                num=num,
+                title=title,
+                text=c["text"],
+                sentences=c.get("sentences") or []
+            ))
+        if chapters:
+            if log_fn:
+                log_fn("📦 Using cached chapter text from progress JSON (skipping book re-parsing).")
+            return chapters
+    except Exception as e:
+        if log_fn:
+            log_fn(f"⚠️ Could not load cached text from progress JSON: {e}")
+    return None
+
+
+def on_progress_upload_handler(file_obj: Any) -> list[Any]:
+    """Safe handler for uploaded progress JSON.
+    
+    Fixes BUG-R2-C1-A2-H2 & BUG-R2-C1-A2-H3: Never presets server paths into gr.File or gr.Audio
+    and does not echo server filesystem paths.
+    """
+    if file_obj is None:
+        return ["", gr.update()] + [gr.update() for _ in range(40)]
+    path = file_obj.name if hasattr(file_obj, "name") else (file_obj.get("name") if isinstance(file_obj, dict) else str(file_obj))
+    if not path or not os.path.exists(path):
+        return ["❌ Uploaded progress file not found on disk.", gr.update()] + [gr.update() for _ in range(40)]
+    
+    try:
+        data = read_progress_file(path)
+    except FileNotFoundError as exc:
+        gr.Warning(str(exc))
+        return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(40)]
+    except ValueError as exc:
+        gr.Warning(str(exc))
+        return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(40)]
+    except Exception as exc:
+        return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(40)]
+        
+    try:
+        title = data.get("book_title", "")
+        settings = data.get("settings", {})
+        chapters = data.get("chapters", [])
+        completed = sum(1 for c in chapters if c.get("status") in ("completed", "complete"))
+        total = len(chapters)
+        
+        msg = (
+            f"### ✅ Progress File Loaded Successfully!\n"
+            f"- **Book:** {title}\n"
+            f"- **Total Chapters:** {total}\n"
+            f"- **Completed:** {completed}\n"
+            f"Settings and chapter metadata have been restored to the UI. "
+            f"Please upload your book file (in the Book tab) and voice sample (in the Narrator tab) if not already provided."
+        )
+
+        def val(key, default_fallback):
+            return settings.get(key, default_fallback) if settings else default_fallback
+
+        author_val = val("author", "")
+        lang_val = val("language", "English")
+        out_fmt_val = val("output_format", "mp3")
+        lufs_val = val("lufs", -18)
+        temp_val = val("temperature", 0.3)
+        topp_val = val("top_p", 0.8)
+        pause_val = val("pause", 0.5)
+        para_pause_val = val("para_pause", 1.2)
+        mname_val = val("tts_model_name", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+        timbre_val = val("tts_timbre", "")
+        instruct_val = val("tts_instruct", "")
+        max_len_val = val("max_len", 399)
+        true_peak_val = val("true_peak", -1.5)
+        worker_count_val = val("worker_count", 1)
+        parallel_mode_val = val("parallel_mode", "chunks")
+        tts_provider_val = val("tts_provider_name", "qwen")
+        ocr_val = val("epub_ocr", False)
+        force_val = val("force_reprocess", False)
+        exp_txt_val = val("export_text", False)
+        single_file_val = val("single_file_mode", False)
+        exp_lrc_val = val("export_lrc", True)
+        exp_srt_val = val("export_srt", False)
+        exp_vtt_val = val("export_vtt", False)
+        torch_compile_val = val("torch_compile", False)
+        regen_missing_val = val("regen_missing", True)
+        quantization_val = val("quantization", "none")
+        resume_chunks_val = val("resume_incomplete_chunks", True)
+        sample_rate_val = val("sample_rate", 24000)
+        bitrate_val = val("bitrate", "192k")
+        channels_val = val("channels", 1)
+        rep_penalty_val = val("repetition_penalty", 1.05)
+        top_k_val = val("top_k", 20)
+        speed_val = val("speed", 1.0)
+        nfe_step_val = val("nfe_step", 32)
+        seed_val = val("seed", -1)
+
+        pron_file_update = gr.update()
+        pron_map = val("pronunciation_map", {})
+        if pron_map and isinstance(pron_map, dict):
+            try:
+                temp_pron_path = os.path.join(_OUTPUT_DIR, "restored_pronunciation_fixes.txt")
+                with open(temp_pron_path, "w", encoding="utf-8") as pf:
+                    for search, repl in pron_map.items():
+                        pf.write(f"{search} == {repl}\n")
+                pron_file_update = gr.update(value=temp_pron_path)
+            except Exception:
+                pass
+
+        saved_chapters = val("selected_chapters", [])
+
+        return [
+            msg,
+            gr.update(value=title) if title else gr.update(),
+            gr.update(),  # book_file: do NOT preset server paths (BUG-R2-C1-A2-H2/H3)
+            gr.update(),  # voice_studio_upload: do NOT preset server paths (BUG-R2-C1-A2-H2/H3)
+            gr.update(value=author_val),
+            gr.update(value=lang_val),
+            gr.update(value=out_fmt_val),
+            gr.update(value=lufs_val),
+            gr.update(value=temp_val),
+            gr.update(value=topp_val),
+            gr.update(value=pause_val),
+            gr.update(value=para_pause_val),
+            gr.update(value=mname_val),
+            gr.update(value=timbre_val),
+            gr.update(value=instruct_val),
+            gr.update(value=max_len_val),
+            gr.update(value=true_peak_val),
+            gr.update(value=worker_count_val),
+            gr.update(value=parallel_mode_val),
+            gr.update(value=tts_provider_val),
+            gr.update(value=ocr_val),
+            gr.update(value=force_val),
+            gr.update(value=exp_txt_val),
+            gr.update(value=single_file_val),
+            gr.update(value=exp_lrc_val),
+            gr.update(value=exp_srt_val),
+            gr.update(value=exp_vtt_val),
+            gr.update(value=torch_compile_val),
+            gr.update(value=regen_missing_val),
+            gr.update(value=quantization_val),
+            gr.update(value=resume_chunks_val),
+            gr.update(value=sample_rate_val),
+            gr.update(value=bitrate_val),
+            gr.update(value=channels_val),
+            gr.update(value=rep_penalty_val),
+            gr.update(value=top_k_val),
+            gr.update(value=speed_val),
+            gr.update(value=nfe_step_val),
+            gr.update(value=seed_val),
+            pron_file_update,
+            gr.update(value=saved_chapters) if saved_chapters else gr.update(),
+            saved_chapters or None,
+        ]
+    except Exception as e:
+        return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(40)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -952,65 +1182,8 @@ def build_app():
         )
 
         # ── Preview helper ─────────────────────────────────────────────────────
-        def _parse_chapter_titles(labels: list[str]) -> list[str] | None:
-            """
-            Convert checkbox labels like '5. Chapter 1: Crimson  (~1,793 words)'
-            into plain titles like 'Chapter 1: Crimson'.
+        # Note: _parse_chapter_titles and _load_cached_chapters_if_available are defined at module level
 
-            Returning titles (not numbers) avoids the scan/extractor numbering
-            mismatch: scan() numbers ALL TOC entries 1-N, but ingest_epub()
-            only numbers ML-classified content chapters 1-M.
-            """
-            if not labels:
-                return None
-            import re as _re
-            out = []
-            for lbl in labels:
-                after_num = lbl.split(". ", 1)[-1]          # strip "5. " prefix
-                title = _re.sub(r'\s+\(~[\d,]+\s*words\)\s*$', '', after_num).strip()
-                if title:
-                    out.append(title)
-            return out or None
-
-        def _load_cached_chapters_if_available(prog_json_path: str, selected_chapters_labels: list[str] | None = None, log_fn=None):
-            """If prog_json_path exists and has cached text for chapters, return list of ExtractedChapter objects.
-            Otherwise return None."""
-            if not os.path.exists(prog_json_path):
-                return None
-            try:
-                data = read_progress_file(prog_json_path)
-                ch_list = data.get("chapters", [])
-                if not ch_list or not all(c.get("text", "").strip() for c in ch_list):
-                    return None
-                
-                selected_titles = _parse_chapter_titles(selected_chapters_labels) if selected_chapters_labels else None
-                
-                chapters = []
-                for c in ch_list:
-                    title = c.get("title", "")
-                    num = c.get("num", 0)
-                    if selected_titles:
-                        matched = False
-                        for st in selected_titles:
-                            if st and (st == title or st in title):
-                                matched = True
-                                break
-                        if not matched:
-                            continue
-                    chapters.append(ExtractedChapter(
-                        num=num,
-                        title=title,
-                        text=c["text"],
-                        sentences=c.get("sentences") or []
-                    ))
-                if chapters:
-                    if log_fn:
-                        log_fn("📦 Using cached chapter text from progress JSON (skipping book re-parsing).")
-                    return chapters
-            except Exception as e:
-                if log_fn:
-                    log_fn(f"⚠️ Could not load cached text from progress JSON: {e}")
-            return None
 
         def on_preview(scan_res, file_obj, selected_chapters, page_ranges_str, epub_ocr):
             if file_obj is None:
@@ -1064,7 +1237,8 @@ def build_app():
             torch_compile, regen_missing, quantization, resume_incomplete_chunks,
             sample_rate, bitrate_kbps, channels,
             rep_penalty, top_k, speed, nfe_step, seed,
-            progress=gr.Progress(track_tqdm=False)
+            progress=gr.Progress(track_tqdm=False),
+            request: gr.Request = None,
         ):
             if file_obj is None:
                 yield "⚠️ Please upload a book file first.", gr.update(visible=False), gr.update(visible=False), [], None
@@ -1120,16 +1294,25 @@ def build_app():
             )
             os.makedirs(book_out, exist_ok=True)
 
+            # Session ownership check (BUG-R2-C1-A2-H5 & BUG-R4-C1-A4-H2)
+            dest_progress_path = os.path.join(book_out, "generation_progress.json")
+            sess_id = _get_session_id(request)
+            if os.path.exists(dest_progress_path) and not _owns_progress(dest_progress_path, sess_id):
+                yield "⚠️ Access denied: Progress file for this book title is owned by another session.", gr.update(visible=False), gr.update(visible=False), [], None
+                return
+
             # If a progress JSON file was uploaded, copy/overwrite it in the output directory
             if progress_file_obj is not None:
                 uploaded_progress_path = progress_file_obj.name if hasattr(progress_file_obj, "name") else str(progress_file_obj)
                 try:
-                    dest_progress_path = os.path.join(book_out, "generation_progress.json")
                     import shutil
                     shutil.copy2(uploaded_progress_path, dest_progress_path)
+                    _register_progress_owner(dest_progress_path, sess_id)
                     print(f"[UI] Progress file uploaded. Copied to {dest_progress_path}")
                 except Exception as e:
                     print(f"[UI] Failed to copy uploaded progress file: {e}")
+            else:
+                _register_progress_owner(dest_progress_path, sess_id)
 
             cfg = AudiobookConfig(
                 book_title=book_title,
@@ -1209,7 +1392,7 @@ def build_app():
                 try:
                     # Check if progress JSON already has cached chapter text
                     prog_json_path = os.path.join(book_out, "generation_progress.json")
-                    chapters = _load_cached_chapters_if_available(prog_json_path, selected_chapters, log_q.put)
+                    chapters = _load_cached_chapters_if_available(prog_json_path, selected_chapters, log_q.put, request=request)
                     
                     if not chapters:
                         # Extract from book file
@@ -1377,181 +1560,7 @@ def build_app():
             outputs=[existing_progress_info]
         )
 
-        def on_progress_upload(file_obj):
-            if file_obj is None:
-                return ["", gr.update()] + [gr.update() for _ in range(35)]
-            path = file_obj.name if hasattr(file_obj, "name") else (file_obj.get("name") if isinstance(file_obj, dict) else str(file_obj))
-            if not path or not os.path.exists(path):
-                return ["❌ Uploaded progress file not found on disk.", gr.update()] + [gr.update() for _ in range(35)]
-            
-            try:
-                data = read_progress_file(path)
-            except FileNotFoundError as exc:
-                gr.Warning(str(exc))
-                return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(35)]
-            except ValueError as exc:
-                gr.Warning(str(exc))
-                return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(35)]
-            except Exception as exc:
-                return [f"❌ **Failed to parse progress file**: {exc}", gr.update()] + [gr.update() for _ in range(35)]
-                
-            try:
-                title = data.get("book_title", "")
-                book_path = data.get("book_path", "")
-                voice_file = data.get("voice_file", "")
-                settings = data.get("settings", {})
-                
-                # Check for existence of book and voice files
-                book_found_msg = ""
-                if book_path:
-                    if os.path.exists(book_path):
-                        book_found_msg = f"  - ✅ Found book file at: `{book_path}`\n"
-                    else:
-                        book_found_msg = f"  - ⚠️ Book file not found at: `{book_path}`\n"
-                
-                voice_found_msg = ""
-                if voice_file:
-                    if os.path.exists(voice_file):
-                        voice_found_msg = f"  - ✅ Found voice file at: `{voice_file}`\n"
-                    else:
-                        voice_found_msg = f"  - ⚠️ Voice file not found at: `{voice_file}`\n"
-
-                chapters = data.get("chapters", [])
-                completed = sum(1 for c in chapters if c.get("status") in ("completed", "complete"))
-                total = len(chapters)
-                
-                msg = (
-                    f"### ✅ Progress File Loaded Successfully!\n"
-                    f"- **Book:** {title}\n"
-                    f"- **Total Chapters:** {total}\n"
-                    f"- **Completed:** {completed}\n"
-                    f"**Paths Checked:**\n"
-                    f"{book_found_msg}"
-                    f"{voice_found_msg}"
-                    f"Settings and files have been restored to the UI."
-                )
-
-                def val(key, default_fallback):
-                    return settings.get(key, default_fallback) if settings else default_fallback
-
-                # Let's map settings values
-                author_val = val("author", "")
-                lang_val = val("language", "English")
-                out_fmt_val = val("output_format", "mp3")
-                lufs_val = val("lufs", -18)
-                temp_val = val("temperature", 0.3)
-                topp_val = val("top_p", 0.8)
-                pause_val = val("pause", 0.5)
-                para_pause_val = val("para_pause", 1.2)
-                
-                mname_val = val("tts_model_name", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-                timbre_val = val("tts_timbre", "[English] ryan")
-                _valid_timbres = [
-                    "[Chinese] vivian",
-                    "[Chinese] serena",
-                    "[Chinese] uncle_fu",
-                    "[Chinese (Beijing Dialect)] dylan",
-                    "[Chinese (Sichuan Dialect)] eric",
-                    "[English] ryan",
-                    "[English] aiden",
-                    "[Japanese] ono_anna",
-                    "[Korean] sohee"
-                ]
-                if timbre_val and timbre_val not in _valid_timbres:
-                    for _choice in _valid_timbres:
-                        if _choice.endswith(timbre_val.strip()) or _choice.split()[-1] == timbre_val.strip():
-                            timbre_val = _choice
-                            break
-                instruct_val = val("tts_instruct", "")
-                
-                max_len_val = val("max_len", 399)
-                true_peak_val = val("true_peak", -1.5)
-                worker_count_val = val("worker_count", 2)
-                parallel_mode_val = val("parallel_mode", "chunks")
-                tts_provider_val = val("tts_provider_name", "qwen")
-                
-                ocr_val = val("docling_ocr", False) or val("epub_ocr", False)
-                force_val = val("force_reprocess", False)
-                exp_txt_val = val("export_text", False)
-                single_file_val = val("single_file_mode", False) or val("single_file", False)
-                exp_lrc_val = val("export_lrc", True)
-                exp_srt_val = val("export_srt", False)
-                exp_vtt_val = val("export_vtt", False)
-                torch_compile_val = val("torch_compile", False)
-                regen_missing_val = val("regen_missing", True)
-                quantization_val = val("quantization", "none")
-                resume_chunks_val = val("resume_incomplete_chunks", False)
-                sample_rate_val = val("sample_rate", 24000)
-                bitrate_val = val("bitrate_kbps", 64)
-                channels_val = val("channels", 1)
-                rep_penalty_val = val("repetition_penalty", 1.05)
-                top_k_val = val("top_k", 50)
-                speed_val = val("speed", 1.0)
-                nfe_step_val = val("nfe_step", 32)
-                seed_val = val("seed", -1)
-
-                # Restore pronunciation map if present
-                pron_map = val("pronunciation_map", {})
-                pron_file_update = gr.update()
-                if pron_map and isinstance(pron_map, dict):
-                    try:
-                        temp_pron_path = os.path.join(_OUTPUT_DIR, "restored_pronunciation_fixes.txt")
-                        with open(temp_pron_path, "w", encoding="utf-8") as pf:
-                            for search, repl in pron_map.items():
-                                pf.write(f"{search} == {repl}\n")
-                        pron_file_update = gr.update(value=temp_pron_path)
-                    except Exception:
-                        pass
-
-                # Restore saved chapter selections (raw labels) if present
-                saved_chapters = val("selected_chapters", [])
-
-                return (
-                    msg,
-                    gr.update(value=title) if title else gr.update(),
-                    gr.update(value=book_path) if book_path and os.path.exists(book_path) else gr.update(),
-                    gr.update(value=voice_file) if voice_file and os.path.exists(voice_file) else gr.update(),
-                    gr.update(value=author_val),
-                    gr.update(value=lang_val),
-                    gr.update(value=out_fmt_val),
-                    gr.update(value=lufs_val),
-                    gr.update(value=temp_val),
-                    gr.update(value=topp_val),
-                    gr.update(value=pause_val),
-                    gr.update(value=para_pause_val),
-                    gr.update(value=mname_val),
-                    gr.update(value=timbre_val),
-                    gr.update(value=instruct_val),
-                    gr.update(value=max_len_val),
-                    gr.update(value=true_peak_val),
-                    gr.update(value=worker_count_val),
-                    gr.update(value=parallel_mode_val),
-                    gr.update(value=tts_provider_val),
-                    gr.update(value=ocr_val),
-                    gr.update(value=force_val),
-                    gr.update(value=exp_txt_val),
-                    gr.update(value=single_file_val),
-                    gr.update(value=exp_lrc_val),
-                    gr.update(value=exp_srt_val),
-                    gr.update(value=exp_vtt_val),
-                    gr.update(value=torch_compile_val),
-                    gr.update(value=regen_missing_val),
-                    gr.update(value=quantization_val),
-                    gr.update(value=resume_chunks_val),
-                    gr.update(value=sample_rate_val),
-                    gr.update(value=bitrate_val),
-                    gr.update(value=channels_val),
-                    gr.update(value=rep_penalty_val),
-                    gr.update(value=top_k_val),
-                    gr.update(value=speed_val),
-                    gr.update(value=nfe_step_val),
-                    gr.update(value=seed_val),
-                    pron_file_update,
-                    gr.update(value=saved_chapters) if saved_chapters else gr.update(),
-                    saved_chapters or None,   # json_selected_chapters_state
-                )
-            except Exception as e:
-                return [f"❌ Failed to parse progress file: {e}", gr.update()] + [gr.update() for _ in range(40)]
+        on_progress_upload = on_progress_upload_handler
 
         progress_file_upload.upload(
             on_progress_upload,
@@ -1586,6 +1595,7 @@ def build_app():
             torch_compile, regen_missing, quantization, resume_incomplete_chunks,
             sample_rate, bitrate_kbps, channels,
             rep_penalty, top_k, speed, nfe_step, seed,
+            request: gr.Request = None,
         ):
             """Parse the book, cache chapter text, and write a self-contained
             generation_progress.json — without starting TTS generation."""
@@ -1600,8 +1610,16 @@ def build_app():
                 os.makedirs(book_out, exist_ok=True)
                 prog_path = os.path.join(book_out, "generation_progress.json")
 
+                sess_id = _get_session_id(request)
+                if os.path.exists(prog_path) and not _owns_progress(prog_path, sess_id):
+                    return (
+                        "⚠️ Access denied: Progress file for this book title is owned by another session.",
+                        gr.update(visible=False),
+                        gr.update(open=True),
+                    )
+
                 # Check if progress JSON already has cached chapter text
-                chapters = _load_cached_chapters_if_available(prog_path, selected_chapters)
+                chapters = _load_cached_chapters_if_available(prog_path, selected_chapters, request=request)
 
                 if not chapters:
                     if not path or not os.path.exists(path):
@@ -1802,6 +1820,7 @@ def build_app():
                         existing["cover_image_b64"] = settings_dict["cover_image_b64"]
                     existing["chapters"] = merged_chapters
                     write_progress_file(prog_path, existing)
+                    _register_progress_owner(prog_path, sess_id)
                 else:
                     progress_data = {
                         "book_title": book_title,
@@ -1822,6 +1841,7 @@ def build_app():
                         ],
                     }
                     write_progress_file(prog_path, progress_data)
+                    _register_progress_owner(prog_path, sess_id)
 
                 return (
                     f"✅ **Config exported!** {len(chapters)} chapters cached.\n\n"

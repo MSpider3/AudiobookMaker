@@ -1,0 +1,30 @@
+flowchart TD
+    subgraph IngestionInput["Untrusted User Document Uploads"]
+        EPUB["EPUB Document"]
+        DOCX["DOCX Document"]
+        ODT["ODT Document"]
+        PDF["PDF Document"]
+    end
+
+    subgraph PreflightBoundary["Safe Ingestion Pre-Flight Inspection Boundary"]
+        ArchiveGuard["Centralized Archive Pre-Flight (_assert_zip_safe)\n- Max 512 MiB uncompressed size\n- Max 2,000 members\n- Rejects compression ratio bombs"]
+        DocGuard["Document Quota Enforcement\n- Max 64 page ranges, 5,000 pages, 20M chars\n- Max table span clamped to 1,000"]
+    end
+
+    subgraph ParsingEngines["Bounded Extraction Engines"]
+        Docling["Docling Ingestion Engine"]
+        DocxLib["python-docx Parser"]
+        OdfLib["odfpy Parser"]
+        PyMuPDF["PyMuPDF fitz Parser"]
+    end
+
+    EPUB --> ArchiveGuard
+    DOCX --> ArchiveGuard
+    ODT --> ArchiveGuard
+    PDF --> DocGuard
+
+    ArchiveGuard --> Docling
+    ArchiveGuard --> DocxLib
+    ArchiveGuard --> OdfLib
+    DocGuard --> PyMuPDF
+    DocGuard --> Docling

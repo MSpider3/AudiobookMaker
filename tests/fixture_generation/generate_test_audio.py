@@ -61,8 +61,9 @@ def generate_synthetic_voice(out_path: str, duration: float = 4.0, sample_rate: 
     # Compute actual properties
     actual_rms = float(np.sqrt(np.mean(signal**2)))
     peak = float(np.max(np.abs(signal)))
+    rel_out_path = os.path.relpath(out_path, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     properties = {
-        "file_path": out_path,
+        "file_path": rel_out_path,
         "sample_rate": sample_rate,
         "channels": 1,
         "duration_sec": float(duration),
