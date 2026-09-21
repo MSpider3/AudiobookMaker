@@ -57,7 +57,7 @@ class F5TTSProvider(BaseTTSProvider):
             try:
                 # Lazy import f5_tts if installed
                 try:
-                    from f5_tts.api import F5TTS
+                    from f5_tts.api import F5TTS  # type: ignore
                     self._model = F5TTS(device=self._device)
                 except ImportError as imp_err:
                     msg = "F5-TTS python package is not installed. Run 'pip install f5-tts' to use F5-TTS."

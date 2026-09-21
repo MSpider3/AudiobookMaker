@@ -214,6 +214,7 @@ class AudiobookConfig:
 
     # ── Voice ─────────────────────────────────────────────────────────────────
     voice_file:          str   = ""       # path to cloning WAV
+    voice_transcript:    str   = ""       # optional text transcript of reference voice for prompt-based cloning
 
     # ── TTS ───────────────────────────────────────────────────────────────────
     tts_provider_name:   str   = "qwen"   # "qwen" (Qwen3-TTS)

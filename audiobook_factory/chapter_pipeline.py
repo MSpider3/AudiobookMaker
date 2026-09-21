@@ -122,19 +122,30 @@ def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConf
     import numpy as np
     import soundfile as sf
 
-    pause_samples = np.zeros(int(config.pause * config.sample_rate), dtype=np.float32)
+    sr = int(config.sample_rate)
+    pause_len = int(config.pause * sr)
+    pause_samples = np.zeros(pause_len, dtype=np.float32)
+    fade_len = min(int(0.005 * sr), 120)  # 5ms micro-fade to eliminate digital clicks/pops
+
     segments = []
     for i, p in enumerate(valid_paths):
         try:
-            data, sr = sf.read(p, dtype="float32")
+            data, chunk_sr = sf.read(p, dtype="float32")
             if len(data) > 0:
+                # Apply 5ms micro fade-in and fade-out to prevent boundary clicks/pops
+                if len(data) > 2 * fade_len and fade_len > 0:
+                    fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                    fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                    data = data.copy()
+                    data[:fade_len] *= fade_in
+                    data[-fade_len:] *= fade_out
                 segments.append(data)
                 segments.append(pause_samples)
         except Exception as exc:
             logger.warning("Failed to read chunk %s during partial concat: %s", p, exc)
     if segments:
         raw = np.concatenate(segments)
-        sf.write(out_path, raw, config.sample_rate)
+        sf.write(out_path, raw, sr)
 
 
 def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConfig) -> None:

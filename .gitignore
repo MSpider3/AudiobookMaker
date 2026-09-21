@@ -93,7 +93,7 @@ test_output_speed/
 .voice_cache/
 audiobook_factory/.voice_cache/
 plan.md
-
+program_testing.ipynb
 # ── Rust ──────────────────────────────────────────────────────────────────────
 audiobook_rust/target/
 audiobook_rust/**/*.rs.bk

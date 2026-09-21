@@ -222,7 +222,7 @@ def _check_bitsandbytes() -> tuple[bool, str]:
         for quantization="int8".
     """
     try:
-        import bitsandbytes
+        import bitsandbytes  # type: ignore
         return True, f"bitsandbytes {bitsandbytes.__version__}"
     except ImportError:
         return True, (
@@ -253,7 +253,7 @@ def check_provider_dependencies(provider_name: str) -> tuple[bool, str]:
     p_name = (provider_name or "qwen").lower().strip()
     if p_name in ("f5tts", "f5-tts", "f5_tts"):
         try:
-            import f5_tts  # noqa: F401
+            import f5_tts  # type: ignore # noqa: F401
             return True, "f5-tts package is installed"
         except ImportError:
             return False, "F5-TTS requires f5-tts package. Install with: pip install f5-tts"
@@ -451,7 +451,7 @@ def run_preflight_checks(
 
     # Optional provider pre-checks
     try:
-        import f5_tts
+        import f5_tts  # type: ignore
         library_versions["f5_tts"] = getattr(f5_tts, "__version__", "installed")
     except ImportError:
         logger.info("[preflight] f5_tts optional dependency not installed.")

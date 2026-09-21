@@ -10,6 +10,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Response, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -18,31 +19,13 @@ from audiobook_factory.pipeline import AudiobookConfig, preview_tts
 from audiobook_factory.voice_preprocessor import PreprocessConfig, preprocess as voice_preprocess
 from api.worker import tasks, task_queue, Task, worker_loop
 
-app = FastAPI(
-    title="AudiobookMaker Backend Server",
-    description="Decoupled high-performance async task runner and model server.",
-    version="1.0.0"
-)
 
+# ── Lifespan Event Handler ───────────────────────────────────────────────────
 
-# ── Pydantic Request Models ───────────────────────────────────────────────────
-
-class GenerateRequest(BaseModel):
-    config: Dict[str, Any]
-    chapters: List[Dict[str, Any]]
-
-
-class VoiceTestRequest(BaseModel):
-    config: Dict[str, Any]
-    text: str
-
-
-# ── Start-up Event ────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup_event():
-    # Spin up background task queue worker in the event loop
-    asyncio.create_task(worker_loop())
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Spin up background task queue worker in the event loop
+    worker_task = asyncio.create_task(worker_loop())
     print("[API Server] Background worker consumer task spawned successfully.")
 
     def _warmup_gpu_pool():
@@ -61,9 +44,9 @@ async def startup_event():
     import threading
     threading.Thread(target=_warmup_gpu_pool, daemon=True).start()
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown_event():
+    # Shutdown: Cancel active tasks and shutdown GPU pools cleanly
     print("[API Server] Shutdown event triggered. Cancelling active tasks...")
     active_found = False
     for task_id, task in list(tasks.items()):
@@ -79,6 +62,27 @@ async def shutdown_event():
         print("[API Server] GPUPoolManager shut down cleanly.")
     except Exception as exc:
         print(f"[API Server] GPUPoolManager shutdown warning: {exc}")
+    worker_task.cancel()
+
+
+app = FastAPI(
+    title="AudiobookMaker Backend Server",
+    description="Decoupled high-performance async task runner and model server.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+# ── Pydantic Request Models ───────────────────────────────────────────────────
+
+class GenerateRequest(BaseModel):
+    config: Dict[str, Any]
+    chapters: List[Dict[str, Any]]
+
+
+class VoiceTestRequest(BaseModel):
+    config: Dict[str, Any]
+    text: str
 
 
 from audiobook_factory.gpu_pool import GPUDetector, GPUPoolManager

@@ -18,7 +18,7 @@ import time
 import zipfile
 from pathlib import Path
 
-import gradio as gr
+import gradio as gr  # type: ignore
 import numpy as np
 import soundfile as sf
 

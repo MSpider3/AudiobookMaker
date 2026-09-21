@@ -92,6 +92,8 @@ class QwenTTSProvider(BaseTTSProvider):
         self._model: Any = None
         self._loaded_model_name: str | None = None
         self._x_vector_cache: dict[str, torch.Tensor] = {}
+        self._voice_prompt_cache: dict[str, Any] = {}
+        self._transcript_cache: dict[str, str] = {}
         self._lock: threading.Lock = threading.Lock()
 
     @classmethod
@@ -162,6 +164,108 @@ class QwenTTSProvider(BaseTTSProvider):
             logger.debug("Voice ref cached to %s", temp_path)
             return temp_path
         raise ValueError(f"voice_ref must be bytes or str, got {type(voice_ref).__name__}")
+
+    def _get_voice_transcript(self, ref_path: str) -> str | None:
+        """Retrieves or transcribes reference audio text.
+
+        Tries in order:
+        1. config.voice_transcript or config.ref_text if configured.
+        2. In-memory transcript cache.
+        3. Sidecar .txt file if exists alongside ref_path.
+        4. Automatic speech recognition via lightweight Whisper (whisper-tiny).
+        """
+        # 1. Direct configuration
+        cfg_transcript = getattr(self.config, "voice_transcript", None) or getattr(self.config, "ref_text", None)
+        if cfg_transcript and str(cfg_transcript).strip():
+            return str(cfg_transcript).strip()
+
+        # 2. In-memory cache
+        if ref_path in self._transcript_cache:
+            return self._transcript_cache[ref_path]
+
+        # 3. Sidecar transcript file (e.g. voice.wav.txt or voice.txt)
+        import os
+        sidecars = [ref_path + ".txt", os.path.splitext(ref_path)[0] + ".txt"]
+        for sidecar in sidecars:
+            if os.path.exists(sidecar) and os.path.isfile(sidecar):
+                try:
+                    with open(sidecar, "r", encoding="utf-8", errors="replace") as f:
+                        text = f.read().strip()
+                    if text:
+                        self._transcript_cache[ref_path] = text
+                        logger.info("    [QwenTTS] 🎙️ Loaded reference transcript from sidecar %s: '%s'", os.path.basename(sidecar), text[:60])
+                        return text
+                except Exception as exc:
+                    logger.debug("Failed reading sidecar %s: %s", sidecar, exc)
+
+        # 4. Automatic speech recognition with Whisper
+        try:
+            import torch
+            from transformers import pipeline
+            device_idx = int(self._device.split(":")[1]) if (self._device.startswith("cuda") and ":" in self._device) else (0 if self._device == "cuda" else -1)
+            asr_pipe = pipeline(
+                "automatic-speech-recognition",
+                model="openai/whisper-tiny",
+                device=device_idx if (torch.cuda.is_available() and device_idx >= 0) else -1,
+                torch_dtype=torch.float16 if (torch.cuda.is_available() and device_idx >= 0) else torch.float32,
+            )
+            res = asr_pipe(ref_path)
+            transcript = (res.get("text") or "").strip() if isinstance(res, dict) else ""
+            if transcript:
+                self._transcript_cache[ref_path] = transcript
+                logger.info("    [QwenTTS] 🎙️ Auto-transcribed reference audio '%s': \"%s\"", os.path.basename(ref_path), transcript)
+                return transcript
+        except Exception as asr_err:
+            logger.debug("    [QwenTTS] Whisper auto-transcription skipped/unavailable: %s", asr_err)
+
+        return None
+
+    def _ensure_voice_prompt_cached(self, voice_ref: str | bytes) -> tuple[Any, str | None, str | None]:
+        """Pre-computes and caches voice clone prompt and speaker embeddings.
+
+        Returns:
+            Tuple of (voice_clone_prompt_obj_or_None, x_vector_key_or_None, ref_text_or_None).
+        """
+        self._bind_cuda_device()
+        if not voice_ref:
+            return None, None, None
+
+        ref_path = self._resolve_voice_ref(voice_ref)
+        if not ref_path:
+            return None, None, None
+
+        if isinstance(voice_ref, bytes):
+            key = hashlib.sha256(voice_ref).hexdigest()[:16]
+        else:
+            key = hashlib.sha256(str(voice_ref).encode("utf-8", errors="replace")).hexdigest()[:16]
+
+        ref_text = self._get_voice_transcript(ref_path)
+
+        if self._model is None or not hasattr(self._model, "model") or self._model.model is None:
+            return None, None, ref_text
+
+        # Return cached voice clone prompt if valid
+        if key in self._voice_prompt_cache:
+            return self._voice_prompt_cache[key], key, ref_text
+
+        x_key = self._ensure_x_vector_cached(voice_ref)
+
+        if hasattr(self._model, "create_voice_clone_prompt"):
+            try:
+                # Use ICL (In-Context Learning) mode if ref_text is present, preserving gender, timbre, and acoustics
+                use_xvec_only = (ref_text is None or len(ref_text.strip()) == 0)
+                prompt = self._model.create_voice_clone_prompt(
+                    ref_audio=ref_path,
+                    ref_text=ref_text,
+                    x_vector_only_mode=use_xvec_only,
+                )
+                self._voice_prompt_cache[key] = prompt
+                logger.info("    [QwenTTS] ⚡ Voice clone prompt cached under key %s (ICL mode=%s)", key, not use_xvec_only)
+                return prompt, x_key, ref_text
+            except Exception as e:
+                logger.warning("    [QwenTTS] create_voice_clone_prompt failed (%s) — falling back to per-call voice_ref.", e)
+
+        return None, x_key, ref_text
 
     def _ensure_x_vector_cached(self, voice_ref: str | bytes) -> str | None:
         """Pre-compute and cache the speaker x-vector for the reference voice.
@@ -250,22 +354,28 @@ class QwenTTSProvider(BaseTTSProvider):
                 with self._lock:
                     self._ensure_initialised()
                     ref_path = self._resolve_voice_ref(voice_ref or self.config.voice_file)
-                    x_key = self._ensure_x_vector_cached(ref_path) if ref_path else None
-
                     model_type = getattr(self._model.model, "tts_model_type", "base")
 
                     if model_type == "base":
+                        prompt, x_key, ref_text = self._ensure_voice_prompt_cached(ref_path) if ref_path else (None, None, None)
                         gen_kwargs = dict(
                             text=text,
                             language=getattr(self.config, "language", "English"),
-                            x_vector_only_mode=True,
                             temperature=self.config.temperature,
                             top_p=self.config.top_p,
                         )
-                        if x_key is not None and x_key in self._x_vector_cache and hasattr(self._model, "generate_voice_clone"):
+                        if prompt is not None:
+                            gen_kwargs["voice_clone_prompt"] = prompt
+                        elif ref_text:
+                            gen_kwargs["ref_audio"] = ref_path
+                            gen_kwargs["ref_text"] = ref_text
+                            gen_kwargs["x_vector_only_mode"] = False
+                        elif x_key is not None and x_key in self._x_vector_cache and hasattr(self._model, "generate_voice_clone"):
                             gen_kwargs["x_vector"] = self._x_vector_cache[x_key]
+                            gen_kwargs["x_vector_only_mode"] = True
                         else:
                             gen_kwargs["ref_audio"] = ref_path
+                            gen_kwargs["x_vector_only_mode"] = True
                         wav_data, sr = self._model.generate_voice_clone(**gen_kwargs)
                     elif model_type == "custom_voice":
                         wav_data, sr = self._model.generate_custom_voice(
@@ -366,24 +476,31 @@ class QwenTTSProvider(BaseTTSProvider):
             with self._lock:
                 self._ensure_initialised()
                 ref_path = self._resolve_voice_ref(voice_ref or self.config.voice_file)
-                x_key = self._ensure_x_vector_cached(ref_path) if ref_path else None
                 if self._model is None or not hasattr(self._model, "model") or self._model.model is None:
                     raise RuntimeError(f"QwenTTS model instance is not properly loaded on {self._device}.")
                 model_type = getattr(self._model.model, "tts_model_type", "base")
                 languages = [getattr(self.config, "language", "English")] * len(texts)
 
                 if model_type == "base":
+                    prompt, x_key, ref_text = self._ensure_voice_prompt_cached(ref_path) if ref_path else (None, None, None)
                     gen_kwargs = dict(
                         text=texts,
                         language=languages,
-                        x_vector_only_mode=True,
                         temperature=self.config.temperature,
                         top_p=self.config.top_p,
                     )
-                    if x_key is not None and x_key in self._x_vector_cache and hasattr(self._model, "generate_voice_clone"):
+                    if prompt is not None:
+                        gen_kwargs["voice_clone_prompt"] = prompt
+                    elif ref_text:
+                        gen_kwargs["ref_audio"] = [ref_path] * len(texts)
+                        gen_kwargs["ref_text"] = [ref_text] * len(texts)
+                        gen_kwargs["x_vector_only_mode"] = False
+                    elif x_key is not None and x_key in self._x_vector_cache and hasattr(self._model, "generate_voice_clone"):
                         gen_kwargs["x_vector"] = self._x_vector_cache[x_key]
+                        gen_kwargs["x_vector_only_mode"] = True
                     else:
                         gen_kwargs["ref_audio"] = [ref_path] * len(texts)
+                        gen_kwargs["x_vector_only_mode"] = True
                     wav_data_list, sr = self._model.generate_voice_clone(**gen_kwargs)
                 elif model_type == "custom_voice":
                     speakers = [self.config.tts_timbre or "serena"] * len(texts)
@@ -479,6 +596,8 @@ class QwenTTSProvider(BaseTTSProvider):
             self._model = None
             self._loaded_model_name = None
             self._x_vector_cache.clear()
+            self._voice_prompt_cache.clear()
+            self._transcript_cache.clear()
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

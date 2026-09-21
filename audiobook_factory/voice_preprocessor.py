@@ -30,25 +30,25 @@ from dataclasses import dataclass, field
 
 @dataclass
 class PreprocessConfig:
-    # Step 1: Noise Reduction
+    # Step 1: Gentle Noise Reduction (reduces floor hiss while preserving vocal formants)
     noise_reduce:           bool  = True
-    noise_reduce_strength:  float = 0.5    # 0.0 – 1.0
+    noise_reduce_strength:  float = 0.25   # 0.0 – 1.0 (gentle default)
 
-    # Step 2: Noise Gate
-    noise_gate:             bool  = True
-    noise_gate_threshold_db: float = -40.0  # dB, frames below this → silence
+    # Step 2: Noise Gate (Disabled by default to avoid clipping word attacks/tails)
+    noise_gate:             bool  = False
+    noise_gate_threshold_db: float = -45.0  # dB
 
-    # Step 3: High-Pass Filter
+    # Step 3: High-Pass Filter (removes sub-bass rumble/plosives)
     highpass_filter:        bool  = True
     highpass_cutoff_hz:     int   = 80      # Hz
 
-    # Step 4: Silence Removal
-    silence_removal:        bool  = True
+    # Step 4: Silence Removal (Disabled by default to preserve speaker cadence/prosody)
+    silence_removal:        bool  = False
     silence_threshold_db:   float = -40.0   # dB
     min_segment_ms:         int   = 300     # ms — shorter segments discarded
     max_silence_kept_ms:    int   = 500     # ms retained between segments
 
-    # Step 5: Normalize Volume
+    # Step 5: Normalize Volume (ensures optimal SNR)
     normalize_volume:       bool  = True
     normalize_target_dbfs:  float = -3.0   # dBFS
 
@@ -172,19 +172,26 @@ def _run_preprocessing_pipeline(
     # ── Step 2: Noise Gate ────────────────────────────────────────────────────
     if config.noise_gate:
         try:
-            import librosa
-            log("[Preprocess] Step 2: Noise gate...")
+            import librosa  # type: ignore
+            log("[Preprocess] Step 2: Smooth noise gate...")
             frame_length = 2048
             hop_length   = 1024
             rms = librosa.feature.rms(
                 y=audio, frame_length=frame_length, hop_length=hop_length
             )[0]
             db  = librosa.amplitude_to_db(rms, ref=1.0)
+            gain_mask = np.ones(len(audio), dtype=np.float32)
             for i, below in enumerate(db < config.noise_gate_threshold_db):
                 if below:
                     start = i * hop_length
                     end   = min(start + hop_length, len(audio))
-                    audio[start:end] = 0.0
+                    gain_mask[start:end] = 0.0
+            # Apply smooth 10ms moving average smoothing to avoid step discontinuities
+            smooth_win = int(sr * 0.010)
+            if smooth_win > 1:
+                kernel = np.ones(smooth_win, dtype=np.float32) / float(smooth_win)
+                gain_mask = np.convolve(gain_mask, kernel, mode="same")
+            audio = (audio * gain_mask).astype(np.float32)
         except ImportError:
             log("[Preprocess] WARNING: librosa not installed — skipping noise gate.")
 
@@ -231,7 +238,7 @@ def _run_preprocessing_pipeline(
     # ── Step 7: Resample ──────────────────────────────────────────────────────
     if config.resample and config.target_sample_rate != sr:
         try:
-            import librosa
+            import librosa  # type: ignore
             log(f"[Preprocess] Step 7: Resample {sr}→{config.target_sample_rate}Hz...")
             audio = librosa.resample(
                 audio, orig_sr=sr, target_sr=config.target_sample_rate
