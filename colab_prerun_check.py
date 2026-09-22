@@ -104,7 +104,16 @@ try:
         cfg = AudiobookConfig()
 
     class DummyProvider(BaseTTSProvider):
-        def synthesize(self, text, voice_ref, out_path): pass
+        @property
+        def device(self) -> str:
+            return "cpu"
+
+        def synthesize(self, text, voice_ref, out_path=None, *, return_bytes=False):
+            return (b"", 0.0) if return_bytes else (out_path or "", 0.0)
+
+        def synthesize_batch(self, texts, voice_ref, *, return_bytes=True):
+            return [(b"", 0.0) for _ in texts]
+
         def estimate_cost(self, total_chars): return 0.0
         def get_name(self): return "DummyTestProvider"
 
