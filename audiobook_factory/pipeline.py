@@ -573,6 +573,11 @@ def run_pipeline(
     pool = None
     provider = None
     if not config.preview_mode:
+        # Free the Voice Studio's cached preview model (if any) before the
+        # real generation run claims GPU memory for its own provider pool —
+        # a leftover preview model from a different engine can otherwise
+        # starve the pool warmup of VRAM.
+        _cleanup_preview_provider()
         pool = GPUPoolManager.instance().get_pool(
             provider_name=config.tts_provider_name,
             provider_factory=lambda dev: get_tts_provider(
@@ -1369,10 +1374,44 @@ class _ImmediateQueue(queue.Queue):
     pass
 
 
+# ── Voice Studio preview provider cache ─────────────────────────────────────
+# preview_tts() is called on every "Preview voice" click in the Voice Studio
+# tab and is separate from the GPUPoolManager pool used by run_pipeline().
+# Previously it called get_tts_provider() fresh on every single call and
+# never released the result, so each preview click (and every provider
+# switch in the dropdown) permanently loaded another full model onto the
+# GPU. Repeated previews, or previewing more than one TTS engine in the
+# same session, eventually exhausted VRAM. Cache one instance and clean up
+# the old one whenever the requested provider changes.
+_preview_provider_cache: dict[str, Any] = {"name": None, "provider": None, "key": None}
+_preview_cache_lock = threading.Lock()
+
+
+def _cleanup_preview_provider() -> None:
+    """Releases the cached Voice Studio preview provider, if any."""
+    with _preview_cache_lock:
+        provider = _preview_provider_cache.get("provider")
+        if provider is not None:
+            try:
+                provider.cleanup()
+            except Exception as exc:
+                logger.warning("[preview_tts] Error cleaning up cached preview provider: %s", exc)
+        _preview_provider_cache["provider"] = None
+        _preview_provider_cache["name"] = None
+        _preview_provider_cache["key"] = None
+
+
+atexit.register(_cleanup_preview_provider)
+
+
 def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
     """
     Generate a short TTS preview and return raw WAV bytes.
     Used by the Voice Studio tab.
+
+    Reuses a single cached provider instance across calls instead of
+    loading a fresh model per click; automatically frees the previous
+    provider's GPU memory when the requested provider name or variant changes.
     """
     from audiobook_factory.tts_providers import get_tts_provider
 
@@ -1382,12 +1421,38 @@ def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
     with tempfile.TemporaryDirectory(dir=str(_TEMP_DIR)) as tmp:
         out_path = os.path.join(tmp, "preview.wav")
         try:
-            provider = get_tts_provider(config.tts_provider_name, config)
+            with _preview_cache_lock:
+                provider = _preview_provider_cache.get("provider")
+                cached_name = _preview_provider_cache.get("name")
+                cached_key = _preview_provider_cache.get("key")
+                current_key = (
+                    config.tts_provider_name,
+                    getattr(config, "tts_model_name", getattr(config, "tts_model_variant", "")),
+                    getattr(config, "quantization", ""),
+                )
+                if provider is None or cached_key != current_key or cached_name != config.tts_provider_name:
+                    if provider is not None:
+                        logger.info(
+                            "[preview_tts] Switching preview provider %s -> %s: freeing previous model.",
+                            cached_name, config.tts_provider_name,
+                        )
+                        try:
+                            provider.cleanup()
+                        except Exception as exc:
+                            logger.warning("[preview_tts] Error cleaning up previous preview provider: %s", exc)
+                    provider = get_tts_provider(config.tts_provider_name, config)
+                    _preview_provider_cache["provider"] = provider
+                    _preview_provider_cache["name"] = config.tts_provider_name
+                    _preview_provider_cache["key"] = current_key
             provider.synthesize(text.strip(), config.voice_file, out_path)
             if os.path.exists(out_path):
                 with open(out_path, "rb") as f:
                     return f.read()
         except Exception as e:
             logger.warning("[preview_tts] Error: %s", e)
+            # The cached provider may be in a bad state (e.g. OOM mid-load) —
+            # drop it so the next preview call starts clean instead of
+            # repeatedly failing against a half-initialised model.
+            _cleanup_preview_provider()
             raise e
     return None

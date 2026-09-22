@@ -106,6 +106,48 @@ def _get_or_resize_semaphore(desired_count: int) -> asyncio.Semaphore:
     return _current_semaphore
 
 
+async def _wait_for_other_providers_idle(
+    cfg: AudiobookConfig, task: Task, timeout: float = 600.0
+) -> None:
+    """Waits for any other-provider GPU pool to finish before this task starts.
+
+    GPUPoolManager keeps only one TTS provider's weights resident at a time
+    (get_pool() evicts other providers to avoid OOM — see gpu_pool.py). The
+    dispatch semaphore in worker_loop() only limits concurrency by GPU
+    *count*, not by which TTS engine each queued task wants, so two tasks
+    requesting different engines can otherwise be scheduled at the same
+    time and race on the same pool slot. Serialize provider switches here
+    instead of letting that race surface as a confusing mid-run error.
+    """
+    if cfg.preview_mode:
+        return
+    manager = GPUPoolManager.instance()
+    start = time.monotonic()
+    announced = False
+    while True:
+        if task.cancel_token.is_cancelled or task.status == "cancelled":
+            return
+        pools = manager.all_pools()
+        blocking = [
+            name for name, pool in pools.items()
+            if name != cfg.tts_provider_name and not pool.is_idle
+        ]
+        if not blocking:
+            return
+        if not announced:
+            await task.add_log(
+                f"⏳ Waiting for provider(s) {', '.join(blocking)} to finish before "
+                f"loading '{cfg.tts_provider_name}' (TTS engines can't share GPU memory)."
+            )
+            announced = True
+        if time.monotonic() - start > timeout:
+            await task.add_log(
+                "⚠️ Timed out waiting for the other TTS provider to free up; proceeding anyway."
+            )
+            return
+        await asyncio.sleep(1.0)
+
+
 async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
     async with sem:
         task = tasks.get(task_id)
@@ -150,6 +192,19 @@ async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
                     sentences=ch.get("sentences", [])
                 ) for idx, ch in enumerate(task.chapters)
             ]
+
+            await _wait_for_other_providers_idle(cfg, task)
+            if task.cancel_token.is_cancelled or task.status == "cancelled":
+                await task.update_status("cancelled")
+                await task.add_log("⛔ Generation task cancelled before provider acquisition.")
+                await task.broadcast({
+                    "type": "session_end",
+                    "files": [],
+                    "success": False,
+                    "cancelled": True,
+                })
+                task_queue.task_done()
+                return
 
             log_q = queue.Queue()
             prog_q = queue.Queue()

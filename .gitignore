@@ -87,6 +87,7 @@ temp/
 output/
 results/
 *.tmp
+*.patch
 # Temp chapter processing dirs created by pipeline.py
 abm_ch*/
 # Benchmark test output

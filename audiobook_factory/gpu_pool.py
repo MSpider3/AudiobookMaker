@@ -267,6 +267,58 @@ class ProviderPool:
         """
         return self.device_count > 0
 
+    @property
+    def is_idle(self) -> bool:
+        """Whether every provider in this pool is currently checked back in.
+
+        A pool is only safe to evict/cleanup when no caller currently holds
+        a provider out via acquire()/acquire_context() — otherwise cleaning
+        up the underlying model out from under an in-flight synthesize()
+        call would crash that call mid-chapter.
+
+        Returns:
+            True if no device's provider is currently acquired.
+        """
+        if not self._devices:
+            return True
+        return all(
+            dev_queue.full() for dev_queue in self._device_queues.values()
+        )
+
+    def cleanup(self) -> None:
+        """Releases every provider's GPU/model resources and empties the pool.
+
+        Calls `.cleanup()` on each device's provider instance (freeing model
+        weights and CUDA memory), then clears the internal queues and device
+        map. Safe to call even if some providers are still checked out,
+        though callers should prefer waiting for `is_idle` first so an
+        in-flight synthesis isn't disrupted.
+        """
+        for device, provider_instance in list(self._device_map.items()):
+            try:
+                provider_instance.cleanup()
+                logger.info("[gpu_pool] Cleaned up provider on %s (pool=%s)", device, self._provider_name)
+            except Exception as exc:
+                logger.warning(
+                    "[gpu_pool] Error cleaning up provider on %s (pool=%s): %s",
+                    device, self._provider_name, exc,
+                )
+        # Drain any queued instances (mirrors device_map, but empty the
+        # queues too so a stale acquire() can't hand out a torn-down provider).
+        for dev_queue in self._device_queues.values():
+            while True:
+                try:
+                    dev_queue.get_nowait()
+                except queue.Empty:
+                    break
+        self._device_map.clear()
+        self._device_queues.clear()
+        self._devices = []
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def get_provider_for_device(self, device: str) -> BaseTTSProvider | None:
         """Returns the provider instance bound to a specific device, without acquiring.
 
@@ -413,21 +465,58 @@ class GPUPoolManager:
         provider_factory: Callable[[str], BaseTTSProvider],
         min_vram_gb: float = _DEFAULT_MIN_VRAM_GB,
         gpu_count_override: int = 0,
+        keep_other_providers: bool = False,
     ) -> ProviderPool:
         """Retrieve or construct the ProviderPool for a given provider name.
+
+        Each provider pool keeps a full model resident on every device it
+        manages. By default, requesting a *different* provider than what is
+        currently loaded evicts the other loaded provider pool(s) first, so
+        two TTS engines' weights are never resident on the same GPU(s) at
+        once — this is what previously caused CUDA OOMs / failures when
+        switching TTS engines (e.g. Qwen → VibeVoice) within one process,
+        since old pools were created but never freed. Pass
+        `keep_other_providers=True` to opt out (only safe if you know the
+        combined VRAM footprint of all providers fits).
 
         Args:
             provider_name: Unique provider string identifier (e.g. "qwen").
             provider_factory: Callable constructing a provider instance for a device.
             min_vram_gb: Minimum free VRAM threshold in GB for CUDA devices.
             gpu_count_override: Optional cap on the number of GPUs to allocate (0 = auto).
+            keep_other_providers: If True, don't evict other providers' pools
+                when loading a new one. Default False (evict to avoid OOM).
 
         Returns:
             The active ProviderPool instance for the specified provider.
+
+        Raises:
+            RuntimeError: If switching providers is requested while another
+                provider's pool is mid-synthesis (a provider currently
+                checked out via acquire()), since evicting it then would
+                crash that in-flight generation.
         """
         with self._manager_lock:
             if provider_name in self._pools:
                 return self._pools[provider_name]
+
+            if not keep_other_providers and self._pools:
+                busy = {
+                    name: pool for name, pool in self._pools.items()
+                    if not pool.is_idle
+                }
+                if busy:
+                    raise RuntimeError(
+                        f"Cannot switch TTS provider to '{provider_name}': "
+                        f"provider(s) {', '.join(busy)} are still mid-synthesis. "
+                        "Wait for the current generation to finish before switching engines."
+                    )
+                for name in list(self._pools.keys()):
+                    logger.info(
+                        "[gpu_pool] Switching TTS provider %s -> %s: evicting previous pool to free VRAM.",
+                        name, provider_name,
+                    )
+                    self._pools.pop(name).cleanup()
 
             detected_devices = GPUDetector.detect_devices()
             if gpu_count_override > 0 and detected_devices != ["cpu"]:
@@ -511,9 +600,37 @@ class GPUPoolManager:
         with self._manager_lock:
             return dict(self._pools)
 
+    def evict(self, provider_name: str) -> bool:
+        """Explicitly tear down and free the pool for one provider, if loaded.
+
+        Args:
+            provider_name: The provider pool to remove.
+
+        Returns:
+            True if a pool was found and evicted, False if none was loaded.
+
+        Raises:
+            RuntimeError: If the pool is currently mid-synthesis (a provider
+                checked out via acquire()).
+        """
+        with self._manager_lock:
+            pool = self._pools.get(provider_name)
+            if pool is None:
+                return False
+            if not pool.is_idle:
+                raise RuntimeError(
+                    f"Cannot evict TTS provider '{provider_name}': still mid-synthesis."
+                )
+            self._pools.pop(provider_name).cleanup()
+            return True
+
     def shutdown(self) -> None:
-        """Clean up and clear all active provider pools."""
+        """Clean up and clear all active provider pools, freeing GPU memory."""
         with self._manager_lock:
             for name, pool in self._pools.items():
                 logger.info("Shutting down ProviderPool[%s]", name)
+                try:
+                    pool.cleanup()
+                except Exception as exc:
+                    logger.warning("Error during ProviderPool[%s] cleanup: %s", name, exc)
             self._pools.clear()
