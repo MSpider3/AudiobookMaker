@@ -36,13 +36,12 @@ import threading
 import time
 from typing import Any, TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from audiobook_factory.pipeline import AudiobookConfig
-
 # ── Ensure project root is on sys.path ───────────────────────────────────────
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
+
+from audiobook_factory.pipeline import AudiobookConfig
 
 
 # ══════════════════════════════════════════════════════════════════════════════
