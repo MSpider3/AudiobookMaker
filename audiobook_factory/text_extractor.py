@@ -138,7 +138,14 @@ def _epub_metadata(book) -> tuple[str, str, bytes | None]:
     # Strategy 2: Check ITEM_IMAGE properties
     if not cover_data:
         for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-            if "cover-image" in item.get_properties():
+            # EpubImage items may lack get_properties(); guard with getattr
+            props = getattr(item, "properties", None)
+            if props is None and hasattr(item, "get_properties"):
+                try:
+                    props = item.get_properties()
+                except (AttributeError, TypeError):
+                    props = []
+            if props and "cover-image" in props:
                 cover_data = item.get_content()
                 if cover_data:
                     break
@@ -288,7 +295,10 @@ def _scan_epub(path: str, ftype: str) -> ScanResult:
 def _scan_pdf(path: str) -> ScanResult:
     page_count = 0
     try:
-        import fitz  # PyMuPDF
+        try:
+            import pymupdf as fitz  # PyMuPDF (new name)
+        except ImportError:
+            import fitz  # PyMuPDF (legacy)
         doc = fitz.open(path)
         page_count = doc.page_count
         doc.close()
@@ -379,7 +389,16 @@ def _extract_epub(
     classifier = MLClassifier()
     normalizer = TextNormalizer()
 
-    chapters, skipped, cover_data = ingestor.ingest_epub(path, classifier, normalizer)
+    chapters, skipped, _toc_entries = ingestor.ingest_epub(path, classifier, normalizer)
+
+    # Extract cover data separately — ingest_epub returns toc_entries, not cover bytes
+    cover_data: bytes | None = None
+    try:
+        from ebooklib import epub as _epub_mod
+        _book = _epub_mod.read_epub(path)
+        _, _, cover_data = _epub_metadata(_book)
+    except Exception:
+        pass
 
     # Selections can be:
     #   None        → include all chapters

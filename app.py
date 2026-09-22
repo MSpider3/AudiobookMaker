@@ -630,14 +630,24 @@ def build_app():
                             gr.update(visible=True),   # voice_studio_upload
                         ]
                     elif p == "vibevoice":
-                        info = "### 🎙️ VibeVoice-1.5B Provider\n* **Model:** `bezzam/VibeVoice-1.5B-hf`\n* **Capabilities:** High-quality zero-shot multi-lingual voice cloning from reference WAV files."
+                        info = (
+                            "### 🎙️ VibeVoice-1.5B Provider\n"
+                            "* **Model:** `bezzam/VibeVoice-1.5B-hf`\n"
+                            "* **Capabilities:** High-quality zero-shot multi-lingual voice cloning from reference WAV files.\n"
+                            "* **Note:** Downloads model weights from HuggingFace on first run (~3GB)."
+                        )
                         return [
                             gr.update(visible=False),  # qwen_group
                             gr.update(value=info, visible=True), # provider_info_md
                             gr.update(visible=True),   # voice_studio_upload
                         ]
                     elif p == "f5tts":
-                        info = "### 🎙️ F5-TTS Provider\n* **Model:** `f5_tts.api.F5TTS`\n* **Capabilities:** Fast and lightweight zero-shot voice cloning with reference audio clips."
+                        info = (
+                            "### 🎙️ F5-TTS Provider\n"
+                            "* **Model:** `f5_tts.api.F5TTS`\n"
+                            "* **Capabilities:** Fast and lightweight zero-shot voice cloning with reference audio clips.\n"
+                            "* **Installation:** Optional backend — run `pip install f5-tts` to enable this provider."
+                        )
                         return [
                             gr.update(visible=False),  # qwen_group
                             gr.update(value=info, visible=True), # provider_info_md
@@ -1158,13 +1168,23 @@ def build_app():
                     config_dict = dataclasses.asdict(cfg)
                     payload = {"config": config_dict, "text": text}
                     r = requests.post(url, json=payload)
-                    r.raise_for_status()
-                    wav_bytes = r.content
+                    if r.status_code == 200:
+                        wav_bytes = r.content
+                    else:
+                        err_detail = ""
+                        try:
+                            err_detail = r.json().get("detail", "")
+                        except Exception:
+                            err_detail = r.text
+                        print(f"⚠️ [UI Fallback] Voice test API returned {r.status_code}: {err_detail}. Running locally.")
                 except Exception as e:
                     print(f"⚠️ [UI Fallback] Voice test API failed: {e}. Running locally.")
 
             if wav_bytes is None:
-                wav_bytes = preview_tts(text, cfg)
+                try:
+                    wav_bytes = preview_tts(text, cfg)
+                except Exception as e:
+                    return None, f"❌ Preview failed: {e}"
 
             if wav_bytes is None:
                 return None, "❌ TTS generation failed — check your voice file and TTS model."
@@ -1452,7 +1472,11 @@ def build_app():
                                                     log_q.put(f"__DONE__::{paths}")
                                                     break
                                                 elif st["status"] in ("failed", "cancelled"):
-                                                    log_q.put(f"❌ API task {st['status']}.")
+                                                    err_msg_api = st.get("error_message") or ""
+                                                    if err_msg_api:
+                                                        log_q.put(f"❌ API task {st['status']}: {err_msg_api}")
+                                                    else:
+                                                        log_q.put(f"❌ API task {st['status']}.")
                                                     log_q.put("__DONE__::")
                                                     break
                                         except Exception:

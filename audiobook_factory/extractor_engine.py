@@ -47,9 +47,9 @@ from audiobook_factory.text_processing import normalize_text, smart_sentence_spl
 
 # ── Docling ───────────────────────────────────────────────────────────────────
 try:
-    from docling.document_converter import DocumentConverter
-    from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
+    from docling.document_converter import DocumentConverter  # type: ignore
+    from docling.datamodel.base_models import InputFormat  # type: ignore
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions  # type: ignore
     DOCLING_AVAILABLE = True
 except ImportError:
     DOCLING_AVAILABLE = False
@@ -57,7 +57,10 @@ except ImportError:
 
 # ── PyMuPDF (optional, for PDF TOC) ──────────────────────────────────────────
 try:
-    import fitz  # PyMuPDF
+    try:
+        import pymupdf as fitz  # PyMuPDF (new name)
+    except ImportError:
+        import fitz  # PyMuPDF (legacy)
     PYMUPDF_AVAILABLE = True
 except ImportError:
     PYMUPDF_AVAILABLE = False
@@ -76,12 +79,12 @@ _CHAPTER_KW = re.compile(
 
 # Skip-list for TOC entry titles (front/back-matter, gallery, legal…)
 _SKIP_TOC_TITLE = re.compile(
-    r"^(table\s*of\s*contents|toc|index|preface|foreword|introduction|"
+    r"^(table\s*of\s*contents|toc|index|"
     r"copyright|cover|title\s*page|about|postscript|newsletter|"
     r"image\s*gallery|characters?|locations?|map|pathways?|"
-    r"epilogue|afterword|end\s*of|to\s*be\s*continued|back\s*cover|"
+    r"end\s*of|to\s*be\s*continued|back\s*cover|"
     r"coloph|errata|bibliography|glossary|character\s*gallery|"
-    r"pathways\s*guide|bonus\s*chapter|contact\s*us|credits?)",
+    r"pathways\s*guide|contact\s*us|credits?)",
     re.I,
 )
 
@@ -651,7 +654,7 @@ class DocumentIngestor:
         # ── In-flight EPUB Image OCR ──
         if epub_book is not None:
             try:
-                import easyocr
+                import easyocr  # type: ignore
                 # We initialize lazily so we don't block startup or throw errors if missing
                 if not hasattr(DocumentIngestor, "_easyocr_reader"):
                     DocumentIngestor._easyocr_reader = easyocr.Reader(["en"], gpu=True)
@@ -1123,29 +1126,44 @@ class OutputWriter:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="5-Phase Hybrid AI Extraction Engine")
+    parser.add_argument("input_path", nargs="?", default=os.path.join(PROJECT_ROOT, "LOTM"), help="Path to book file or folder containing book files")
+    parser.add_argument("--output", "-o", default=os.path.join(PROJECT_ROOT, "output"), help="Output directory")
+    args = parser.parse_args()
+
+    input_path = os.path.abspath(args.input_path)
+    output_folder = os.path.abspath(args.output)
+    os.makedirs(output_folder, exist_ok=True)
+
     print("=" * 70)
     print("  5-PHASE HYBRID EXTRACTION PIPELINE")
     print("  AudiobookMaker — Debug Text Extraction")
     print("=" * 70)
-    print(f"  Input : {LOTM_FOLDER}")
-    print(f"  Output: {OUTPUT_FOLDER}")
+    print(f"  Input : {input_path}")
+    print(f"  Output: {output_folder}")
     print()
 
-    if not os.path.isdir(LOTM_FOLDER):
-        print(f"[ERROR] LOTM folder not found: {LOTM_FOLDER}")
+    if os.path.isfile(input_path):
+        input_folder = os.path.dirname(input_path)
+        files = [os.path.basename(input_path)]
+    elif os.path.isdir(input_path):
+        input_folder = input_path
+        files = [
+            f for f in sorted(os.listdir(input_folder))
+            if Path(f).suffix.lower() in SUPPORTED_EXT
+        ]
+    else:
+        print(f"[ERROR] Input path not found: {input_path}")
         sys.exit(1)
 
-    files = [
-        f for f in sorted(os.listdir(LOTM_FOLDER))
-        if Path(f).suffix.lower() in SUPPORTED_EXT
-    ]
     if not files:
-        print("[ERROR] No supported files (.epub .pdf .txt) found.")
+        print("[ERROR] No supported files (.epub .pdf .txt .docx .odt) found.")
         sys.exit(1)
 
     print(f"Files to process ({len(files)}):\n")
     for f in files:
-        size = os.path.getsize(os.path.join(LOTM_FOLDER, f)) / 1024 / 1024
+        size = os.path.getsize(os.path.join(input_folder, f)) / 1024 / 1024
         print(f"  • {f}  ({size:.1f} MB)")
     print()
 
@@ -1157,7 +1175,7 @@ def main():
     all_summary: dict[str, Any] = {}
 
     for filename in files:
-        filepath = os.path.join(LOTM_FOLDER, filename)
+        filepath = os.path.join(input_folder, filename)
         stem     = Path(filename).stem
         ext      = Path(filename).suffix.lower()
 
@@ -1167,7 +1185,7 @@ def main():
 
         # Clear previous output for this book
         safe_stem = OutputWriter._safe_name(stem, 80)
-        out_dir   = os.path.join(OUTPUT_FOLDER, safe_stem)
+        out_dir   = os.path.join(output_folder, safe_stem)
         if os.path.exists(out_dir):
             shutil.rmtree(out_dir)
 
@@ -1235,14 +1253,14 @@ def main():
         print(f"  ✓ Output → {out_dir}")
 
     # Master summary
-    master_path = os.path.join(OUTPUT_FOLDER, "_master_summary.json")
+    master_path = os.path.join(output_folder, "_master_summary.json")
     with open(master_path, "w", encoding="utf-8") as f:
         json.dump(all_summary, f, indent=2, ensure_ascii=False)
 
     print()
     print("=" * 70)
     print(f"  DONE.  Master summary: {master_path}")
-    print(f"  Inspect output in:    {OUTPUT_FOLDER}")
+    print(f"  Inspect output in:    {output_folder}")
     print("=" * 70)
 
 

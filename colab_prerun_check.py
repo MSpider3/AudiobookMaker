@@ -139,6 +139,14 @@ try:
 except Exception as e:
     print(f"    QwenTTSProvider per-device test failed: {e}  ✗")
 
+# ── 6. Optional TTS Providers Status ─────────────────────────────────────────
+print("\n[6] Optional TTS Providers status …")
+try:
+    import f5_tts  # type: ignore # noqa: F401
+    print("    F5-TTS: installed and available  ✓")
+except ImportError:
+    print("    F5-TTS: not installed (optional — run install cell if using F5-TTS)  ℹ")
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 print("\n" + "=" * 62)
 print("All Colab pre-run diagnostic checks passed!")

@@ -75,3 +75,38 @@ class TestTTSProviderContract:
     def test_get_tts_provider_unknown_raises(self, config):
         with pytest.raises(ValueError, match="Unknown TTS provider"):
             get_tts_provider("non_existent_provider_xyz", config)
+
+    def test_get_tts_provider_all_valid_names(self, config):
+        from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
+        from audiobook_factory.tts_providers.vibevoice_provider import VibeVoiceTTSProvider
+        from audiobook_factory.tts_providers.f5tts_provider import F5TTSProvider
+
+        for name in ("qwen", "qwen3", "qwen3-tts", ""):
+            p = get_tts_provider(name, config)
+            assert isinstance(p, QwenTTSProvider)
+
+        for name in ("vibevoice", "vibe-voice", "vibevoice-1.5b"):
+            p = get_tts_provider(name, config)
+            assert isinstance(p, VibeVoiceTTSProvider)
+
+        for name in ("f5tts", "f5-tts", "f5_tts"):
+            p = get_tts_provider(name, config)
+            assert isinstance(p, F5TTSProvider)
+
+    def test_f5tts_missing_dependency_raises_clean_message(self, config):
+        p = get_tts_provider("f5tts", config)
+        try:
+            import f5_tts  # noqa: F401
+            pytest.skip("f5-tts is installed in environment")
+        except ImportError:
+            with pytest.raises(RuntimeError, match="pip install f5-tts"):
+                p.ensure_ready()
+
+    def test_vibevoice_unapproved_model_raises(self):
+        bad_cfg = AudiobookConfig(
+            tts_provider_name="vibevoice",
+            tts_model_name="evil-repo/unapproved-vibevoice",
+        )
+        p = get_tts_provider("vibevoice", bad_cfg)
+        with pytest.raises(ValueError, match="Refusing to load unapproved VibeVoice model"):
+            p.ensure_ready()

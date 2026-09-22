@@ -29,20 +29,24 @@ async def lifespan(app: FastAPI):
     print("[API Server] Background worker consumer task spawned successfully.")
 
     def _warmup_gpu_pool():
+        if os.environ.get("ABM_SKIP_GPU_WARMUP") == "1":
+            return
         try:
             from audiobook_factory.gpu_pool import GPUPoolManager
             from audiobook_factory.pipeline import AudiobookConfig
             from audiobook_factory.tts_providers import get_tts_provider
             cfg = AudiobookConfig()
-            GPUPoolManager.instance().get_pool(
-                provider_name=cfg.tts_provider_name,
-                provider_factory=lambda dev: get_tts_provider(cfg.tts_provider_name, cfg, device=dev),
-            )
+            if cfg.tts_provider_name != "mock":
+                GPUPoolManager.instance().get_pool(
+                    provider_name=cfg.tts_provider_name,
+                    provider_factory=lambda dev: get_tts_provider(cfg.tts_provider_name, cfg, device=dev),
+                )
         except Exception as exc:
             print(f"[API Server] GPU pool warmup warning: {exc}")
 
-    import threading
-    threading.Thread(target=_warmup_gpu_pool, daemon=True).start()
+    if os.environ.get("ABM_SKIP_GPU_WARMUP") != "1":
+        import threading
+        threading.Thread(target=_warmup_gpu_pool, daemon=True).start()
 
     yield
 
