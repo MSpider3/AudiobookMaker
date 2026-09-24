@@ -9,8 +9,11 @@ from __future__ import annotations
 import dataclasses
 import io
 import json
+import logging
 import os
 import queue
+
+logger = logging.getLogger(__name__)
 import re
 import sys
 import threading
@@ -913,8 +916,8 @@ def build_app():
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
                         f.write(result.cover_data)
                         cover_path = f.name
-                except:
-                    pass
+                except Exception as exc:
+                    logger.debug("Cover extraction failed: %s", exc)
 
             if result.has_toc and result.chapters:
                 choices = [f"{c.num}. {c.title}  (~{c.word_count:,} words)" for c in result.chapters]

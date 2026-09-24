@@ -55,6 +55,10 @@ dogfood-output/
 # ── Debug / extraction output ─────────────────────────────────────────────────
 debug_extraction_output/
 
+# ── QA / Security ─────────────────────────────────────────────────────────────
+docs/qa/
+docs/security/
+
 # ── OS cruft ─────────────────────────────────────────────────────────────────
 .gradio/
 .DS_Store

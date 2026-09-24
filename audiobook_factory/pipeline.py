@@ -78,6 +78,8 @@ from audiobook_factory.progress_io import (
     update_chapter_status,
     update_chapter_chunk,
     update_chapter_retry,
+    _WRITE_LOCK,
+    _write_unlocked,
 )
 from audiobook_factory.utils import format_lrc_timestamp
 
@@ -114,25 +116,26 @@ def _finalize_progress_file(progress_path: str, chapters: list) -> None:
     if not os.path.exists(progress_path):
         return
     try:
-        data = read_progress_file(progress_path)
-        chapter_entries = data.get("chapters", [])
-        completed_count = sum(1 for c in chapter_entries if c.get("status") == "completed")
-        failed_entries = [c for c in chapter_entries if c.get("status") == "failed"]
-        failed_count = len(failed_entries)
-        failed_chapters = [c.get("num") for c in failed_entries if c.get("num") is not None]
-        total_ch = len(chapter_entries) if chapter_entries else len(chapters)
-        all_complete = (completed_count == total_ch and total_ch > 0)
+        with _WRITE_LOCK:
+            data = read_progress_file(progress_path)
+            chapter_entries = data.get("chapters", [])
+            completed_count = sum(1 for c in chapter_entries if c.get("status") == "completed")
+            failed_entries = [c for c in chapter_entries if c.get("status") == "failed"]
+            failed_count = len(failed_entries)
+            failed_chapters = [c.get("num") for c in failed_entries if c.get("num") is not None]
+            total_ch = len(chapter_entries) if chapter_entries else len(chapters)
+            all_complete = (completed_count == total_ch and total_ch > 0)
 
-        from datetime import datetime, timezone
-        data["generation_summary"] = {
-            "total_chapters": total_ch,
-            "completed_count": completed_count,
-            "failed_count": failed_count,
-            "failed_chapters": failed_chapters,
-            "all_complete": all_complete,
-            "finalized_at": datetime.now(timezone.utc).isoformat(),
-        }
-        write_progress_file(progress_path, data)
+            from datetime import datetime, timezone
+            data["generation_summary"] = {
+                "total_chapters": total_ch,
+                "completed_count": completed_count,
+                "failed_count": failed_count,
+                "failed_chapters": failed_chapters,
+                "all_complete": all_complete,
+                "finalized_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _write_unlocked(progress_path, data)
     except Exception as exc:
         logger.warning("[Pipeline] Could not finalize progress file %s: %s", progress_path, exc)
 
@@ -328,6 +331,11 @@ class AudiobookConfig:
         return "\n".join(lines)
 
 
+_VALID_OUTPUT_FORMATS: tuple[str, ...] = (
+    "mp3", "wav", "flac", "m4b", "m4a", "aac", "ogg", "webm", "mp4", "mov"
+)
+
+
 def _validate_config(config: AudiobookConfig) -> None:
     """Validate AudiobookConfig options before running the pipeline.
 
@@ -339,10 +347,10 @@ def _validate_config(config: AudiobookConfig) -> None:
             f"Invalid quantization mode '{config.quantization}'. "
             f"Supported options: {sorted(_VALID_QUANTIZATION_MODES)}"
         )
-    if config.output_format not in ("mp3", "wav", "flac", "m4b"):
+    if config.output_format not in _VALID_OUTPUT_FORMATS:
         raise ValueError(
             f"Invalid output_format '{config.output_format}'. "
-            f"Supported options: ['flac', 'm4b', 'mp3', 'wav']"
+            f"Supported options: {sorted(_VALID_OUTPUT_FORMATS)}"
         )
     if config.parallel_mode not in ("chunks", "chapters"):
         raise ValueError(
@@ -762,7 +770,8 @@ def run_pipeline(
                 with open(list_txt, "w", encoding="utf-8") as f:
                     for p in output_files:
                         p_safe = os.path.abspath(p).replace('\\', '/')
-                        f.write(f"file '{p_safe}'\n")
+                        escaped = p_safe.replace("'", "'\\''")
+                        f.write(f"file '{escaped}'\n")
                 
                 subprocess.run(
                     ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt, "-c", "copy", full_path],
@@ -1143,6 +1152,7 @@ def _process_chapter(
             return None
 
         # ── Generate Subtitles Asynchronously ─────────────────────────────────
+        sub_future: concurrent.futures.Future | None = None
         if config.export_lrc or config.export_srt or config.export_vtt:
             if subtitle_futures is not None and subtitle_futures_lock is not None:
                 sub_future = _subtitle_executor.submit(
@@ -1170,7 +1180,8 @@ def _process_chapter(
                     conv_path = os.path.join(temp_dir, "cover_converted.jpg")
                     img.save(conv_path, format="JPEG", quality=95)
                     valid_cover = conv_path
-            except Exception:
+            except Exception as exc:
+                logger.warning("[Ch%d] Cover image conversion failed (%s). Using original.", idx, exc)
                 valid_cover = raw_cover if os.path.exists(raw_cover) else ""
 
         def _get_cover_flags(fmt: str, include_cover: bool) -> list[str]:
@@ -1337,6 +1348,11 @@ def _process_chapter(
 
 
     finally:
+        if sub_future is not None:
+            try:
+                sub_future.result(timeout=30.0)
+            except Exception as exc:
+                logger.warning("[Ch%d] Subtitle future failed: %s", idx, exc)
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 

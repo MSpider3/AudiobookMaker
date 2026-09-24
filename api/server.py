@@ -10,14 +10,21 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from collections import defaultdict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Response, UploadFile, File, Form
+import secrets
+import threading
+import time
+from fastapi import (
+    FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Response,
+    UploadFile, File, Form, Depends, Header, Request
+)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from audiobook_factory.pipeline import AudiobookConfig, preview_tts
 from audiobook_factory.voice_preprocessor import PreprocessConfig, preprocess as voice_preprocess
-from api.worker import tasks, task_queue, Task, worker_loop
+from api.worker import tasks, task_queue, Task, worker_loop, evict_old_tasks
 
 
 # ── Lifespan Event Handler ───────────────────────────────────────────────────
@@ -91,6 +98,59 @@ class VoiceTestRequest(BaseModel):
 
 from audiobook_factory.gpu_pool import GPUDetector, GPUPoolManager
 
+# ── Auth & Rate Limiting ───────────────────────────────────────────────────────
+
+async def require_auth(
+    x_api_key: str = Header(default="", alias="x-api-key"),
+    authorization: str = Header(default="", alias="authorization"),
+) -> None:
+    """Validates shared secret auth if ABM_API_SECRET is configured."""
+    secret = os.environ.get("ABM_API_SECRET", "")
+    if not secret:
+        return
+    token = x_api_key
+    if not token and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+    if not token or not secrets.compare_digest(token, secret):
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing API key.")
+
+
+class SimpleRateLimiter:
+    """In-memory sliding-window rate limiter per client IP."""
+
+    def __init__(self, max_requests: int, window_seconds: float):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests: dict[str, list[float]] = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def check(self, client_ip: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            history = self._requests[client_ip]
+            self._requests[client_ip] = [t for t in history if t > cutoff]
+            if len(self._requests[client_ip]) >= self.max_requests:
+                return False
+            self._requests[client_ip].append(now)
+            return True
+
+
+_generate_limiter = SimpleRateLimiter(max_requests=30, window_seconds=60.0)
+_preprocess_limiter = SimpleRateLimiter(max_requests=60, window_seconds=60.0)
+
+
+async def check_generate_rate_limit(request: Request) -> None:
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    if not _generate_limiter.check(client_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded for generation requests.")
+
+
+async def check_preprocess_rate_limit(request: Request) -> None:
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    if not _preprocess_limiter.check(client_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded for preprocess requests.")
+
 
 @app.get("/api/v1/health")
 async def health_check():
@@ -120,8 +180,9 @@ async def health_check():
     }
 
 
-@app.post("/api/v1/generate")
+@app.post("/api/v1/generate", dependencies=[Depends(require_auth), Depends(check_generate_rate_limit)])
 async def enqueue_generation(payload: GenerateRequest):
+    evict_old_tasks()
     task_id = str(uuid.uuid4())
     
     # Store task details
@@ -138,7 +199,7 @@ async def enqueue_generation(payload: GenerateRequest):
     return {"task_id": task_id, "status": "queued"}
 
 
-@app.post("/api/v1/tasks/{task_id}/cancel")
+@app.post("/api/v1/tasks/{task_id}/cancel", dependencies=[Depends(require_auth)])
 async def cancel_task(task_id: str):
     task = tasks.get(task_id)
     if not task:
@@ -153,7 +214,7 @@ async def cancel_task(task_id: str):
     return {"task_id": task_id, "status": task.status}
 
 
-@app.get("/api/v1/tasks/{task_id}")
+@app.get("/api/v1/tasks/{task_id}", dependencies=[Depends(require_auth)])
 async def get_task_status(task_id: str):
     task = tasks.get(task_id)
     if not task:
@@ -169,7 +230,7 @@ async def get_task_status(task_id: str):
     }
 
 
-@app.post("/api/v1/voice-test")
+@app.post("/api/v1/voice-test", dependencies=[Depends(require_auth)])
 async def api_voice_test(payload: VoiceTestRequest):
     """
     Generates preview speech using the backend's shared loaded model.
@@ -187,7 +248,7 @@ async def api_voice_test(payload: VoiceTestRequest):
         raise HTTPException(status_code=500, detail=f"TTS synthesis error: {e}")
 
 
-@app.post("/api/v1/preprocess")
+@app.post("/api/v1/preprocess", dependencies=[Depends(require_auth), Depends(check_preprocess_rate_limit)])
 async def api_preprocess(
     noise_reduce: bool = Form(...),
     noise_reduce_strength: float = Form(...),
@@ -245,6 +306,15 @@ async def api_preprocess(
 
 @app.websocket("/api/v1/ws/{task_id}")
 async def task_websocket_endpoint(websocket: WebSocket, task_id: str):
+    secret = os.environ.get("ABM_API_SECRET", "")
+    if secret:
+        token = websocket.query_params.get("api_key") or websocket.headers.get("x-api-key") or ""
+        if not token or not secrets.compare_digest(token, secret):
+            await websocket.accept()
+            await websocket.send_json({"type": "error", "message": "Unauthorized: invalid or missing API key."})
+            await websocket.close(code=1008)
+            return
+
     await websocket.accept()
     task = tasks.get(task_id)
     if not task:

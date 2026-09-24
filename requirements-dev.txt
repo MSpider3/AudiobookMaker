@@ -1,0 +1,7 @@
+# ─── AudiobookMaker — Development & Test Dependencies ────────────────────────
+# Install with:  pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest
+pytest-asyncio>=0.23

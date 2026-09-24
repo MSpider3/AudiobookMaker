@@ -110,3 +110,64 @@ class TestTTSProviderContract:
         p = get_tts_provider("vibevoice", bad_cfg)
         with pytest.raises(ValueError, match="Refusing to load unapproved VibeVoice model"):
             p.ensure_ready()
+
+    def test_f5tts_temp_file_cleaned_up(self, config, monkeypatch):
+        import numpy as np
+        from audiobook_factory.tts_providers.f5tts_provider import F5TTSProvider
+
+        p = F5TTSProvider(config, device="cpu")
+        recorded_temp_files = []
+
+        class DummyModel:
+            def infer(self, **kwargs):
+                ref_file = kwargs.get("ref_file")
+                recorded_temp_files.append(ref_file)
+                assert os.path.exists(ref_file), "Temp file should exist during inference"
+                return np.zeros(24000, dtype=np.float32), 24000, None
+
+        p._model = DummyModel()
+        monkeypatch.setattr(p, "ensure_ready", lambda: None)
+
+        fake_voice_ref = b"RIFF" + b"\x00" * 100
+        p.synthesize("Hello world", fake_voice_ref, return_bytes=True)
+
+        assert len(recorded_temp_files) == 1
+        assert not os.path.exists(recorded_temp_files[0]), "Temp file must be unlinked after synthesize"
+
+    def test_qwen_voice_ref_cache_limit_and_eviction(self, config):
+        from audiobook_factory.tts_providers.qwen_provider import (
+            QwenTTSProvider, _VOICE_REF_CACHE, _MAX_VOICE_REF_CACHE
+        )
+        p = QwenTTSProvider(config, device="cpu")
+        created_paths = []
+        for i in range(12):
+            raw_bytes = f"RIFF_FAKE_VOICE_{i:04d}_CONTENT_DATA".encode()
+            path = p._resolve_voice_ref(raw_bytes)
+            created_paths.append(path)
+
+        assert len(_VOICE_REF_CACHE) <= _MAX_VOICE_REF_CACHE
+        # The oldest 4 entries (0..3) should have been evicted and deleted
+        for evicted_path in created_paths[:4]:
+            assert not os.path.exists(evicted_path), f"Evicted voice ref {evicted_path} should be deleted"
+
+    def test_qwen_asr_pipeline_is_cached(self, config, monkeypatch):
+        from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
+        p = QwenTTSProvider(config, device="cpu")
+
+        pipeline_calls = []
+
+        def fake_pipeline(*args, **kwargs):
+            pipeline_calls.append(kwargs)
+            return lambda path: {"text": "Transcribed speech"}
+
+        monkeypatch.setattr("transformers.pipeline", fake_pipeline)
+
+        t1 = p._get_voice_transcript("/nonexistent/fake_ref_1.wav")
+        assert t1 == "Transcribed speech"
+        assert len(pipeline_calls) == 1
+
+        # Second call with another path uses the already-instantiated pipeline
+        t2 = p._get_voice_transcript("/nonexistent/fake_ref_2.wav")
+        assert t2 == "Transcribed speech"
+        assert len(pipeline_calls) == 1, "Pipeline should be cached at instance level, not recreated"
+

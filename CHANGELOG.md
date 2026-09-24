@@ -4,6 +4,70 @@ All notable changes to **AudiobookMaker** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.5.0] - 2026-09-24
+
+### ⚡ Added
+- **API Secret Authentication & Rate Limiting (`api/server.py`)**: Added shared secret authentication via `ABM_API_SECRET` (`x-api-key` header, `Authorization: Bearer` header, and WebSocket query parameter `?api_key=`), safeguarding endpoints against unauthorized GPU task submission and data access. Implemented thread-safe in-memory sliding-window rate limiting on `/api/v1/generate` (30 req/min) and `/api/v1/preprocess` (60 req/min).
+- **Task Lifecycle Eviction (`api/worker.py`, `api/server.py`)**: Added bounded task history management with `_MAX_COMPLETED_TASKS = 50` and `evict_old_tasks()`, eliminating unbounded memory growth from accumulated terminal jobs in long-running server sessions.
+- **Dedicated Dev & Test Requirements (`requirements-dev.txt`)**: Created `requirements-dev.txt` specifying `pytest` and `pytest-asyncio>=0.23` to support async test execution in fresh environments.
+
+### 🐛 Fixed
+- **F5-TTS Temporary Voice Reference Cleanup (`f5tts_provider.py`)**: Wrapped inference in a `try/finally` block to ensure temporary WAV reference files created from `bytes` payloads are reliably unlinked, preventing disk exhaustion during multi-chapter synthesis.
+- **Qwen Voice Reference Bounded LRU Cache (`qwen_provider.py`)**: Capped `_VOICE_REF_CACHE` at 8 entries with thread-safe LRU eviction and automatic deletion of evicted WAV files from disk.
+- **Whisper ASR Pipeline Caching (`qwen_provider.py`)**: Cached the Whisper automatic speech recognition pipeline at the `QwenTTSProvider` instance level, preventing expensive repeated model re-downloads and GPU memory allocations across synthesis calls.
+- **Chapter Pipeline Cancellation Sentinels (`chapter_pipeline.py`)**: Enforced dispatch of termination sentinels (`None`) to all active device queues in `_stage_a_worker`'s `finally` block, preventing Stage B workers from blocking indefinitely when cancellation occurs mid-dispatch.
+- **Stage B Cancellation Dropped Chunk Accounting (`chapter_pipeline.py`)**: Ensured accumulated in-flight batches abandoned on cancellation emit `_StageError` events to Stage C before exiting, maintaining consistent chunk counting and clean `CancelledError` propagation.
+- **Stage C Active Worker Counting (`chapter_pipeline.py`)**: Fixed worker exit tracking in Stage C so active worker counts are decremented strictly upon receiving worker `None` sentinels rather than chunk-level `_StageError` events.
+- **Subtitle Generation Synchronization (`pipeline.py`)**: Synchronized chapter subtitle generation futures inside `_process_chapter`'s `finally` block before temporary working directory removal, preventing silent `FileNotFoundError` subtitle export failures.
+- **Expanded Output Format Validation (`pipeline.py`)**: Updated `_validate_config()` to accept all media formats supported by `ffmpeg_utils.py` (`mp3`, `wav`, `flac`, `m4b`, `m4a`, `aac`, `ogg`, `webm`, `mp4`, `mov`).
+- **FFmpeg Concat Demuxer Single-Quote Escaping (`pipeline.py`)**: Added proper shell escaping for single quotes and spaces in file paths written to `concat_list.txt` in single-file audio concatenation mode.
+- **Atomic Progress Summary Finalization (`pipeline.py`, `progress_io.py`)**: Wrapped `_finalize_progress_file()` read-modify-write logic with `_WRITE_LOCK` to eliminate race conditions with concurrent chapter completion updates, and documented multi-process locking limitations.
+- **Cover Image Conversion Logging (`pipeline.py`, `app.py`)**: Replaced bare `except:` blocks with specific `Exception` handling and logging, preventing silent cover art embedding failures and ensuring system-level exceptions are not masked.
+- **Preflight bfloat16 Capability Detection (`preflight.py`)**: Fixed `torch.cuda.is_bf16_supported()` call signature by scoping checks under `torch.cuda.device(idx)` context rather than passing device index as an argument.
+- **Lazy PyTorch Import in Worker (`api/worker.py`)**: Defended module-level imports in `api.worker` by scoping `import torch` inside `_get_active_gpu_count()`, avoiding import crashes in lightweight CLI/test environments.
+
+---
+
+## [v1.4.1] - 2026-09-22
+
+### ⚡ Added
+- **Multi-TTS Provider Serialization & Pool Eviction (`gpu_pool.py`, `api/worker.py`)**: Implemented `_wait_for_other_providers_idle()` to serialize task execution when switching between different TTS backends (Qwen, VibeVoice, F5-TTS). Added automatic eviction and cleanup of inactive provider pools in `GPUPoolManager.get_pool()` to eliminate multi-engine GPU OOM errors.
+- **Voice Studio Preview Provider Cache (`pipeline.py`)**: Added cached preview provider instance in `preview_tts()` with automatic resource cleanup upon engine or model variant changes, preventing VRAM leaks on preview clicks.
+- **Conditional GPU Warmup (`server.py`, `colab_prerun_check.py`, `kaggle_prerun_check.py`)**: Added `ABM_SKIP_GPU_WARMUP` environment variable check to bypass blocking warmup passes during testing or fast startup.
+
+### 🐛 Fixed
+- **Notebook & Tunnel Launch Stability (`AudiobookMaker_Colab.ipynb`, `AudiobookMaker_Kaggle.ipynb`)**: Fixed notebook startup hangs by starting Pinggy tunnels before Gradio initialization, generating SSH keys automatically, setting `inline=False` and `share=True`, and executing via `sys.executable`.
+- **Gradio Type Annotation NameErrors (`app.py`, `cli.py`)**: Imported `Any` in `app.py` and `AudiobookConfig` in `cli.py` to fix runtime `get_type_hints()` failures during Gradio interface mounting.
+- **Document Extractor Edge Case Robustness (`text_extractor.py`, `extractor_engine.py`)**: Hardened EPUB/PDF text parsing, TOC boundary detection, and fallback handling for missing chapter titles.
+
+---
+
+## [v1.4.0] - 2026-09-21
+
+### 🛡️ Security
+- **VibeVoice Model Allowlist (`vibevoice_provider.py`)**: Enforced strict allowlist validation on HuggingFace model identifiers for VibeVoice to prevent remote code execution via `trust_remote_code=True`.
+- **Path Traversal Containment (`worker.py`, `filename_sanitizer.py`)**: Anchored output directories in `api/worker.py` to `ABM_OUTPUT_BASE` and sanitized audio file extension suffixes in `filename_sanitizer.py`.
+- **Archive & Document Decompression Guards (`text_extractor.py`, `extractor_engine.py`)**: Added zip bomb safety checks, PDF decompression limits, and table span clamping in document extractors.
+- **CLI Configuration Sanitization (`cli.py`)**: Hardened CLI settings loading against maliciously crafted configuration parameters and unapproved provider injection.
+- **Session Progress Isolation (`app.py`)**: Isolated Gradio session progress ownership and removed server path reflection in UI responses.
+- **Security Documentation & QA Reports (`docs/security/`, `docs/qa/`)**: Added security hardening proposals, vulnerability remediation reports, and automated reproduction tests across 9 test modules.
+
+### ⚡ Added & Fixed
+- **Qwen3 Audio Quality & Concatenation (`pipeline.py`, `qwen_provider.py`)**: Refined cross-chunk audio stitching to eliminate audible gaps and pops between generated segments.
+- **FastAPI Lifespan Migration (`api/server.py`)**: Replaced deprecated `@app.on_event("startup")` and `@app.on_event("shutdown")` hooks with modern `lifespan` context manager.
+
+---
+
+## [v1.3.1] - 2026-08-31
+
+### ⚡ Added
+- **Automated QA & Benchmark Framework (`tests/`)**: Built comprehensive automated testing infrastructure including audio quality validator (`AudioValidator`), synthetic audio fixture generators, document parsing test suites, and pipeline speed benchmarking tools (`tests/benchmark_pipeline.py`).
+- **Kaggle Validation Suite (`tests/kaggle/`)**: Added end-to-end multi-GPU verification suite, smoke tests, and automated Markdown report generation for Kaggle dual T4 environments.
+- **EBU R128 Pure-Python Mastering (`pipeline.py`, `ffmpeg_utils.py`)**: Implemented pure-Python audio mastering fallback with EBU R128 loudness normalization and true peak limiting when Rust acceleration is unavailable.
+- **File-Based Voice Preprocessing (`voice_preprocessor.py`)**: Enabled `voice_preprocess()` to accept file paths directly and automatically persist cleaned reference audio to disk.
+
+---
+
 ## [v1.3.0] - 2026-08-11
 
 ### ⚡ Added

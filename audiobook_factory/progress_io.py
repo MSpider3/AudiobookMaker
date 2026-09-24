@@ -24,8 +24,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _WRITE_LOCK = threading.Lock()
-# Module-level lock protecting all writes to progress JSON files.
+# Module-level lock protecting all writes to progress JSON files within this process.
 # Prevents concurrent write corruption when chapters run in parallel.
+# Note: This is an in-process thread lock. Cross-process coordination (e.g. across separate
+# CLI/API Python processes writing to the same progress file) requires file-level locking.
 
 _SUPPORTED_ENCODINGS: tuple[str, ...] = ("utf-8-sig", "utf-8", "latin-1")
 # Tried in order on read. utf-8-sig strips BOM automatically.

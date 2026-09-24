@@ -330,6 +330,10 @@ def _stage_b_device_worker(
                 item = device_synth_queue.get(timeout=_ACQUIRE_POLL_TIMEOUT_SEC)
             except queue.Empty:
                 if cancel_token.is_cancelled:
+                    if accumulated:
+                        for chunk_idx, _ in accumulated:
+                            master_queue.put(_StageError(CancelledError(f"Chunk {chunk_idx} cancelled")))
+                        accumulated.clear()
                     master_queue.put(None)
                     return
                 continue
@@ -346,6 +350,10 @@ def _stage_b_device_worker(
                 return
 
             if cancel_token.is_cancelled:
+                if accumulated:
+                    for chunk_idx, _ in accumulated:
+                        master_queue.put(_StageError(CancelledError(f"Chunk {chunk_idx} cancelled")))
+                    accumulated.clear()
                 master_queue.put(None)
                 return
 
@@ -483,21 +491,24 @@ def run_chapter_pipeline(
                     if cancel_token.is_cancelled:
                         break
                     device_synth_queues[pinned_device].put(item)
-                device_synth_queues[pinned_device].put(None)
             else:
                 # Path B: Static contiguous split across all active devices
                 counts = [(total + num_devs - 1 - i) // num_devs for i in range(num_devs)]
                 offset = 0
                 for i, dev in enumerate(active_devices):
+                    if cancel_token.is_cancelled:
+                        break
                     chunk_slice = pending_items[offset : offset + counts[i]]
                     for item in chunk_slice:
                         if cancel_token.is_cancelled:
                             break
                         device_synth_queues[dev].put(item)
-                    device_synth_queues[dev].put(None)  # Sentinel per device queue
                     offset += counts[i]
         except Exception as exc:
             logger.error("Stage A error on chapter %d: %s", chapter_index, exc)
+        finally:
+            for dev in active_devices:
+                device_synth_queues[dev].put(None)
 
     thread_a = threading.Thread(target=_stage_a_worker, name=f"StageA-Ch{chapter_index}", daemon=False)
 
@@ -585,8 +596,8 @@ def run_chapter_pipeline(
                         continue
                     elif isinstance(item, _StageError):
                         _pipeline_failed = True
-                        pipeline_exc = item.exception
-                        stage_b_active_count -= 1
+                        if pipeline_exc is None:
+                            pipeline_exc = item.exception
                         continue
                     elif isinstance(item, _SynthResult):
                         received_chunks[item.chunk_index] = item

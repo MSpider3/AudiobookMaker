@@ -92,11 +92,13 @@ class F5TTSProvider(BaseTTSProvider):
             )
 
         ref_file = voice_ref if isinstance(voice_ref, str) else None
+        _tmp_ref_file: str | None = None
         if isinstance(voice_ref, bytes):
             import tempfile
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
                 tf.write(voice_ref)
                 ref_file = tf.name
+                _tmp_ref_file = tf.name
 
         try:
             nfe_step = getattr(self.config, "nfe_step", 32)
@@ -119,6 +121,12 @@ class F5TTSProvider(BaseTTSProvider):
         except Exception as exc:
             logger.error("[F5-TTS] Inference error: %s", exc)
             raise RuntimeError(f"F5-TTS synthesis failed: {exc}") from exc
+        finally:
+            if _tmp_ref_file is not None:
+                try:
+                    os.unlink(_tmp_ref_file)
+                except OSError:
+                    pass
 
         duration = len(audio_data) / float(sample_rate) if sample_rate > 0 else est_duration
 

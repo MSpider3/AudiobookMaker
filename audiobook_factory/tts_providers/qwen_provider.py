@@ -23,8 +23,36 @@ _TORCH_COMPILE_MODE: str = "max-autotune"
 
 
 import hashlib
+import os
 
+_MAX_VOICE_REF_CACHE: int = 8
 _VOICE_REF_CACHE: dict[str, str] = {}
+_VOICE_REF_LOCK = threading.Lock()
+
+
+def _voice_ref_cache_get(key: str) -> str | None:
+    with _VOICE_REF_LOCK:
+        if key in _VOICE_REF_CACHE:
+            path = _VOICE_REF_CACHE.pop(key)
+            _VOICE_REF_CACHE[key] = path
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                return path
+    return None
+
+
+def _voice_ref_cache_put(key: str, path: str) -> None:
+    with _VOICE_REF_LOCK:
+        if key in _VOICE_REF_CACHE:
+            _VOICE_REF_CACHE.pop(key)
+        elif len(_VOICE_REF_CACHE) >= _MAX_VOICE_REF_CACHE:
+            oldest_key, oldest_path = next(iter(_VOICE_REF_CACHE.items()))
+            _VOICE_REF_CACHE.pop(oldest_key)
+            try:
+                if os.path.exists(oldest_path):
+                    os.unlink(oldest_path)
+            except OSError:
+                pass
+        _VOICE_REF_CACHE[key] = path
 
 
 def _sanitize_dict_keys(obj: Any) -> None:
@@ -94,6 +122,7 @@ class QwenTTSProvider(BaseTTSProvider):
         self._x_vector_cache: dict[str, torch.Tensor] = {}
         self._voice_prompt_cache: dict[str, Any] = {}
         self._transcript_cache: dict[str, str] = {}
+        self._asr_pipe: Any = None
         self._lock: threading.Lock = threading.Lock()
 
     @classmethod
@@ -149,18 +178,16 @@ class QwenTTSProvider(BaseTTSProvider):
         if isinstance(voice_ref, str):
             return voice_ref
         if isinstance(voice_ref, bytes):
-            import os
             import tempfile
             key = hashlib.sha256(voice_ref).hexdigest()[:16]
-            if key in _VOICE_REF_CACHE:
-                cached = _VOICE_REF_CACHE[key]
-                if os.path.exists(cached) and os.path.getsize(cached) > 0:
-                    return cached
+            cached = _voice_ref_cache_get(key)
+            if cached is not None:
+                return cached
             temp_path = os.path.join(tempfile.gettempdir(), f"qwen_voiceref_{key}.wav")
             if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
                 with open(temp_path, "wb") as f:
                     f.write(voice_ref)
-            _VOICE_REF_CACHE[key] = temp_path
+            _voice_ref_cache_put(key, temp_path)
             logger.debug("Voice ref cached to %s", temp_path)
             return temp_path
         raise ValueError(f"voice_ref must be bytes or str, got {type(voice_ref).__name__}")
@@ -202,14 +229,15 @@ class QwenTTSProvider(BaseTTSProvider):
         try:
             import torch
             from transformers import pipeline
-            device_idx = int(self._device.split(":")[1]) if (self._device.startswith("cuda") and ":" in self._device) else (0 if self._device == "cuda" else -1)
-            asr_pipe = pipeline(
-                "automatic-speech-recognition",
-                model="openai/whisper-tiny",
-                device=device_idx if (torch.cuda.is_available() and device_idx >= 0) else -1,
-                torch_dtype=torch.float16 if (torch.cuda.is_available() and device_idx >= 0) else torch.float32,
-            )
-            res = asr_pipe(ref_path)
+            if getattr(self, "_asr_pipe", None) is None:
+                device_idx = int(self._device.split(":")[1]) if (self._device.startswith("cuda") and ":" in self._device) else (0 if self._device == "cuda" else -1)
+                self._asr_pipe = pipeline(
+                    "automatic-speech-recognition",
+                    model="openai/whisper-tiny",
+                    device=device_idx if (torch.cuda.is_available() and device_idx >= 0) else -1,
+                    torch_dtype=torch.float16 if (torch.cuda.is_available() and device_idx >= 0) else torch.float32,
+                )
+            res = self._asr_pipe(ref_path)
             transcript = (res.get("text") or "").strip() if isinstance(res, dict) else ""
             if transcript:
                 self._transcript_cache[ref_path] = transcript
@@ -598,6 +626,7 @@ class QwenTTSProvider(BaseTTSProvider):
             self._x_vector_cache.clear()
             self._voice_prompt_cache.clear()
             self._transcript_cache.clear()
+            self._asr_pipe = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

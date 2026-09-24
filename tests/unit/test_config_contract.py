@@ -91,10 +91,11 @@ class TestConfigContract:
             _validate_config(cfg_invalid)
 
     def test_validate_config_output_format(self):
-        for fmt in ("mp3", "wav", "flac", "m4b"):
+        for fmt in ("mp3", "wav", "flac", "m4b", "m4a", "aac", "ogg", "webm", "mp4", "mov"):
             cfg = AudiobookConfig(output_format=fmt)
             _validate_config(cfg)
 
-        cfg_invalid = AudiobookConfig(output_format="aac")
+        cfg_invalid = AudiobookConfig(output_format="unsupported_fmt")
         with pytest.raises(ValueError, match="output_format"):
             _validate_config(cfg_invalid)
+

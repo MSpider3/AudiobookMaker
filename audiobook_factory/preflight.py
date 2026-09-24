@@ -171,8 +171,14 @@ def _check_bfloat16_support() -> tuple[bool, str, str]:
         if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
             return True, "CPU: using float32", "float32"
 
+        def _dev_supports_bf16(idx: int) -> bool:
+            if not hasattr(torch.cuda, "is_bf16_supported"):
+                return False
+            with torch.cuda.device(idx):
+                return bool(torch.cuda.is_bf16_supported())
+
         all_support_bf16 = all(
-            hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported(i)
+            _dev_supports_bf16(i)
             for i in range(torch.cuda.device_count())
         )
         if all_support_bf16:

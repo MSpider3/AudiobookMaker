@@ -47,6 +47,18 @@ class Task:
 # Global task memory database & execution queue
 tasks: Dict[str, Task] = {}
 task_queue: asyncio.Queue = asyncio.Queue()
+_MAX_COMPLETED_TASKS: int = 50
+
+
+def evict_old_tasks(max_completed: int = _MAX_COMPLETED_TASKS) -> None:
+    """Remove oldest completed/failed/cancelled tasks over the limit."""
+    terminal = [
+        tid for tid, t in tasks.items()
+        if t.status in ("completed", "failed", "cancelled")
+    ]
+    if len(terminal) > max_completed:
+        for tid in terminal[:-max_completed]:
+            tasks.pop(tid, None)
 
 
 async def monitor_task(task: Task, log_q: queue.Queue, prog_q: queue.Queue, future: asyncio.Future):
@@ -75,7 +87,6 @@ async def monitor_task(task: Task, log_q: queue.Queue, prog_q: queue.Queue, futu
         await asyncio.sleep(0.1)
 
 
-import torch
 from audiobook_factory.gpu_pool import GPUDetector, GPUPoolManager
 
 _current_semaphore: asyncio.Semaphore | None = None
@@ -87,7 +98,11 @@ def _get_active_gpu_count() -> int:
     manager = GPUPoolManager.instance()
     pools = manager.all_pools()
     if not pools:
-        return max(1, torch.cuda.device_count() if torch.cuda.is_available() else 1)
+        try:
+            import torch
+            return max(1, torch.cuda.device_count() if torch.cuda.is_available() else 1)
+        except ImportError:
+            return 1
     return max(1, max(p.device_count for p in pools.values()))
 
 
