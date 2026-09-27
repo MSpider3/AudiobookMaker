@@ -239,9 +239,9 @@ class QwenTTSProvider(BaseTTSProvider):
                     "automatic-speech-recognition",
                     model="openai/whisper-tiny",
                     device=device_idx if (torch.cuda.is_available() and device_idx >= 0) else -1,
-                    torch_dtype=torch.float16 if (torch.cuda.is_available() and device_idx >= 0) else torch.float32,
+                    dtype=torch.float16 if (torch.cuda.is_available() and device_idx >= 0) else torch.float32,
                 )
-            res = self._asr_pipe(ref_path)
+            res = self._asr_pipe(ref_path, chunk_length_s=30, clean_up_tokenization_spaces=False)
             transcript = (res.get("text") or "").strip() if isinstance(res, dict) else ""
             if transcript:
                 self._transcript_cache[ref_path] = transcript
@@ -701,7 +701,7 @@ class QwenTTSProvider(BaseTTSProvider):
             dtype = torch.bfloat16 if supports_bf16 else torch.float16
         return {
             "device_map": self._device,
-            "torch_dtype": dtype,
+            "dtype": dtype,
         }
 
     def _load_model(self) -> None:
@@ -727,6 +727,17 @@ class QwenTTSProvider(BaseTTSProvider):
         sys.stdout = devnull
         sys.stderr = devnull
         try:
+            # Monkeypatch transformers 5.x to support older @check_model_inputs() decorators
+            import transformers.utils.generic
+            _orig_check = transformers.utils.generic.check_model_inputs
+            if not getattr(_orig_check, "_is_patched_for_qwen", False):
+                def _patched_check(*args, **kwargs):
+                    if not args and not kwargs:
+                        return _orig_check
+                    return _orig_check(*args, **kwargs)
+                _patched_check._is_patched_for_qwen = True
+                transformers.utils.generic.check_model_inputs = _patched_check
+
             from qwen_tts import Qwen3TTSModel  # type: ignore
         finally:
             sys.stdout = orig_stdout

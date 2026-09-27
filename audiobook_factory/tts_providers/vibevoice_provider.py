@@ -58,7 +58,7 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
             logger.info("[VibeVoice] Loading VibeVoice-1.5B model on %s...", self._device)
             try:
                 import torch
-                from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+                from transformers import AutoModel, AutoProcessor, AutoTokenizer
                 _BLESSED_VIBEVOICE_MODELS = {"bezzam/VibeVoice-1.5B-hf", "microsoft/VibeVoice-1.5B"}
                 model_name = getattr(self.config, "tts_model_name", "bezzam/VibeVoice-1.5B-hf")
                 if not model_name or model_name.startswith("Qwen/"):
@@ -87,9 +87,9 @@ class VibeVoiceTTSProvider(BaseTTSProvider):
                         logger.warning("[VibeVoice] Tokenizer fallback info: %s", tok_err)
                         self._processor = None
 
-                self._model = AutoModelForCausalLM.from_pretrained(
+                self._model = AutoModel.from_pretrained(
                     model_name,
-                    torch_dtype=dtype,
+                    dtype=dtype,
                     trust_remote_code=True,
                     device_map=self._device if "cuda" in self._device else None,
                 )
