@@ -96,7 +96,7 @@ class TestTTSProviderContract:
     def test_f5tts_missing_dependency_raises_clean_message(self, config):
         p = get_tts_provider("f5tts", config)
         try:
-            import f5_tts  # noqa: F401
+            import f5_tts  # type: ignore # noqa: F401
             pytest.skip("f5-tts is installed in environment")
         except ImportError:
             with pytest.raises(RuntimeError, match="pip install f5-tts"):
@@ -151,6 +151,7 @@ class TestTTSProviderContract:
             assert not os.path.exists(evicted_path), f"Evicted voice ref {evicted_path} should be deleted"
 
     def test_qwen_asr_pipeline_is_cached(self, config, monkeypatch):
+        pytest.importorskip("transformers")
         from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
         p = QwenTTSProvider(config, device="cpu")
 
@@ -160,7 +161,7 @@ class TestTTSProviderContract:
             pipeline_calls.append(kwargs)
             return lambda path: {"text": "Transcribed speech"}
 
-        monkeypatch.setattr("transformers.pipeline", fake_pipeline)
+        monkeypatch.setattr("audiobook_factory.tts_providers.qwen_provider.pipeline", fake_pipeline)
 
         t1 = p._get_voice_transcript("/nonexistent/fake_ref_1.wav")
         assert t1 == "Transcribed speech"

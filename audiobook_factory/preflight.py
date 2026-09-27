@@ -499,12 +499,14 @@ def run_preflight_checks(
                         f"GPU cuda:{i} ({torch.cuda.get_device_name(i)}) has {total_gb} GB VRAM (<= 8.5 GB). "
                         "Consider setting vram_headroom_gb=1.0 or quantization='int8' for optimal stability."
                     )
+                with torch.cuda.device(i):
+                    bf16_ok = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
                 device_info.append({
                     "device": f"cuda:{i}",
                     "name": torch.cuda.get_device_name(i),
                     "free_vram_gb": round(free / 1e9, 2),
                     "total_vram_gb": total_gb,
-                    "bf16_supported": hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported(i),
+                    "bf16_supported": bf16_ok,
                 })
     except Exception as exc:
         warnings.append(f"Device info collection failed: {exc}")

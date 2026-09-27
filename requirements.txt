@@ -64,9 +64,7 @@ fastapi
 uvicorn[standard]
 websockets
 
-# ── Testing ───────────────────────────────────────────────────────────────────
-pytest
-pytest-asyncio>=0.23
+
 
 
 

@@ -25,6 +25,11 @@ _TORCH_COMPILE_MODE: str = "max-autotune"
 import hashlib
 import os
 
+try:
+    from transformers import pipeline
+except ImportError:
+    pipeline = None
+
 _MAX_VOICE_REF_CACHE: int = 8
 _VOICE_REF_CACHE: dict[str, str] = {}
 _VOICE_REF_LOCK = threading.Lock()
@@ -228,8 +233,7 @@ class QwenTTSProvider(BaseTTSProvider):
         # 4. Automatic speech recognition with Whisper
         try:
             import torch
-            from transformers import pipeline
-            if getattr(self, "_asr_pipe", None) is None:
+            if getattr(self, "_asr_pipe", None) is None and pipeline is not None:
                 device_idx = int(self._device.split(":")[1]) if (self._device.startswith("cuda") and ":" in self._device) else (0 if self._device == "cuda" else -1)
                 self._asr_pipe = pipeline(
                     "automatic-speech-recognition",
@@ -670,7 +674,7 @@ class QwenTTSProvider(BaseTTSProvider):
         quant = getattr(config, "quantization", "none")
         if quant == "int8":
             try:
-                import bitsandbytes  # noqa: F401
+                import bitsandbytes  # type: ignore # noqa: F401
                 from transformers import BitsAndBytesConfig
             except ImportError:
                 raise ImportError(
@@ -723,7 +727,7 @@ class QwenTTSProvider(BaseTTSProvider):
         sys.stdout = devnull
         sys.stderr = devnull
         try:
-            from qwen_tts import Qwen3TTSModel
+            from qwen_tts import Qwen3TTSModel  # type: ignore
         finally:
             sys.stdout = orig_stdout
             sys.stderr = orig_stderr
@@ -731,7 +735,7 @@ class QwenTTSProvider(BaseTTSProvider):
         logger.info("    [QwenTTS] Loading model on %s: %s…", self._device, self.config.tts_model_name)
 
         try:
-            import flash_attn  # noqa: F401
+            import flash_attn  # type: ignore # noqa: F401
             attn_impl = "flash_attention_2"
             logger.info("    [QwenTTS] flash_attn detected → using FlashAttention 2.")
         except ImportError:
