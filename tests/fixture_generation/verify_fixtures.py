@@ -14,8 +14,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import soundfile as sf
-from audiobook_factory.text_extractor import extract
+from audiobook_factory.text_extractor import extract, scan
 
 
 def get_fixtures_dir() -> str:
@@ -24,9 +23,15 @@ def get_fixtures_dir() -> str:
 
 
 def verify_documents() -> bool:
+    """Round-trips every source document through scan() and extract().
+
+    Each fixture must yield exactly the chapters listed in
+    ``source_documents/expected_chapters.json``, contain the required phrases
+    and none of the forbidden ones (front/back matter, headers, footnotes).
+    """
     fixtures_dir = get_fixtures_dir()
     src_docs_dir = os.path.join(fixtures_dir, "source_documents")
-    expected_json_path = os.path.join(fixtures_dir, "text", "expected_extraction.json")
+    expected_json_path = os.path.join(src_docs_dir, "expected_chapters.json")
 
     if not os.path.exists(expected_json_path):
         print(f"FAIL: Missing expected JSON: {expected_json_path}")
@@ -36,34 +41,38 @@ def verify_documents() -> bool:
         expected = json.load(f)
 
     all_passed = True
-    formats = ["txt", "docx", "pdf", "epub", "odt"]
-
-    for fmt in formats:
-        doc_path = os.path.join(src_docs_dir, f"dummy_book.{fmt}")
+    for name, entry in expected.items():
+        doc_path = os.path.join(src_docs_dir, name)
         if not os.path.exists(doc_path):
             print(f"FAIL: Fixture missing: {doc_path}")
             all_passed = False
             continue
 
         size = os.path.getsize(doc_path)
-        if size < 50:
-            print(f"FAIL: Fixture file too small ({size} bytes): {doc_path}")
+        print(f"Testing extraction for {name} ({size} bytes)...")
+        try:
+            chapters, _cover = extract(doc_path, log_fn=lambda _msg: None)
+            scanned = [c.title for c in scan(doc_path).chapters]
+        except Exception as e:
+            print(f"FAIL: Extraction threw exception for {name}: {e}")
             all_passed = False
             continue
 
-        print(f"Testing extraction for {fmt.upper()} ({doc_path}, {size} bytes)...")
-        try:
-            chapters, cover = extract(doc_path)
-            if not chapters:
-                print(f"FAIL: Extraction returned 0 chapters for {fmt}")
-                all_passed = False
-            else:
-                print(f"  OK: Extracted {len(chapters)} chapters from {fmt.upper()}")
-                total_text_len = sum(len(ch.text) for ch in chapters)
-                print(f"  OK: Total extracted characters: {total_text_len}")
-        except Exception as e:
-            print(f"FAIL: Extraction threw exception for {fmt}: {e}")
+        titles = [ch.title for ch in chapters]
+        text = " ".join(" ".join(ch.text.split()) for ch in chapters)
+        problems = []
+        if titles != entry["chapters"]:
+            problems.append(f"chapters {titles} != expected {entry['chapters']}")
+        if scanned != titles:
+            problems.append(f"scan() lists {scanned} but extract() returned {titles}")
+        problems += [f"missing phrase {p!r}" for p in entry["must_contain"] if " ".join(p.split()) not in text]
+        problems += [f"narrated matter {p!r}" for p in entry["must_not_contain"] if p in text]
+        if problems:
             all_passed = False
+            for problem in problems:
+                print(f"  FAIL: {problem}")
+        else:
+            print(f"  OK: {len(chapters)} chapters, {len(text)} characters")
 
     return all_passed
 
@@ -80,6 +89,8 @@ def verify_audio() -> bool:
     if not os.path.exists(expected_path):
         print(f"FAIL: Missing audio properties JSON: {expected_path}")
         return False
+
+    import soundfile as sf
 
     with open(expected_path, "r", encoding="utf-8") as f:
         expected = json.load(f)

@@ -11,6 +11,7 @@ pymupdf             # PDF page extraction + TOC (fitz)
 python-docx         # DOCX extraction
 odfpy               # ODT extraction
 docx2txt            # Lightweight DOCX text extraction fallback
+mobi                # MOBI/AZW3 unpacking, pure Python (KindleUnpack fork, GPL-3.0; optional)
 
 # ── OCR ───────────────────────────────────────────────────────────────────────
 easyocr             # Image text extraction inside EPUBs

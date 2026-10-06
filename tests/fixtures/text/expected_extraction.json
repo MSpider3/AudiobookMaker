@@ -1,29 +1,48 @@
 {
   "metadata": {
-    "title": "The Chronicles of Antiquity",
-    "author": "Dr. Arthur Pendelton, Ph.D.",
+    "title": "The Lighthouse at Saltmarsh Point",
+    "author": "Mara Ellison",
     "language": "en",
-    "description": "A synthetic multi-chapter test novel for AudiobookMaker validation."
+    "description": "A synthetic multi-chapter test novel for AudiobookMaker validation.",
+    "identifier": "abm-synthetic-fixture-002"
   },
-  "chapter_count": 3,
+  "chapter_count": 6,
   "chapters": [
     {
       "num": 1,
-      "title": "Chapter 1 - The Crimson Tower",
-      "paragraph_count": 4,
-      "full_text": "Dr. Arthur Pendelton adjusted his gold-rimmed spectacles, gazing up at the ominous silhouette of the Crimson Tower. The clock tower in the town square struck 12:45 PM with a resounding chime.\n\n\"We must proceed with utmost caution,\" whispered Eleanor, checking her brass compass. \"The magnetic anomalies began at exactly 3.14159 MHz, just as Prof. Moriarty predicted in his 1888 journal.\"\n\nThe heavy iron doors groaned on rusty hinges as they stepped across the marble threshold. Dust particles danced in the amber sunbeams filtering through stained-glass arches. On the wall hung a faded tapestry depicting the battle of Saint-Germain in A.D. 1492.\n\n\"Look here, Arthur!\" she exclaimed, pointing to an inscribed inscription: 'Ignorantia juris non excusat\u2014knowledge is the only true shield.' Could this ancient proverb hold the secret to the cipher?"
+      "title": "Prologue",
+      "paragraph_count": 3,
+      "full_text": "The tide went out at dawn, as it had every morning since 1887, and nobody in Saltmarsh thought to watch it go.\n\nBy the time the fishing boats had cleared the harbour wall and the gulls had finished quarrelling over the scraps on the quay, and the baker had set out her first trays, and the schoolmaster had rung his cracked brass bell, and the postman had begun his slow climb up the hill with a sack of letters that were mostly bills, the lamp at the top of the lighthouse was still burning, pale and stubborn against the brightening sky, because the keeper who should have put it out was nowhere to be found.\n\nIt was the first time in thirty-nine years that the light had been left on."
     },
     {
       "num": 2,
-      "title": "Chapter 2 - Whispers in the Archive",
-      "paragraph_count": 4,
-      "full_text": "Inside the subterranean library, towering mahogany shelves held thousands of vellum folios. The air smelled of aged cedar, dried lavender, and old ink.\n\nEleanor retrieved a leather-bound volume stamped with the emblem of the Royal Philosophical Society. She flipped to page 247, scanning the meticulous handwritten notes of Mrs. H. G. Wells.\n\n\"According to section 4(b),\" Arthur murmured, studying the celestial chart, \"the planetary alignment will occur on Nov. 15th, 2026. That gives us less than 72 hours.\"\n\nSuddenly, a sharp noise echoed from the corridor\u2014a rhythmic clacking sound, like boots on flagstone. Step, click, step, click. Someone\u2014or something\u2014was approaching with chilling deliberate speed."
+      "title": "Chapter 1: The Salt Road",
+      "paragraph_count": 8,
+      "full_text": "Dr. Imogen Hale arrived on the 3rd of March, 1926, with two trunks, a bicycle and a letter from Mr. Abel Crane, the harbour master.\n\nThe letter promised a salary of £120 a year, a cottage, and—underlined twice—no visitors after dark.\n\n\"You'll want the Salt Road,\" said the carter. \"It floods at high water, mind.\"\n\n\"Does it flood often?\" she asked.\n\n\"Only twice a day.\"\n\nShe laughed, but he did not, and by the time she understood that he was being perfectly serious the cart had already turned for home.\n\nThe notice on the cottage door read: KEEPER ABSENT ENQUIRE AT THE HARBOUR OFFICE\n\nShe had packed for every emergency she could imagine, e.g., a broken lens, a flooded cellar, a failed generator, etc., and for none of the ones that actually happened. That night she consulted the tide tables twice before breakfast was even a possibility."
     },
     {
       "num": 3,
-      "title": "Chapter 3 - The Obsidian Key",
-      "paragraph_count": 4,
-      "full_text": "Arthur grasped the obsidian key firmly in his right palm. Its surface was cold as glacial ice, vibrating with a subtle, rhythmic frequency of 440 Hz.\n\n\"Insert it into the central cylinder,\" Eleanor urged, holding her lantern high to illuminate the bronze keyhole.\n\nWith a decisive twist, the tumblers aligned with three distinct clicks. A hidden compartment sprang open, revealing a velvet-lined casket containing the golden astrolabe of King Solomon.\n\nThey had solved the riddle of the Crimson Tower. The truth of antiquity was finally theirs to safeguard for generations to come."
+      "title": "Chapter 2: Plan B",
+      "paragraph_count": 10,
+      "full_text": "Plan A had been simple: find the missing keeper, relight the lamp, go home.\n\nPlan B was Imogen's own invention, and it involved a rowing boat, a flask of tea with a slice of lemon for the Vitamin C, and the tide tables.\n\n\"No!\" he cried. \"Not the north channel. Nobody rows the north channel in March.\"\n\n\"Then what do you suggest, Mr. Crane?\"\n\nHe rubbed his jaw. \"I suggest… I suggest we wait for the ebb.\"\n\nThey waited. At 4:15 p.m. the water began to slide away from the causeway, and by five o'clock the Salt Road lay bare and shining, all 2.5 miles of it.\n\nDay, High water, Low water\n\nMonday, 6:10 a.m., 12:25 p.m.\n\nTuesday, 6:55 a.m., 1:05 p.m.\n\nOn the back of the table someone had written, in pencil, do not trust Tuesday."
+    },
+    {
+      "num": 4,
+      "title": "About the Lighthouse",
+      "paragraph_count": 5,
+      "full_text": "About the lighthouse itself there were three stories, and Imogen heard all of them in her first week.\n\nThe first said it was built in 1851 by King William IV's own engineer, which was impossible, since that king had died in 1837.\n\nThe second said the lamp had cost $4,000, shipped in 1,250 pieces from a workshop in Paris, and that the man who assembled it kept a café on the quay until the day he died.\n\nThe third story was the one the children told. It said the keeper could speak to ships in any language, that he had once answered a Russian trawler with a cheerful \"Привет!\" and a steamer bound for 東京 with a bow, and that only a naïve person would ask how.\n\nImogen wrote all three down in her notebook, under the heading Unreliable, and underlined the second."
+    },
+    {
+      "num": 5,
+      "title": "Chapter 10: The Tenth Bell",
+      "paragraph_count": 6,
+      "full_text": "The bell in the lamp room rang ten times at midnight on the 21st, although nobody had wound it since the 2nd.\n\n\"That makes ten,\" said Mr. Crane, who had been counting on his fingers. \"It only ever rings nine.\"\n\n\"What happens on the tenth?\"\n\n\"I don't know. Nobody's ever stayed to find out—\"\n\nThe door at the foot of the stairs opened. Wet footprints crossed the stone floor, one after another, and stopped at the first step. Then a voice Imogen had never heard, but recognised at once from Chapter I of the keeper's own logbook, said, \"You left my light on.\"\n\n\"Somebody had to,\" she said."
+    },
+    {
+      "num": 6,
+      "title": "Epilogue",
+      "paragraph_count": 3,
+      "full_text": "The keeper stayed until spring. He would not say where he had been, only that the journey had cost him exactly 39 years and one good pair of boots.\n\nDr. Hale left Saltmarsh on the 1st of May. She took the bicycle, one trunk, and the tide tables, which she never trusted again.\n\nThe lamp is still lit every evening at dusk. If you take the Salt Road at low water you can see it from the second milestone… and if it is a Tuesday, you should walk a little faster."
     }
   ]
 }

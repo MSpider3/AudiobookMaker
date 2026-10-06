@@ -12,9 +12,13 @@ Imported by audiobook_factory/text_extractor.py as the public API backend.
 
 from __future__ import annotations
 
+import gc
+import html as html_lib
+import inspect
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import statistics
@@ -22,12 +26,14 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from urllib.parse import unquote
 
 import ebooklib
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 from ebooklib import epub
 
 logger = logging.getLogger(__name__)
@@ -51,12 +57,10 @@ from audiobook_factory.text_processing import normalize_text, smart_sentence_spl
 # ── Docling ───────────────────────────────────────────────────────────────────
 try:
     from docling.document_converter import DocumentConverter  # type: ignore
-    from docling.datamodel.base_models import InputFormat  # type: ignore
-    from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions  # type: ignore
     DOCLING_AVAILABLE = True
 except ImportError:
     DOCLING_AVAILABLE = False
-    print("[WARNING] Docling not installed — HTML/PDF extraction will be limited.")
+    logger.info("Docling not installed — using the BeautifulSoup/PyMuPDF extraction paths.")
 
 # ── PyMuPDF (optional, for PDF TOC) ──────────────────────────────────────────
 try:
@@ -71,7 +75,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
 # ══════════════════════════════════════════════════════════════════════════════
-SUPPORTED_EXT    = {".epub", ".mobi", ".pdf", ".docx", ".odt", ".txt"}
+SUPPORTED_EXT    = {".epub", ".mobi", ".azw", ".azw3", ".pdf", ".docx", ".odt", ".txt"}
 MAX_SENTENCE_LEN = 399   # matches config.py
 
 # Chapter keywords for heuristic scoring
@@ -86,21 +90,135 @@ _SKIP_TOC_TITLE = re.compile(
     # Unambiguous front/back matter — a prefix is enough.
     r"(?:table\s*of\s*contents|copyright|title\s*page|postscript|newsletter|"
     r"image\s*gallery|to\s*be\s*continued|back\s*cover|coloph|errata|"
-    r"bibliography|glossary|character\s*gallery|pathways\s*guide|contact\s*us)"
+    r"bibliography|glossary|character\s*gallery|pathways\s*guide|contact\s*us|"
+    r"half[\s-]*title|acknowledge?ments?\b|also\s+(?:by|from|available)\b|"
+    r"(?:other|more)\s+(?:books|titles|works|novels)\b|books\s+by\b|"
+    r"by\s+the\s+same\s+author|(?:advance\s+)?praise\s+for\b|"
+    r"(?:an?\s+)?(?:excerpt|preview|sneak\s+peek)\s+(?:of|from)\b|"
+    r"list\s+of\s+(?:illustrations|figures|tables|maps|plates)|frontispiece|"
+    r"reading\s+group\s+guide|discussion\s+questions|questions\s+for\s+discussion)"
     r"|"
     # Ordinary words that also begin real chapter titles ("About a Boy",
-    # "Maple Street", "End of the Road", "Cover of Darkness"): skip them only
-    # when they are the entire title.
+    # "Maple Street", "End of the Road", "Cover of Darkness", "Notes from
+    # Underground"): skip them only when they are the entire title.
     r"(?:toc|contents|index|(?:front\s*)?cover(?:\s*(?:page|image|art))?|"
     r"about(?:\s+(?:the\s+)?(?:authors?|book|publisher|translator|illustrator|series)"
     r"|\s+this\s+(?:book|edition))?|"
     r"characters?(?:\s+(?:list|profiles?|introduction))?|locations?|maps?|"
     r"pathways?|credits?|"
+    r"dedication|(?:end|foot)?\s*notes|references|works\s+cited|further\s+reading|"
+    r"permissions|legal\s+notice|disclaimer|imprint|preview|sneak\s+peek|"
     r"end\s*of\s*(?:the\s+)?(?:book|volume|vol\.?|part|preview|sample|excerpt)(?:\s+\w+)?)"
     r"\s*[.:!]*\s*$"
     r")",
     re.I,
 )
+
+# Headings that open a narrable unit on their own ("Chapter 7", "Prologue").
+_STRICT_CHAPTER_HEADING = re.compile(
+    r"^\s*(?:(?:chapter|part|book|volume|act)\s+(?:\d+|[ivxlcdm]+|[a-z]+)\b"
+    r"|prologue|epilogue|interlude|introduction|preface|foreword|afterword)",
+    re.I,
+)
+
+# ``epub:type`` values that mark a document as front/back matter.
+_MATTER_EPUB_TYPES: frozenset[str] = frozenset({
+    "cover", "titlepage", "halftitlepage", "copyright-page", "toc", "landmarks",
+    "loi", "lot", "index", "colophon", "imprint", "imprimatur", "dedication",
+    "acknowledgments", "bibliography", "glossary", "contributors",
+    "other-credits", "errata", "seriespage", "footnotes", "endnotes",
+    "rearnotes", "page-list", "ad", "advertisement",
+})
+
+# Phrases that only ever appear on copyright / licence pages.
+_MATTER_MARKERS = re.compile(
+    r"all\s+rights\s+reserved|\bisbn(?:-1[03])?\b[\s:]*[\dxX-]{9,}|"
+    r"(?:copyright|\(c\)|©)\s*(?:©|\(c\))?\s*(?:by\s+)?(?:19|20)\d\d|"
+    r"no\s+part\s+of\s+this\s+(?:book|publication|work)\s+may|library\s+of\s+congress|"
+    r"cataloging[- ]in[- ]publication|project\s+gutenberg(?:\s+e-?book|\s+license|-tm)|"
+    r"this\s+(?:e-?book|edition)\s+is\s+(?:licensed|for\s+the\s+use)",
+    re.I,
+)
+# Weaker hints: ordinary prose can contain one of these, a copyright page has several.
+_MATTER_HINTS = re.compile(
+    r"first\s+(?:published|edition|printing)\b|published\s+by\b|printed\s+in\s+the\b|"
+    r"cover\s+(?:design|art|illustration)\s+by\b|\bimprint\s+of\b|www\.\S+|https?://\S+",
+    re.I,
+)
+_TOC_LINE_TAIL = re.compile(r"(?:[.…\s]{2,}|\s)\d{1,4}\s*$")
+
+_WORD = re.compile(r"\S+")
+
+# Minimum sizes used when a document has to be classified without a TOC.
+_MIN_CHAPTER_CHARS: int = 50
+_MIN_UNLISTED_NARRATIVE_WORDS: int = 150
+
+
+def looks_like_matter(text: str) -> bool:
+    """Tells whether a block of text reads like a copyright page or a contents list.
+
+    Parameters
+    ----------
+    text : str
+        Plain text of a page, file or leading section.
+
+    Returns
+    -------
+    bool
+        True for copyright/licence boilerplate and for table-of-contents
+        listings; False for ordinary prose.
+    """
+    head = text[:1500]
+    if _MATTER_MARKERS.search(head):
+        return True
+    if len({m.group(0).lower()[:8] for m in _MATTER_HINTS.finditer(head)}) >= 2:
+        return True
+    lines = [ln.strip() for ln in head.split("\n") if ln.strip()]
+    if len(lines) >= 4:
+        short = [ln for ln in lines if len(ln) <= 70]
+        listed = [
+            ln for ln in short
+            if _TOC_LINE_TAIL.search(ln) or _CHAPTER_KW.match(ln) or _SKIP_TOC_TITLE.match(ln)
+        ]
+        if len(short) >= 0.8 * len(lines) and len(listed) >= 0.6 * len(lines):
+            return True
+    return False
+
+
+def normalize_href(href: str, base_dir: str = "") -> tuple[str, str]:
+    """Splits an EPUB href into a comparable (path, anchor) pair.
+
+    ebooklib unquotes manifest hrefs but returns NCX/nav hrefs verbatim, so
+    both sides are percent-decoded and path-normalised before comparing.
+
+    Parameters
+    ----------
+    href : str
+        Href as found in a TOC entry or a manifest item.
+    base_dir : str
+        Directory the href is relative to ("" for the OPF directory).
+
+    Returns
+    -------
+    tuple[str, str]
+        Normalised path and decoded fragment ("" when absent).
+    """
+    path, _, anchor = (href or "").partition("#")
+    path = unquote(path).replace("\\", "/")
+    if base_dir and path and not path.startswith("/"):
+        path = posixpath.join(base_dir, path)
+    path = posixpath.normpath(path) if path else ""
+    if path == ".":
+        path = ""
+    return path.lstrip("/"), unquote(anchor)
+
+
+def make_soup(markup: str) -> BeautifulSoup:
+    """Parses HTML with lxml, falling back to the pure-Python parser."""
+    try:
+        return BeautifulSoup(markup, "lxml")
+    except Exception:  # bs4.FeatureNotFound, or an lxml build problem
+        return BeautifulSoup(markup, "html.parser")
 
 # Inline HTML elements: markup inside a sentence, never a paragraph boundary.
 _INLINE_TAGS: tuple[str, ...] = (
@@ -134,6 +252,8 @@ class ChapterItem:
     method:       str            # "docling" | "beautifulsoup" | "plain_text"
     ir_json:      dict           # Docling document dict (for 0_docling_ir.json)
     xgb_score:    float = 0.0
+    probably_matter: bool = False   # front/back matter that was explicitly selected
+    href:         str = ""       # where the chapter starts ("file.xhtml#anchor")
 
 @dataclass
 class SkippedItem:
@@ -147,6 +267,41 @@ class TocEntry:
     title:          str
     href:           str
     classification: str   # "chapter" | "skip"
+    anchor:         str = ""       # fragment of the original href, percent-decoded
+    is_parent:      bool = False   # a TOC section that has child entries
+    depth:          int = 0        # nesting level in the TOC (0 = top)
+
+
+@dataclass
+class HtmlDoc:
+    """One HTML file of a book, in reading order."""
+    name:   str            # normalised path inside the book
+    html:   str            # body markup
+    linear: bool = True    # False for spine items marked linear="no"
+    is_nav: bool = False   # the EPUB3 navigation document
+    item:   Any = None     # ebooklib item, when the book is an EPUB
+    epub_types: frozenset[str] = frozenset()   # epub:type values of <body>
+
+
+@dataclass
+class EpubSection:
+    """A planned chapter (or flagged front/back matter) of an HTML-based book.
+
+    ``scan()`` lists these and ``extract()`` converts them, so both always
+    agree on titles, order and numbering.
+    """
+    title:      str
+    kind:       str                                  # "chapter" | "matter"
+    href:       str = ""
+    parts:      list[tuple[HtmlDoc, str]] = field(default_factory=list)  # (doc, html fragment)
+    word_count: int = 0
+    num:        int = 0
+    reason:     str = ""                             # why it was classified this way
+    position:   int = 0                              # index of the lead document
+
+    @property
+    def probably_matter(self) -> bool:
+        return self.kind != "chapter"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 3  —  MLClassifier
@@ -274,15 +429,16 @@ class MLClassifier:
         Returns (classification, xgb_score).
         classification: "chapter" | "front_matter" | "back_matter" | "toc" | "gallery" | "skipped"
         """
-        # Normalise href basename for matching
-        name_base = item_name.split("#")[0].split("/")[-1]
+        # Exact, percent-decoded path equality: a substring test matched
+        # "1.xhtml" against the TOC href "11.xhtml".
+        name_path = normalize_href(item_name)[0]
 
         # Priority 1 — TOC says chapter
-        if any(name_base in h for h in chapter_hrefs):
+        if name_path and any(name_path == normalize_href(h)[0] for h in chapter_hrefs):
             return ("chapter", 1.0)
 
         # Priority 2 — TOC says skip
-        if any(name_base in h for h in skip_hrefs):
+        if name_path and any(name_path == normalize_href(h)[0] for h in skip_hrefs):
             label = "toc" if "toc" in item_title.lower() or "table" in item_title.lower() \
                 else "gallery" if "gallery" in item_title.lower() or "image" in item_title.lower() \
                 else "back_matter"
@@ -363,9 +519,11 @@ class TextNormalizer:
 
     # Patterns for PDF header/footer noise
     # Garbled OCR from images: no-spaces blobs that look like merged words.
-    # Heuristic: >=18 chars, no spaces, starts uppercase, contains multiple
-    # lowercase sequences (rules out legitimate acronyms like "UNESCO").
-    _GARBLED    = re.compile(r"[A-Z][a-zA-Z]{11,}")
+    # Heuristic: >=18 chars, no spaces, and at least three capitalised words
+    # run together ("ThisIsGarbledOcrSoup"). An ordinary long word such as
+    # "Introduction" or "Acknowledgments" is NOT garbled.
+    _GARBLED    = re.compile(r"[A-Z][a-z]+(?:[A-Z][a-z]+){2,}")
+    _GARBLED_MIN_LEN: int = 18
     # Running page-header lines: short (≤60 chars) with no sentence-ending punctuation
     _PAGE_NUM   = re.compile(r"^\s*\d{1,4}\s*$", re.MULTILINE)
     # Docling image placeholder lines
@@ -373,14 +531,35 @@ class TextNormalizer:
 
     # ── Individual normalisation steps ───────────────────────────────────────
 
+    _MD_HEADING_PREFIX = re.compile(r"^#+\s*")
+    # Sentence-final punctuation, optionally inside closing quotes/brackets.
+    _SENTENCE_END = re.compile(r"[.!?:,;…][\"'”’)\]*_]*$")
+    _DIALOGUE_START = re.compile(r"^[\"'“‘—–\-«]")
+    _STRUCTURAL_LINE = re.compile(r"^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|\||>)")
+
+    def _is_running_header_candidate(self, stripped: str) -> bool:
+        """A short bare line that could be a running header or footer.
+
+        Dialogue (``"What?"``), anything that ends a sentence and markdown
+        structure (headings, list items, table rows) never qualifies.
+        """
+        if not 3 <= len(stripped) <= 60:
+            return False
+        if self._SENTENCE_END.search(stripped) or self._DIALOGUE_START.match(stripped):
+            return False
+        return not self._STRUCTURAL_LINE.match(stripped)
+
     def _strip_pdf_noise(self, text: str) -> str:
         """
         Removes PDF-specific extraction artefacts:
         1. Standalone page numbers.
         2. Docling <!-- image --> placeholder lines.
         3. Garbled OCR from image blocks (CamelCase word-soup with no spaces).
-        4. Repeating short lines (running headers/footers): if an identical
-           line of ≤60 chars appears 3+ times it is almost certainly a header.
+        4. Repeating short lines (running headers/footers): an identical bare
+           line of ≤60 chars that appears 3+ times is almost certainly a
+           header. The first occurrence is kept, because a one-word chapter
+           heading ("Introduction") is usually also the running header of the
+           pages that follow it; repeated dialogue is never touched.
         """
         # 1. Page numbers on their own line
         text = self._PAGE_NUM.sub("", text)
@@ -388,39 +567,103 @@ class TextNormalizer:
         text = self._IMG_BLOCK.sub("", text)
         # 3. Garbled OCR blobs — remove lines whose text content (after stripping
         #    any markdown heading markers like ## or ###) is ONLY a CamelCase blob
-        _MD_HEADING = re.compile(r"^#+\s*")
         lines = text.split("\n")
         cleaned = []
         for line in lines:
             stripped = line.strip()
             # Remove heading markers to get the bare text
-            bare = _MD_HEADING.sub("", stripped).strip()
+            bare = self._MD_HEADING_PREFIX.sub("", stripped).strip()
             # A "garbled" line: bare text has no internal spaces AND matches CamelCase blob
-            if bare and " " not in bare and self._GARBLED.fullmatch(bare):
+            if len(bare) >= self._GARBLED_MIN_LEN and " " not in bare and self._GARBLED.fullmatch(bare):
                 continue
             cleaned.append(line)
-        text = "\n".join(cleaned)
         # 4. Detect and remove repeating short header/footer lines
-        from collections import Counter
         line_counts = Counter(
-            l.strip() for l in text.split("\n")
-            if 3 <= len(l.strip()) <= 60 and not l.strip().endswith((".", "!", "?", ":", ","))
+            stripped for stripped in (ln.strip() for ln in cleaned)
+            if self._is_running_header_candidate(stripped)
         )
         repeating = {ln for ln, cnt in line_counts.items() if cnt >= 3}
         if repeating:
-            text = "\n".join(
-                l for l in text.split("\n")
-                if l.strip() not in repeating
-            )
-        return text
+            seen: set[str] = set()
+            kept = []
+            for line in cleaned:
+                stripped = line.strip()
+                if stripped in repeating:
+                    if stripped in seen:
+                        continue
+                    seen.add(stripped)
+                kept.append(line)
+            cleaned = kept
+        return "\n".join(cleaned)
+
+    # ── Markdown structure (Docling output only) ─────────────────────────────
+
+    _MD_TABLE_RULE = re.compile(r"^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(?:\|[ \t]*:?-{2,}:?[ \t]*)+\|?[ \t]*$")
+    _MD_TABLE_ROW  = re.compile(r"^[ \t]*\|(.*)\|[ \t]*$")
+    _MD_CELL_SPLIT = re.compile(r"(?<!\\)\|")
+    _MD_BULLET     = re.compile(r"^([ \t]*)(?:[-*+•◦▪])[ \t]+(?=\S)")
+    _MD_QUOTE      = re.compile(r"^[ \t]*(?:>[ \t]?)+")
+    _MD_FENCE      = re.compile(r"^[ \t]*(?:```|~~~)")
+    _MD_LINK       = re.compile(r"(?<!!)\[([^\]\n]+)\]\((?:[^()\n]|\([^()\n]*\))*\)")
+    _MD_ESCAPE     = re.compile(r"\\([\\`*{}\[\]()#+\-.!>|~])")
+
+    @staticmethod
+    def _close_item(text: str) -> str:
+        """Ends a list item or table row like a sentence ("Tea, 3 shillings.")."""
+        text = text.rstrip()
+        return text + "." if text[-1:].isalnum() else text
+
+    def strip_markdown_structure(self, text: str) -> str:
+        """Flattens Markdown structure that a TTS voice would read aloud.
+
+        List bullets, block-quote markers, code fences and table pipes are
+        removed (a table row becomes its cells joined by commas) and
+        ``[text](url)`` links are reduced to their text. List items and table
+        rows become paragraphs of their own, closed with a full stop when they
+        have no end punctuation, so they are not run together when spoken.
+        This is a Python pre-pass for Docling output and Markdown-flavoured
+        text files, applied *before* :meth:`normalize`, so the Rust and Python
+        normalisers still receive identical input.
+
+        Parameters
+        ----------
+        text : str
+            Markdown as exported by Docling.
+
+        Returns
+        -------
+        str
+            The same text without list, table, quote and link syntax.
+        """
+        text = self._IMG_TAG.sub("", text)
+        text = self._FOOTNOTE_LINK.sub("", text)
+        out: list[str] = []
+        for line in text.split("\n"):
+            if self._MD_FENCE.match(line) or self._MD_TABLE_RULE.match(line):
+                continue
+            row = self._MD_TABLE_ROW.match(line)
+            if row:
+                cells = [c.strip() for c in self._MD_CELL_SPLIT.split(row.group(1))]
+                out += [self._close_item(", ".join(c for c in cells if c)), ""]
+                continue
+            if not self._HR.match(line):
+                line = self._MD_QUOTE.sub("", line)
+                if self._MD_BULLET.match(line):
+                    out += [self._close_item(self._MD_BULLET.sub(r"\1", line)), ""]
+                    continue
+            out.append(line)
+        text = "\n".join(out)
+        text = self._MD_LINK.sub(r"\1", text)
+        return self._MD_ESCAPE.sub(r"\1", text)
 
     # Patterns for Markdown noise
     _FOOTNOTE_LINK = re.compile(r"\[\[\d+\]\]\([^)]+\)|\[\d+\]\([^)]+\)")
+    _OCR_PREFIX    = re.compile(r"OCR_IMG_TEXT:\s*")
 
     def _strip_noise(self, text: str) -> str:
         # Remove the OCR_IMG_TEXT: prefix we maliciously injected in _preprocess_html
         # MUST happen before _BOLD_EM to prevent _IMG_ from being stripped as an italic tag!
-        text = re.sub(r"OCR_IMG_TEXT:\s*", "", text)
+        text = self._OCR_PREFIX.sub("", text)
 
         text = self._IMG_TAG.sub("", text)              # strip ![...](...)
         text = self._HTML_CMT.sub("", text)             # strip <!-- image --> etc.
@@ -514,8 +757,11 @@ class TextNormalizer:
         skipped = False
         for i, line in enumerate(lines):
             # Strip markdown heading markers for comparison
-            bare = re.sub(r"^#+\s*", "", line).strip().lower()
-            if i < 4 and bare == stripped_title and cleaned and not skipped:
+            if i >= 4:
+                cleaned.extend(lines[i:])
+                break
+            bare = self._MD_HEADING_PREFIX.sub("", line).strip().lower()
+            if bare == stripped_title and cleaned and not skipped:
                 skipped = True
                 continue  # skip duplicate title line
             cleaned.append(line)
@@ -532,6 +778,10 @@ class TextNormalizer:
                 and repair kerning-split words anywhere in a line.
         fix_kerning: repair kerning-split words without the PDF noise stripping
                 (for PDF text that did not come through Docling).
+
+        Both PDF steps run here in Python, before the shared pipeline, so the
+        Rust and Python back ends see the same already-repaired text and
+        return identical output.
         """
         text = raw_md
 
@@ -542,28 +792,28 @@ class TextNormalizer:
                 if repaired != ocr_txt:
                     text = text.replace(ocr_txt, repaired, 1)
 
-        if fix_kerning and not is_pdf:
-            # Done here rather than in the shared pipeline so the Rust and
-            # Python back ends both see already-repaired text.
+        # 2. PDF-specific noise (headers, footers, garbled OCR images). The
+        #    Rust clean_text() has its own copy of this step that deletes any
+        #    short line repeated 3+ times (dialogue, one-word headings), so it
+        #    is always done here and Rust is called with is_pdf=False.
+        if is_pdf:
+            text = self._strip_pdf_noise(text)
+        if is_pdf or fix_kerning:
             text = self._fix_isolated_capitals(text, aggressive=True)
 
         # Try Rust compiled clean pipeline first for speed
         try:
             import audiobook_rust
             if hasattr(audiobook_rust, "clean_text"):
-                return audiobook_rust.clean_text(text, title, is_pdf)
+                return audiobook_rust.clean_text(text, title, False)
         except ImportError:
             pass
-
-        # 2. PDF-specific noise (headers, footers, garbled OCR images)
-        if is_pdf:
-            text = self._strip_pdf_noise(text)
 
         # 3. Remove duplicate title heading
         text = self._remove_duplicate_title(title, text)
 
         # 4. Fix broken lines before noise strip to avoid stripping mid-word
-        text = self._fix_broken_lines(text, is_pdf=is_pdf)
+        text = self._fix_broken_lines(text, is_pdf=False)
 
         # 5. Markdown noise strip
         text = self._strip_noise(text)
@@ -577,6 +827,128 @@ class TextNormalizer:
         return smart_sentence_splitter(text, MAX_SENTENCE_LEN)
 
 
+# ── HTML fragment inspection (shared by scan and extract) ────────────────────
+
+_TAG_WITH_ID   = re.compile(r"<[a-zA-Z][^<>]*>")
+_ID_ATTR       = re.compile(r"\s(?:xml:id|id|name)\s*=\s*([\"'])(.*?)\1", re.S)
+_EPUB_TYPE     = re.compile(r"epub:type\s*=\s*[\"']([^\"']+)[\"']")
+_BODY_TAG      = re.compile(r"<body\b[^>]*>", re.I)
+_BODY_CONTENT  = re.compile(r"<body\b[^>]*>(.*)</body\s*>", re.I | re.S)
+_ANY_TAG       = re.compile(r"<[^>]+>")
+_HEADING_TAG   = re.compile(r"<h([1-3])\b[^>]*>(.*?)</h\1\s*>", re.I | re.S)
+_SYNTH_ANCHOR: str = "abm-split-{}"
+_HAS_ALNUM     = re.compile(r"[^\W_]")
+# Opening tags that may wrap an anchor: the split point moves in front of them
+# so a heading keeps its own <h2>/<div> instead of leaving it behind.
+_OPENERS_BEFORE = re.compile(
+    r"(?:<(?:div|section|article|header|hgroup|h[1-6]|p|span|a|b|i|em|strong|center|blockquote|font)\b[^<>]*>\s*)+$",
+    re.I,
+)
+_NOTE_MARKER   = re.compile(r"^[\[(]?(?:\d{1,3}|[*†‡§]+|[a-z])[\])]?$")
+_NOTE_SYMBOLS: tuple[str, ...] = ("[", "(", "*", "†", "‡", "§")
+_NOTE_TYPES: frozenset[str] = frozenset({"footnote", "endnote", "rearnote", "footnotes", "endnotes", "rearnotes"})
+_BLOCK_TAGS: tuple[str, ...] = (
+    "p", "div", "table", "ul", "ol", "dl", "blockquote", "pre", "section",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+)
+_OCR_TOKEN_FMT: str = "OCRIMGTOKEN{:05d}X"
+_OCR_GPU_ENV: str = "AUDIOBOOK_OCR_GPU"
+_OCR_MIN_IMAGE_SIDE: int = 48
+
+
+@dataclass
+class _FragmentInfo:
+    text:         str
+    words:        int
+    heading:      str               # first h1–h3 when it opens the fragment
+    first_line:   str
+    epub_types:   frozenset[str]
+    link_ratio:   float
+    has_images:   bool
+
+
+def _collapse(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def fragment_info(markup: str) -> _FragmentInfo:
+    """Parses an HTML fragment once and returns what classification needs."""
+    epub_types = frozenset(
+        t for m in _EPUB_TYPE.finditer(markup[:4000]) for t in m.group(1).lower().split()
+    )
+    pieces: list[str] = []
+    heading = ""
+    first_line = ""
+    link_chars = 0
+    has_images = False
+    try:
+        from lxml import html as lxml_html
+        root = lxml_html.fragment_fromstring(markup, create_parent="div")
+        for junk in root.xpath(".//script|.//style|.//head|.//title"):
+            junk.drop_tree()
+        pieces = [t.strip() for t in root.itertext() if t and t.strip()]
+        headings = root.xpath(".//h1|.//h2|.//h3")
+        if headings:
+            heading = _collapse(headings[0].text_content())
+        link_chars = sum(len(_collapse(a.text_content())) for a in root.xpath(".//a[@href]"))
+        has_images = bool(root.xpath(".//img|.//image|.//svg"))
+        for block in root.iter("p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td"):
+            first_line = _collapse(block.text_content())
+            if first_line:
+                break
+    except Exception:
+        pieces = [p.strip() for p in _ANY_TAG.sub("\n", markup).split("\n") if p.strip()]
+        pieces = [html_lib.unescape(p) for p in pieces]
+    if not first_line and pieces:
+        first_line = pieces[0]
+    text = "\n".join(pieces)
+    words = len(_WORD.findall(text))
+    if heading:
+        # Only a heading that opens the fragment titles it.
+        probe = heading.split(" ")[0]
+        before = text.split(probe, 1)[0] if probe and probe in text else text
+        if len(before.split()) > 12:
+            heading = ""
+    if len(first_line) > 80 or first_line[-1:] in ".,;:!?":
+        first_line = ""
+    return _FragmentInfo(
+        text=text, words=words, heading=heading, first_line=_collapse(first_line),
+        epub_types=epub_types, link_ratio=link_chars / max(1, len(text)),
+        has_images=has_images,
+    )
+
+
+def select_sections(sections: Iterable[Any], selections: list[int] | list[str] | None) -> list[Any]:
+    """Applies a chapter selection to planned sections.
+
+    Parameters
+    ----------
+    sections : Iterable
+        Objects with ``title``, ``num`` and ``probably_matter`` attributes.
+    selections : list[int] | list[str] | None
+        ``None``/empty selects every chapter that is not flagged as
+        front/back matter. A list of titles (as shown by ``scan()``) or of
+        chapter numbers selects exactly those entries — including flagged
+        ones, which are only ever extracted when asked for by name or number.
+
+    Returns
+    -------
+    list
+        The selected sections, in reading order.
+    """
+    sections = list(sections)
+    if not selections:
+        return [s for s in sections if not s.probably_matter]
+    if isinstance(selections, (str, int)):
+        selections = [selections]  # type: ignore[list-item]
+    wanted_titles = {_collapse(s).casefold() for s in selections if isinstance(s, str)}
+    wanted_nums = {s for s in selections if isinstance(s, int) and not isinstance(s, bool)}
+    return [
+        s for s in sections
+        if s.num in wanted_nums or _collapse(s.title).casefold() in wanted_titles
+    ]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 1 & 2  —  DocumentIngestor
 # ══════════════════════════════════════════════════════════════════════════════
@@ -587,58 +959,72 @@ class DocumentIngestor:
     Phase 2: Docling ingestion with explicit format routing + OCR.
     """
 
+    # EasyOCR reader shared by one extraction run and released afterwards, so
+    # it never sits in memory (or VRAM) next to the TTS model.
+    _easyocr_reader: Any = None
+    _easyocr_langs: tuple[str, ...] = ()
+    _easyocr_failed: set[tuple[str, ...]] = set()
+
     def __init__(self):
-        if DOCLING_AVAILABLE:
-            self._converter = DocumentConverter()
-            # Separate PDF converter with forced OCR
-            pdf_opts = PdfPipelineOptions()
-            pdf_opts.do_ocr = True          # Enable OCR for embedded images
-            pdf_opts.do_table_structure = False
-            pdf_opts.ocr_options = RapidOcrOptions()
-            self._pdf_converter = DocumentConverter(
-                format_options={
-                    InputFormat.PDF: type("FormatOption", (), {
-                        "pipeline_options": pdf_opts
-                    })()
-                }
-            )
-        else:
-            self._converter = None
-            self._pdf_converter = None
+        # Docling loads layout models when a converter is built, so that only
+        # happens the first time a document is actually converted.
+        self._docling_converter = None
+        self._pdf_converter = None   # kept for backward compatibility; never used
+
+    @property
+    def _converter(self):
+        if not DOCLING_AVAILABLE:
+            return None
+        if getattr(self, "_docling_converter", None) is None:
+            self._docling_converter = DocumentConverter()
+        return self._docling_converter
+
+    @_converter.setter
+    def _converter(self, value) -> None:
+        self._docling_converter = value
 
     # ── Phase 1a: TOC extraction ──────────────────────────────────────────────
 
-    def _walk_epub_toc(self, toc_items) -> tuple[set[str], set[str], list[TocEntry]]:
-        """Recursively walk epub TOC; returns (chapter_hrefs, skip_hrefs, entries)."""
+    def _walk_epub_toc(
+        self, toc_items, base_dir: str = "", depth: int = 0,
+    ) -> tuple[set[str], set[str], list[TocEntry]]:
+        """Recursively walk epub TOC; returns (chapter_hrefs, skip_hrefs, entries).
+
+        Hrefs are percent-decoded, normalised paths (see :func:`normalize_href`);
+        the fragment of each entry is kept in ``TocEntry.anchor``.
+        """
         chapter_hrefs: set[str] = set()
         skip_hrefs:    set[str] = set()
         entries:       list[TocEntry] = []
 
+        if toc_items is None:
+            return chapter_hrefs, skip_hrefs, entries
+        if not isinstance(toc_items, (list, tuple)):
+            # ebooklib returns a bare Link for an NCX whose navMap is empty.
+            toc_items = [toc_items]
+
+        def _add(title: str, raw_href: str, is_parent: bool) -> None:
+            path, anchor = normalize_href(raw_href, base_dir)
+            if not path:
+                return
+            title = _collapse(title)
+            cls = "skip" if _SKIP_TOC_TITLE.match(title) else "chapter"
+            (skip_hrefs if cls == "skip" else chapter_hrefs).add(path)
+            entries.append(TocEntry(title, path, cls, anchor=anchor, is_parent=is_parent, depth=depth))
+
         for item in toc_items:
-            if isinstance(item, epub.Link):
-                href  = item.href.split("#")[0]   # strip anchor
-                title = item.title or ""
-                if _SKIP_TOC_TITLE.match(title.strip()):
-                    skip_hrefs.add(href)
-                    entries.append(TocEntry(title, href, "skip"))
-                else:
-                    chapter_hrefs.add(href)
-                    entries.append(TocEntry(title, href, "chapter"))
-            elif isinstance(item, tuple) and len(item) == 2:
+            if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], (list, tuple)):
                 section, children = item
-                # Recurse into section
-                ch, sk, en = self._walk_epub_toc(children)
-                section_title = getattr(section, "title", "") or ""
-                section_href  = getattr(section, "href", "").split("#")[0]
-                section_cls   = "skip" if _SKIP_TOC_TITLE.match(section_title.strip()) else "chapter"
-                if section_cls == "skip":
-                    sk.add(section_href)
-                else:
-                    ch.add(section_href)
-                entries.append(TocEntry(section_title, section_href, section_cls))
+                _add(getattr(section, "title", "") or "", getattr(section, "href", "") or "", True)
+                ch, sk, en = self._walk_epub_toc(children, base_dir, depth + 1)
                 entries.extend(en)
                 chapter_hrefs |= ch
                 skip_hrefs    |= sk
+                continue
+            href = getattr(item, "href", None)
+            if href is None and hasattr(item, "get_name"):
+                href = item.get_name()     # an EpubHtml placed directly in the TOC
+            _add(getattr(item, "title", "") or "", href or "", False)
 
         return chapter_hrefs, skip_hrefs, entries
 
@@ -648,6 +1034,7 @@ class DocumentIngestor:
         entries: list[TocEntry] = []
         if not PYMUPDF_AVAILABLE:
             return chapter_pages, entries
+        doc = None
         try:
             doc = fitz.open(pdf_path)
             for level, title, page in doc.get_toc():
@@ -655,23 +1042,100 @@ class DocumentIngestor:
                 if cls == "chapter":
                     chapter_pages.add(page)
                 entries.append(TocEntry(title or "", str(page), cls))
-            doc.close()
         except Exception as e:
             print(f"    [PDF TOC] extraction failed: {e}")
+        finally:
+            if doc is not None:
+                doc.close()
         return chapter_pages, entries
 
-    # ── Phase 1b: HTML drop-cap pre-processing ────────────────────────────────
+    # ── OCR reader lifecycle ──────────────────────────────────────────────────
 
     @staticmethod
-    def _preprocess_html(html_content: str, epub_book=None, epub_item_name: str = "") -> tuple[str, list[str]]:
+    def ocr_languages(language: str | None) -> list[str]:
+        """Maps a book language tag ("fr", "zh-TW", "en-GB") to EasyOCR codes."""
+        code = (language or "en").strip().lower().replace("_", "-")
+        if code.startswith(("zh-tw", "zh-hk", "zh-mo", "zh-hant")):
+            return ["ch_tra", "en"]
+        primary = code.split("-")[0] or "en"
+        mapped = {"zh": "ch_sim", "nb": "no", "nn": "no", "iw": "he", "in": "id"}.get(primary, primary)
+        return ["en"] if mapped == "en" else [mapped, "en"]
+
+    @classmethod
+    def get_ocr_reader(cls, language: str | None = None):
+        """Returns a (cached) EasyOCR reader for the book language, or None.
+
+        The reader runs on the CPU unless the ``AUDIOBOOK_OCR_GPU`` environment
+        variable is set to a true value, so it does not compete with the TTS
+        model for VRAM. Call :meth:`release_ocr_reader` when extraction ends.
         """
-        Cleans EPUB HTML before Docling sees it:
+        try:
+            import easyocr  # type: ignore
+        except ImportError:
+            return None
+        langs = tuple(cls.ocr_languages(language))
+        if cls._easyocr_reader is not None and cls._easyocr_langs == langs:
+            return cls._easyocr_reader
+        if cls._easyocr_reader is not None:
+            cls.release_ocr_reader(keep_failures=True)
+        use_gpu = os.environ.get(_OCR_GPU_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+        for attempt in dict.fromkeys((langs, ("en",))):
+            if attempt in cls._easyocr_failed:
+                continue
+            try:
+                cls._easyocr_reader = easyocr.Reader(list(attempt), gpu=use_gpu)
+                cls._easyocr_langs = langs
+                return cls._easyocr_reader
+            except Exception as reader_err:
+                # Unsupported language, no network for the model download,
+                # CUDA OOM, … — image text is optional, the chapter text is not.
+                cls._easyocr_failed.add(attempt)
+                logger.warning("EasyOCR unavailable for %s (%s).", list(attempt), reader_err)
+        return None
+
+    @classmethod
+    def release_ocr_reader(cls, keep_failures: bool = False) -> None:
+        """Drops the cached EasyOCR reader and frees the memory it held."""
+        reader = cls._easyocr_reader
+        cls._easyocr_reader = None
+        cls._easyocr_langs = ()
+        if not keep_failures:
+            cls._easyocr_failed = set()
+        if reader is None:
+            return
+        del reader
+        gc.collect()
+        torch = sys.modules.get("torch")
+        try:
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            logger.debug("Could not empty the CUDA cache after OCR: %s", exc)
+
+    # ── Phase 1b: HTML pre-processing ─────────────────────────────────────────
+
+    @classmethod
+    def _preprocess_soup(
+        cls,
+        html_content: str,
+        epub_book=None,
+        epub_item_name: str = "",
+        language: str | None = None,
+    ) -> tuple[BeautifulSoup, dict[str, str]]:
+        """Parses and cleans one HTML file; returns (soup, ocr_tokens).
+
         1. Unwraps drop-cap <span>s.
-        2. Runs OCR on embedded images and extracts the text to bypass Docling stripping.
-        Returns: (processed_html_string, list_of_extracted_ocr_texts)
+        2. Clamps table spans (Docling OOM guard).
+        3. Removes scripts, styles, footnote markers and footnote bodies.
+        4. OCRs embedded images (only when ``epub_book`` is given). Each image
+           with text is replaced, *in place*, by a placeholder token; the
+           returned dict maps token -> ``"OCR_IMG_TEXT: <text>"``.
         """
-        soup = BeautifulSoup(html_content, "html.parser")
-        extracted_images = []
+        soup = make_soup(html_content)
+        tokens: dict[str, str] = {}
+
+        for junk in soup.find_all(["script", "style", "template", "noscript"]):
+            junk.decompose()
 
         for span in soup.find_all("span"):
             classes = " ".join(span.get("class", []))
@@ -711,104 +1175,153 @@ class DocumentIngestor:
                     except (ValueError, TypeError):
                         pass
 
+        # ── Footnotes: a marker read aloud is a stray number mid-sentence ──
+        doomed = [
+            note for note in soup.find_all(attrs={"epub:type": True})
+            if set(str(note.get("epub:type")).lower().split()) & _NOTE_TYPES
+        ]
+        for ref in soup.find_all("a"):
+            kind = str(ref.get("epub:type") or "").lower()
+            label = ref.get_text(strip=True)
+            in_sup = ref.parent is not None and ref.parent.name == "sup"
+            if "noteref" in kind or (
+                _NOTE_MARKER.match(label) and (in_sup or ref.find("sup") is not None)
+            ):
+                doomed.append(ref.parent if in_sup and ref.parent.get_text(strip=True) == label else ref)
+        for sup in soup.find_all("sup"):
+            label = sup.get_text(strip=True)
+            if label[:1] in _NOTE_SYMBOLS and _NOTE_MARKER.match(label):
+                doomed.append(sup)
+        for tag in doomed:
+            if not getattr(tag, "decomposed", False):
+                tag.decompose()
+
         # ── In-flight EPUB Image OCR ──
         if epub_book is not None:
-            try:
-                import easyocr  # type: ignore
-                # We initialize lazily so we don't block startup or throw errors if missing
-                if not hasattr(DocumentIngestor, "_easyocr_reader"):
-                    try:
-                        DocumentIngestor._easyocr_reader = easyocr.Reader(["en"], gpu=True)
-                    except Exception as reader_err:
-                        # No network for the model download, CUDA OOM, … — image
-                        # text is optional, the chapter text is not.
-                        logger.warning("EasyOCR unavailable (%s); skipping image OCR.", reader_err)
-                        DocumentIngestor._easyocr_reader = None
-                if DocumentIngestor._easyocr_reader is None:
-                    return str(soup), extracted_images
-
-                for img in soup.find_all(["img", "image"]):
-                    src = img.get("src") or img.get("xlink:href")
-                    if not src: continue
-                    
-                    # Resolve relative path inside the EPUB archive
-                    base = epub_item_name.rsplit('/', 1)[0] if '/' in epub_item_name else ''
-                    full_src = f'{base}/{src}'.strip('/') if base else src
-                    
+            images = soup.find_all(["img", "image"])
+            reader = cls.get_ocr_reader(language) if images else None
+            if reader is not None:
+                base = posixpath.dirname(epub_item_name)
+                for img in images:
+                    src = img.get("src") or img.get("xlink:href") or img.get("href")
+                    if not src or src.startswith("data:"):
+                        continue
+                    full_src = normalize_href(src, base)[0]
                     img_item = epub_book.get_item_with_href(full_src) or epub_book.get_item_with_href(src)
-                    if img_item:
-                        try:
-                            import io
-                            from PIL import Image
-                            import numpy as np
+                    if not img_item:
+                        continue
+                    try:
+                        import io
+                        from PIL import Image
+                        import numpy as np
 
-                            raw_data = img_item.get_content()
-                            img_stream = io.BytesIO(raw_data)
-                            img_obj = Image.open(img_stream)
-                            
-                            # Convert to RGB if it's not (e.g. RGBA or Grayscale) to prevent easyocr/cv2 errors
-                            if img_obj.mode != "RGB":
-                                img_obj = img_obj.convert("RGB")
-                                
-                            img_np = np.array(img_obj)
+                        img_obj = Image.open(io.BytesIO(img_item.get_content()))
+                        if min(img_obj.size) < _OCR_MIN_IMAGE_SIDE:
+                            continue   # ornaments and scene-break glyphs
+                        # Convert to RGB if it's not (e.g. RGBA or Grayscale) to prevent easyocr/cv2 errors
+                        if img_obj.mode != "RGB":
+                            img_obj = img_obj.convert("RGB")
+                        res = reader.readtext(np.array(img_obj))
+                        extracted_text = " ".join(line[1] for line in res).strip() if res else ""
+                        if extracted_text:
+                            # The token survives Docling untouched (plain letters and
+                            # digits) and is swapped for the text afterwards, so image
+                            # text stays where the image was instead of at the chapter end.
+                            token = _OCR_TOKEN_FMT.format(len(tokens))
+                            tokens[token] = f"OCR_IMG_TEXT: {extracted_text}"
+                            holder = img.parent if img.parent is not None and img.parent.name == "svg" else img
+                            holder.replace_with(NavigableString(f" {token} "))
+                    except Exception as e:
+                        logger.warning("OCR failed on image %s: %s", src, e)
 
-                            res = DocumentIngestor._easyocr_reader.readtext(img_np)
-                            if res:
-                                extracted_text = " ".join([line[1] for line in res]).strip()
-                                if extracted_text:
-                                    # Collect to append directly to the Markdown later, completely bypassing Docling parser
-                                    extracted_images.append(f"OCR_IMG_TEXT: {extracted_text}")
-                        except Exception as e:
-                            print(f"      [OCR] Failed on image {src}: {e}")
-            except ImportError:
-                pass  # easyocr not installed
+        return soup, tokens
 
-        return str(soup), extracted_images
+    @staticmethod
+    def _preprocess_html(html_content: str, epub_book=None, epub_item_name: str = "") -> tuple[str, list[str]]:
+        """
+        Cleans EPUB HTML before Docling sees it:
+        1. Unwraps drop-cap <span>s.
+        2. Runs OCR on embedded images; the recognised text replaces each image in place.
+        Returns: (processed_html_string, list_of_extracted_ocr_texts)
+        """
+        soup, tokens = DocumentIngestor._preprocess_soup(html_content, epub_book, epub_item_name)
+        processed = str(soup)
+        for token, ocr_text in tokens.items():
+            processed = processed.replace(token, html_lib.escape(ocr_text, quote=False))
+        return processed, list(tokens.values())
+
+    @staticmethod
+    def _place_ocr_text(text: str, tokens: dict[str, str]) -> str:
+        """Swaps OCR placeholder tokens for their text; leftovers go to the end."""
+        leftovers = []
+        for token, ocr_text in tokens.items():
+            if token in text:
+                text = text.replace(token, f"\n\n{ocr_text}\n\n")
+            else:
+                leftovers.append(ocr_text)
+        if leftovers:
+            text += "\n\n" + "\n\n".join(leftovers) + "\n\n"
+        return text
 
     # ── Phase 2: Docling ingestion ────────────────────────────────────────────
 
-    def _docling_html(self, html_content: str, epub_book=None, epub_item_name: str = "") -> tuple[str, dict, list[str]]:
-        """
-        Run Docling on preprocessed HTML.
-        Returns (raw_markdown, ir_dict, ocr_block_texts).
-        """
-        processed, extracted_images = self._preprocess_html(html_content, epub_book, epub_item_name)
+    @staticmethod
+    def _export_markdown(doc) -> str:
+        """Exports a Docling document without HTML escaping or image placeholders.
 
+        Underscores stay escaped on purpose: both normalisers turn ``\\_`` into
+        a space, while a bare ``snake_case_name`` would be read as italics.
+        """
+        export = doc.export_to_markdown
+        try:
+            params = inspect.signature(export).parameters
+        except (TypeError, ValueError):
+            params = {}
+        kwargs = {
+            name: value
+            for name, value in (("escape_html", False), ("image_placeholder", ""))
+            if name in params
+        }
+        try:
+            return export(**kwargs)
+        except TypeError:
+            return export()   # older docling-core
+
+    @staticmethod
+    def _docling_ocr_blocks(doc) -> list[str]:
+        """Text blocks Docling produced by OCR (for the Phase 4 repair hook)."""
+        ocr_texts = []
+        for block in getattr(doc, "texts", []):
+            prov = getattr(block, "prov", [])
+            for p in (prov if isinstance(prov, list) else [prov]):
+                if getattr(p, "charspan", None) == (0, 0):
+                    # zero charspan means Docling had no native text → OCR
+                    ocr_texts.append(getattr(block, "text", ""))
+        return ocr_texts
+
+    def _docling_convert(self, processed_html: str, tokens: dict[str, str]) -> tuple[str, dict, list[str]]:
+        """Runs Docling on already pre-processed HTML."""
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
                 suffix=".html", mode="w", encoding="utf-8", delete=False, dir=str(_TEMP_DIR)
             ) as tmp:
-                tmp.write(processed)
+                tmp.write(processed_html)
                 tmp_path = tmp.name
 
             result  = self._converter.convert(tmp_path)
             doc     = result.document
-            raw_md  = doc.export_to_markdown()
-            
-            # Manually append the OCR text extracted from images directly into the Markdown
-            # This cleanly bypasses Docling's aggressive tag-stripping behavior
-            if extracted_images:
-                raw_md += "\n\n" + "\n\n".join(extracted_images) + "\n\n"
+            raw_md  = self._place_ocr_text(self._export_markdown(doc), tokens)
 
             try:
                 ir_dict = doc.export_to_dict()
             except Exception:
                 ir_dict = {}
 
-            # Identify OCR-sourced text blocks (for Phase 4 LLM repair)
-            ocr_texts = []
-            for block in getattr(doc, "texts", []):
-                prov = getattr(block, "prov", [])
-                for p in (prov if isinstance(prov, list) else [prov]):
-                    if getattr(p, "charspan", None) == (0, 0):
-                        # zero charspan means Docling had no native text → OCR
-                        ocr_texts.append(getattr(block, "text", ""))
-
-            return raw_md, ir_dict, ocr_texts
+            return raw_md, ir_dict, self._docling_ocr_blocks(doc)
 
         except Exception as e:
-            print(f"      [Docling HTML] failed: {e}")
+            logger.warning("Docling HTML conversion failed, using BeautifulSoup instead: %s", e)
             return "", {}, []
         finally:
             if tmp_path and os.path.exists(tmp_path):
@@ -817,10 +1330,28 @@ class DocumentIngestor:
                 except Exception:
                     pass
 
-    def _bs_fallback(self, html_content: str, epub_book=None, epub_item_name: str = "") -> str:
-        """BeautifulSoup plain-text fallback."""
-        processed, extracted_images = self._preprocess_html(html_content, epub_book, epub_item_name)
-        soup = BeautifulSoup(processed, "html.parser")
+    def _docling_html(self, html_content: str, epub_book=None, epub_item_name: str = "") -> tuple[str, dict, list[str]]:
+        """
+        Run Docling on preprocessed HTML.
+        Returns (raw_markdown, ir_dict, ocr_block_texts).
+        """
+        soup, tokens = self._preprocess_soup(html_content, epub_book, epub_item_name)
+        return self._docling_convert(str(soup), tokens)
+
+    @classmethod
+    def _soup_to_text(cls, soup: BeautifulSoup, tokens: dict[str, str] | None = None) -> str:
+        """Plain text of a pre-processed soup, one paragraph per block element."""
+        # A data table row reads best as one line ("Tea, 3 shillings").
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["td", "th"], recursive=False)
+            if len(cells) < 2 or any(cell.find(_BLOCK_TAGS) is not None for cell in cells):
+                continue
+            texts = [cell.get_text(" ", strip=True) for cell in cells]
+            if any(len(t) > 200 for t in texts):
+                continue
+            line = soup.new_tag("p")
+            line.string = ", ".join(t for t in texts if t)
+            row.replace_with(line)
         # get_text() puts the separator around *every* tag, so "<i>Titanic</i>"
         # mid-sentence would become its own paragraph (and its own TTS chunk).
         # Dissolve inline markup first so only block boundaries split.
@@ -828,64 +1359,460 @@ class DocumentIngestor:
             inline.unwrap()
         soup.smooth()
         text = soup.get_text(separator="\n\n", strip=True)
-        if extracted_images:
-            text += "\n\n" + "\n\n".join(extracted_images) + "\n\n"
-        return text
+        return cls._place_ocr_text(text, tokens or {})
+
+    def _bs_fallback(self, html_content: str, epub_book=None, epub_item_name: str = "") -> str:
+        """BeautifulSoup plain-text fallback."""
+        soup, tokens = self._preprocess_soup(html_content, epub_book, epub_item_name)
+        return self._soup_to_text(soup, tokens)
+
+    # ── Chapter planning ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _anchor_positions(markup: str) -> dict[str, int]:
+        """Offset of the first tag carrying each id/name in an HTML string."""
+        positions: dict[str, int] = {}
+        for tag in _TAG_WITH_ID.finditer(markup):
+            body = tag.group(0)
+            if "id" not in body and "name" not in body:
+                continue
+            for attr in _ID_ATTR.finditer(body):
+                positions.setdefault(html_lib.unescape(attr.group(2)), tag.start())
+        return positions
+
+    def _split_at_anchors(self, doc: HtmlDoc, targets: list[TocEntry]) -> list[tuple[TocEntry | None, str]]:
+        """Cuts one HTML file at the anchors its TOC entries point to.
+
+        Returns (entry, fragment) pairs in document order. Text in front of
+        the first anchor comes back with ``entry=None``. When no anchor can be
+        located the whole file is returned under the FIRST entry.
+        """
+        markup = doc.html
+        positions: dict[str, int] | None = None
+        located: list[tuple[int, TocEntry]] = []
+        for target in targets:
+            if not target.anchor:
+                located.append((0, target))
+                continue
+            if positions is None:
+                positions = self._anchor_positions(markup)
+            pos = positions.get(target.anchor, -1)
+            if pos < 0:
+                continue
+            opener = _OPENERS_BEFORE.search(markup[max(0, pos - 600):pos])
+            if opener:
+                pos -= len(markup[max(0, pos - 600):pos]) - opener.start()
+            located.append((pos, target))
+        if not located:
+            return [(targets[0], markup)]
+
+        located.sort(key=lambda pair: pair[0])
+        cuts: list[tuple[int, TocEntry]] = []
+        for pos, target in located:
+            if cuts and cuts[-1][0] == pos:
+                if cuts[-1][1].is_parent and not target.is_parent:
+                    cuts[-1] = (pos, target)      # "Part One" + "Chapter 1" at one spot
+                continue
+            cuts.append((pos, target))
+
+        segments: list[tuple[TocEntry | None, str]] = []
+        first_pos = cuts[0][0]
+        if first_pos > 0:
+            lead = markup[:first_pos]
+            if _HAS_ALNUM.search(_ANY_TAG.sub("", lead)):
+                segments.append((None, lead))
+            else:
+                cuts[0] = (0, cuts[0][1])
+        for i, (pos, target) in enumerate(cuts):
+            end = cuts[i + 1][0] if i + 1 < len(cuts) else len(markup)
+            segments.append((target, markup[pos:end]))
+        return segments
+
+    @staticmethod
+    def _heading_targets(doc: HtmlDoc) -> tuple[HtmlDoc, list[TocEntry]] | None:
+        """For a book WITHOUT a TOC: finds the headings that divide one file.
+
+        A file holding several chapters is cut at its most senior heading
+        level that occurs at least twice. Returns the file with split anchors
+        inserted plus one entry per heading, or None when there is nothing to
+        split.
+        """
+        found = [
+            (m.start(), int(m.group(1)), _collapse(html_lib.unescape(_ANY_TAG.sub(" ", m.group(2)))))
+            for m in _HEADING_TAG.finditer(doc.html)
+        ]
+        found = [hit for hit in found if hit[2]]
+        counts = Counter(level for _, level, _ in found)
+        level = next((lv for lv in sorted(counts) if counts[lv] >= 2), 0)
+        if not level:
+            return None
+        chosen = [hit for hit in found if hit[1] == level]
+        markup = doc.html
+        entries: list[TocEntry] = []
+        for n in range(len(chosen) - 1, -1, -1):
+            pos, _, title = chosen[n]
+            anchor = _SYNTH_ANCHOR.format(n)
+            markup = f'{markup[:pos]}<a id="{anchor}"></a>{markup[pos:]}'
+            cls = "skip" if _SKIP_TOC_TITLE.match(title) else "chapter"
+            entries.append(TocEntry(title, doc.name, cls, anchor=anchor))
+        entries.reverse()
+        split_doc = HtmlDoc(name=doc.name, html=markup, linear=doc.linear, is_nav=doc.is_nav,
+                            item=doc.item, epub_types=doc.epub_types)
+        return split_doc, entries
+
+    @staticmethod
+    def _unlisted_verdict(doc: HtmlDoc, info: _FragmentInfo) -> str:
+        """Classifies a file no TOC entry points at: "matter", "heading" or "plain"."""
+        if (info.epub_types | doc.epub_types) & _MATTER_EPUB_TYPES:
+            return "matter"
+        title = info.heading or info.first_line
+        if title and _SKIP_TOC_TITLE.match(title):
+            return "matter"
+        if looks_like_matter(info.text):
+            return "matter"
+        if info.link_ratio > 0.6 and info.words >= 4:
+            return "matter"                      # a linked contents page
+        if info.heading and _STRICT_CHAPTER_HEADING.match(info.heading):
+            return "heading"
+        return "plain"
+
+    def plan_html_sections(
+        self,
+        docs: list[HtmlDoc],
+        toc_entries: list[TocEntry],
+        classifier: MLClassifier | None = None,
+    ) -> tuple[list[EpubSection], list[SkippedItem]]:
+        """Maps a book's HTML files and TOC onto an ordered list of chapters.
+
+        Parameters
+        ----------
+        docs : list[HtmlDoc]
+            The book's HTML files in READING order.
+        toc_entries : list[TocEntry]
+            Flattened TOC (see :meth:`_walk_epub_toc`); may be empty.
+        classifier : MLClassifier | None
+            Classifier for files the TOC does not list.
+
+        Returns
+        -------
+        tuple[list[EpubSection], list[SkippedItem]]
+            Sections in reading order — chapters numbered 1..N, flagged
+            front/back matter numbered after them — and the items dropped.
+        """
+        classifier = classifier or MLClassifier()
+        skipped: list[SkippedItem] = []
+
+        by_path: dict[str, int] = {}
+        by_base: dict[str, list[int]] = {}
+        for idx, doc in enumerate(docs):
+            by_path.setdefault(doc.name, idx)
+            by_base.setdefault(posixpath.basename(doc.name), []).append(idx)
+
+        targets: dict[int, list[TocEntry]] = {}
+        for entry in toc_entries:
+            idx = by_path.get(entry.href)
+            if idx is None:
+                same_name = by_base.get(posixpath.basename(entry.href), [])
+                idx = same_name[0] if len(same_name) == 1 else None
+            if idx is None:
+                skipped.append(SkippedItem(entry.href, entry.title, "TOC entry points at a file that is not in the book"))
+                continue
+            listed = targets.setdefault(idx, [])
+            twin = next((t for t in listed if t.anchor == entry.anchor), None)
+            if twin is not None:
+                if twin.is_parent and not entry.is_parent:
+                    # A section and its first child share a target: the child names it.
+                    twin.title, twin.classification, twin.is_parent = entry.title, entry.classification, False
+                continue
+            if listed and entry.depth >= 2:
+                continue   # sub-sections of a chapter that is already listed
+            listed.append(TocEntry(entry.title, entry.href, entry.classification,
+                                   anchor=entry.anchor, is_parent=entry.is_parent, depth=entry.depth))
+
+        chapter_docs = [i for i, lst in targets.items() if any(t.classification == "chapter" for t in lst)]
+        has_toc = bool(chapter_docs)
+        last_chapter_doc = max(chapter_docs) if chapter_docs else -1
+        readable = [d for d in docs if d.linear and not d.is_nav]
+        if not has_toc and len(readable) <= 2:
+            # No usable TOC and (nearly) the whole book in one file: cut that
+            # file at its headings. With one file per chapter the files
+            # themselves are the chapters and sub-headings stay inside them.
+            docs = list(docs)
+            for idx, doc in enumerate(docs):
+                if idx in targets or doc.is_nav or not doc.linear:
+                    continue
+                split = self._heading_targets(doc)
+                if split is not None:
+                    docs[idx], targets[idx] = split
+
+        sections: list[EpubSection] = []
+        chars: dict[int, int] = {}          # id(section) -> text length
+        images: dict[int, bool] = {}
+        current: EpubSection | None = None
+        tail_closed = False                 # back matter seen after the last listed chapter
+
+        def _open(kind: str, title: str, doc: HtmlDoc, idx: int, frag: str,
+                  info: _FragmentInfo, reason: str, anchor: str = "") -> EpubSection:
+            section = EpubSection(
+                title=title, kind=kind, href=doc.name + (f"#{anchor}" if anchor else ""),
+                parts=[(doc, frag)], word_count=info.words, reason=reason, position=idx,
+            )
+            chars[id(section)] = len(info.text)
+            images[id(section)] = info.has_images
+            sections.append(section)
+            return section
+
+        for idx, doc in enumerate(docs):
+            doc_targets = targets.get(idx)
+            segments = self._split_at_anchors(doc, doc_targets) if doc_targets else [(None, doc.html)]
+            for target, frag in segments:
+                info = fragment_info(frag)
+                if target is not None:
+                    if target.classification == "chapter":
+                        current = _open("chapter", target.title or info.heading, doc, idx, frag, info,
+                                        "Listed in the table of contents", target.anchor)
+                    else:
+                        _open("matter", target.title, doc, idx, frag, info,
+                              "Explicitly skipped (TOC)", target.anchor)
+                        current = None
+                        tail_closed = tail_closed or idx >= last_chapter_doc
+                    continue
+
+                # ── A file (or leading fragment) the TOC does not list ──
+                if doc.is_nav or not doc.linear:
+                    skipped.append(SkippedItem(doc.name, info.heading or doc.name,
+                                               "Navigation or non-linear document"))
+                    continue
+                verdict = self._unlisted_verdict(doc, info)
+                title = info.heading or info.first_line
+                before_story = not any(s.kind == "chapter" for s in sections)
+                matter_title = title or (
+                    "Copyright" if looks_like_matter(info.text)
+                    else "Front Matter" if before_story else "Back Matter"
+                )
+                if verdict == "matter":
+                    _open("matter", matter_title, doc, idx, frag, info,
+                          f"Front/back matter (words={info.words})")
+                    current = None
+                    tail_closed = tail_closed or (has_toc and idx > last_chapter_doc)
+                    continue
+                starts_new = (verdict == "heading") if has_toc else bool(info.heading)
+                if current is not None and not starts_new:
+                    # Continuation of a chapter that is split across files.
+                    current.parts.append((doc, frag))
+                    current.word_count += info.words
+                    chars[id(current)] += len(info.text)
+                    images[id(current)] = images[id(current)] or info.has_images
+                    continue
+                if current is None and has_toc and tail_closed and idx > last_chapter_doc:
+                    _open("matter", matter_title, doc, idx, frag, info,
+                          "Unlisted file after the back matter")
+                    continue
+                label, _score = classifier.classify_item(
+                    item_name=doc.name, item_title=title, word_count=info.words,
+                    position_idx=idx, chapter_hrefs=set(), skip_hrefs=set(),
+                    doc_texts=[], avg_font=12.0,
+                )
+                if verdict == "heading":
+                    label = "chapter"    # "Chapter 7" stays a chapter however short
+                substantial = info.words >= _MIN_UNLISTED_NARRATIVE_WORDS or not has_toc or starts_new
+                if label == "chapter" and substantial:
+                    fallback = "" if not has_toc else ("Opening" if not any(
+                        s.kind == "chapter" for s in sections) else "Untitled Section")
+                    current = _open("chapter", info.heading or (info.first_line if has_toc else "") or fallback,
+                                    doc, idx, frag, info, "Unlisted narrative file")
+                else:
+                    _open("matter", matter_title, doc, idx, frag, info,
+                          f"Front/back matter (words={info.words})")
+                    current = None
+
+        # ── Tidy up: fold or drop fragments too small to be a chapter ──
+        kept: list[EpubSection] = []
+        pending: EpubSection | None = None
+        for section in sections:
+            if pending is not None:
+                if section.kind == "chapter" and section.parts[0][0] is pending.parts[-1][0]:
+                    # A heading-only fragment ("Part One") in front of a chapter
+                    # in the same file: keep its text with that chapter.
+                    section.parts = pending.parts + section.parts
+                    section.word_count += pending.word_count
+                    chars[id(section)] += chars[id(pending)]
+                else:
+                    skipped.append(SkippedItem(pending.href, pending.title, "Text too short (<50 chars)"))
+                pending = None
+            if section.kind == "chapter" and chars[id(section)] < _MIN_CHAPTER_CHARS:
+                if images[id(section)]:
+                    section.kind = "matter"
+                    section.reason = "Image-only section (needs OCR to yield text)"
+                else:
+                    pending = section
+                    continue
+            if section.kind == "matter" and section.word_count == 0 and not images[id(section)]:
+                skipped.append(SkippedItem(section.href, section.title, "Empty document"))
+                continue
+            kept.append(section)
+        if pending is not None:
+            skipped.append(SkippedItem(pending.href, pending.title, "Text too short (<50 chars)"))
+
+        number = 0
+        for section in kept:
+            if section.kind == "chapter":
+                number += 1
+                section.num = number
+                if not section.title:
+                    section.title = f"Chapter {number}"
+        for section in kept:
+            if section.kind != "chapter":
+                number += 1
+                section.num = number
+                section.title = section.title or "Untitled"
+        return kept, skipped
+
+    @staticmethod
+    def epub_docs(book) -> list[HtmlDoc]:
+        """The book's HTML documents in SPINE (reading) order."""
+        by_id = {item.id: item for item in book.get_items() if getattr(item, "id", None)}
+        ordered = []
+        for entry in (book.spine or []):
+            idref, linear = (tuple(entry) + ("yes",))[:2] if isinstance(entry, (tuple, list)) else (entry, "yes")
+            item = by_id.get(idref) if isinstance(idref, str) else idref
+            if item is None or not hasattr(item, "get_body_content"):
+                continue
+            if item.get_type() != ebooklib.ITEM_DOCUMENT and not isinstance(item, epub.EpubNav):
+                continue
+            ordered.append((item, str(linear).lower() != "no"))
+        if not ordered:
+            # No usable spine: manifest order is the only order there is.
+            ordered = [(item, True) for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)]
+
+        docs: list[HtmlDoc] = []
+        seen: set[int] = set()
+        for item, linear in ordered:
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            raw = item.content if isinstance(item.content, (bytes, bytearray)) else str(item.content or "").encode("utf-8")
+            body_tag = _BODY_TAG.search(raw[:20000].decode("utf-8", errors="ignore"))
+            body_types = frozenset(
+                t for m in _EPUB_TYPE.finditer(body_tag.group(0) if body_tag else "")
+                for t in m.group(1).lower().split()
+            )
+            docs.append(HtmlDoc(
+                name=normalize_href(item.get_name() or "")[0],
+                html=item.get_body_content().decode("utf-8", errors="replace"),
+                linear=linear,
+                is_nav=isinstance(item, epub.EpubNav) or "nav" in (getattr(item, "properties", None) or []),
+                item=item,
+                epub_types=body_types,
+            ))
+        return docs
+
+    def plan_epub(
+        self, book, classifier: MLClassifier | None = None,
+    ) -> tuple[list[EpubSection], list[SkippedItem], list[TocEntry]]:
+        """Plans the chapters of an opened EPUB (no conversion, no OCR).
+
+        Parameters
+        ----------
+        book : ebooklib.epub.EpubBook
+            Book returned by ``epub.read_epub``.
+        classifier : MLClassifier | None
+            Classifier for files the TOC does not list.
+
+        Returns
+        -------
+        tuple[list[EpubSection], list[SkippedItem], list[TocEntry]]
+            Planned sections, dropped items and the flattened TOC.
+        """
+        docs = self.epub_docs(book)
+        base_dir = ""
+        if not any(isinstance(item, epub.EpubNav) for item in book.get_items()):
+            # NCX hrefs are relative to the NCX file, not to the OPF.
+            ncx = next((item for item in book.get_items() if isinstance(item, epub.EpubNcx)), None)
+            base_dir = posixpath.dirname(ncx.get_name() or "") if ncx is not None else ""
+        _, _, toc_entries = self._walk_epub_toc(book.toc, base_dir)
+        sections, skipped = self.plan_html_sections(docs, toc_entries, classifier)
+        return sections, skipped, toc_entries
+
+    # ── Conversion of planned sections ────────────────────────────────────────
+
+    def convert_section(
+        self,
+        section: EpubSection,
+        normalizer: TextNormalizer,
+        ocr_book=None,
+        language: str | None = None,
+    ) -> ChapterItem | None:
+        """Converts one planned section to normalised text (Docling, else BeautifulSoup)."""
+        raw_parts: list[str] = []
+        norm_parts: list[str] = []
+        merged_ir: dict = {}
+        merged_ocr: list[str] = []
+        methods_used: set[str] = set()
+        demarkdown = getattr(normalizer, "strip_markdown_structure", None)
+
+        for doc, frag in section.parts:
+            # Parsed (and OCR'd) exactly once, whichever converter ends up being used.
+            soup, tokens = self._preprocess_soup(frag, ocr_book, doc.name, language)
+            raw_md, ir_dict, ocr_texts = "", {}, []
+            if DOCLING_AVAILABLE and self._converter is not None:
+                raw_md, ir_dict, ocr_texts = self._docling_convert(str(soup), tokens)
+            if raw_md:
+                methods_used.add("docling")
+                norm_parts.append(demarkdown(raw_md) if demarkdown else raw_md)
+            else:
+                raw_md = self._soup_to_text(soup, tokens)
+                methods_used.add("beautifulsoup")
+                norm_parts.append(raw_md)
+            raw_parts.append(raw_md)
+            merged_ocr.extend(ocr_texts)
+            if not merged_ir:
+                merged_ir = ir_dict   # keep the lead file's IR for 0_docling_ir.json
+
+        method = "docling" if "docling" in methods_used else "beautifulsoup"
+        if len(section.parts) > 1:
+            method += f"+merged({len(section.parts)} files)"
+
+        normalized = normalizer.normalize("\n\n".join(p for p in norm_parts if p), section.title, merged_ocr)
+        if not normalized.strip():
+            return None
+        return ChapterItem(
+            num=section.num,
+            title=section.title,
+            raw_md="\n\n".join(p for p in raw_parts if p),
+            normalized=normalized,
+            sentences=normalizer.split_sentences(normalized),
+            method=method,
+            ir_json=merged_ir,
+            xgb_score=1.0 if section.kind == "chapter" else 0.0,
+            probably_matter=section.probably_matter,
+            href=section.href,
+        )
+
+    def convert_sections(
+        self,
+        sections: list[EpubSection],
+        normalizer: TextNormalizer,
+        *,
+        ocr_book=None,
+        language: str | None = None,
+    ) -> tuple[list[ChapterItem], list[SkippedItem]]:
+        """Converts planned sections; releases the OCR reader when done."""
+        chapters: list[ChapterItem] = []
+        skipped: list[SkippedItem] = []
+        try:
+            for section in sections:
+                chapter = self.convert_section(section, normalizer, ocr_book, language)
+                if chapter is None:
+                    skipped.append(SkippedItem(section.href, section.title, "No text after normalisation"))
+                else:
+                    chapters.append(chapter)
+        finally:
+            if ocr_book is not None:
+                self.release_ocr_reader()
+        return chapters, skipped
 
     # ── Public EPUB ingestion ─────────────────────────────────────────────────
-
-    def _group_spine_by_chapter(
-        self,
-        items: list,
-        chapter_href_to_title: dict[str, str], # href -> TOC title
-        skip_hrefs: set[str],
-    ) -> list[list]:
-        """
-        Groups EPUB document items into chapter buckets.
-
-        Many EPUBs split one narrative chapter across multiple HTML files
-        (e.g. index_split_007 through index_split_017 all belong to Chapter 2
-        but only 007 appears in the TOC). This method walks the spine in order
-        and appends 'orphan' files (not in any TOC href) to the most recently
-        opened chapter group.
-
-        Returns a list of groups, where each group is a list of items that
-        belong to the same logical chapter. Groups for explicitly skipped
-        items are returned as single-item lists tagged with a sentinel.
-        """
-        groups: list[list] = []          # list of ["chapter"|"skip"|"front", item, item, ...]
-        current_group: list | None = None
-
-        for idx, item in enumerate(items):
-            name = (item.get_name() or "").split("/")[-1]
-
-            found_href = None
-            for h in chapter_href_to_title:
-                if name in h:
-                    found_href = h
-                    break
-
-            in_skip    = any(name in h for h in skip_hrefs)
-
-            if found_href:
-                # Start a new chapter group; store TOC title as well
-                toc_title = chapter_href_to_title[found_href]
-                current_group = ["chapter", toc_title, item]
-                groups.append(current_group)
-            elif in_skip:
-                # Explicitly skipped — own isolated group
-                groups.append(["skip", item])
-                # Don't update current_group; orphans after a skip still
-                # attach to the last real chapter
-            else:
-                # Orphan — continuation of the previous chapter, or pre-chapter front matter
-                if current_group is not None:
-                    current_group.append(item)
-                else:
-                    # Before any chapter has started → front matter
-                    groups.append(["front", item])
-
-        return groups
 
     def ingest_epub(
         self,
@@ -893,153 +1820,64 @@ class DocumentIngestor:
         classifier: MLClassifier,
         normalizer: TextNormalizer,
         enable_ocr: bool = True,
+        *,
+        selections: list[int] | list[str] | None = None,
+        book=None,
+        language: str | None = None,
     ) -> tuple[list[ChapterItem], list[SkippedItem], list[TocEntry]]:
-        from audiobook_factory.text_extractor import _assert_zip_safe  # type: ignore
-        _assert_zip_safe(epub_path)
+        """Extracts the chapters of an EPUB.
 
-        book  = epub.read_epub(epub_path)
-        # Image OCR only runs when a book handle is passed down.
-        ocr_book = book if enable_ocr else None
-        items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
-        print(f"    Found {len(items)} EPUB document items.")
+        Parameters
+        ----------
+        epub_path : str
+            Path to the EPUB file.
+        classifier : MLClassifier
+            Classifier for documents the TOC does not list.
+        normalizer : TextNormalizer
+            Text normaliser.
+        enable_ocr : bool
+            OCR embedded images (EasyOCR) and put their text where the image was.
+        selections : list[int] | list[str] | None
+            Chapter titles or numbers to extract; unselected chapters are never
+            converted. ``None`` extracts every chapter not flagged as matter.
+        book : EpubBook | None
+            An already opened (and safety-checked) book, to avoid reading the
+            archive a second time.
+        language : str | None
+            OCR language override; defaults to the book's ``dc:language``.
 
-        # Phase 1: TOC extraction
-        chapter_hrefs, skip_hrefs, toc_entries = self._walk_epub_toc(book.toc)
-        print(f"    TOC: {len(chapter_hrefs)} chapter hrefs, {len(skip_hrefs)} skip hrefs.")
+        Returns
+        -------
+        tuple[list[ChapterItem], list[SkippedItem], list[TocEntry]]
+            Extracted chapters, skipped items and the flattened TOC.
+        """
+        if book is None:
+            from audiobook_factory.text_extractor import _assert_zip_safe  # type: ignore
+            _assert_zip_safe(epub_path)
+            book = epub.read_epub(epub_path)
 
-        # Group spine items so multi-file chapters are merged
-        # Create href -> title mapping for chapters
-        chapter_href_to_title = {e.href: e.title for e in toc_entries if e.classification == "chapter"}
-        groups = self._group_spine_by_chapter(items, chapter_href_to_title, skip_hrefs)
-        
-        print(f"    Spine groups: {sum(1 for g in groups if g[0]=='chapter')} chapters, "
-              f"{sum(1 for g in groups if g[0]=='skip')} skip, "
-              f"{sum(1 for g in groups if g[0]=='front')} front.")
+        sections, skipped, toc_entries = self.plan_epub(book, classifier)
+        logger.info(
+            "EPUB plan: %d chapters, %d front/back-matter items, %d dropped.",
+            sum(1 for s in sections if s.kind == "chapter"),
+            sum(1 for s in sections if s.kind != "chapter"), len(skipped),
+        )
 
-        chapters: list[ChapterItem] = []
-        skipped:  list[SkippedItem] = []
-        chapter_num = 1
-
-        for group in groups:
-            group_type = group[0]
-            if group_type == "chapter":
-                toc_title   = group[1]
-                group_items = group[2:]
-            else:
-                toc_title   = None
-                group_items = group[1:]
-                
-            if not group_items:
-                continue
-
-            lead_item = group_items[0]
-            lead_name = lead_item.get_name() or ""
-            lead_html = lead_item.get_body_content().decode("utf-8", errors="replace")
-            lead_soup = BeautifulSoup(lead_html, "html.parser")
-            heading    = lead_soup.find(["h1", "h2", "h3"])
-            # Prefer TOC title for chapter matching, fall back to heading/name
-            item_title = toc_title if toc_title else (heading.get_text(strip=True) if heading else lead_name)
-
-            # Handle explicitly skipped groups
-            if group_type in ("skip", "front"):
-                word_count = len(lead_soup.get_text().split())
-                reason = "Explicitly skipped (TOC)" if group_type == "skip" \
-                    else f"Front/back matter (words={word_count})"
-                skipped.append(SkippedItem(
-                    name=lead_name, title=item_title,
-                    reason=reason, xgb_score=0.0,
-                ))
-                continue
-
-            # ── Phase 2: Docling ingestion — one call per HTML file, then merge ──
-            merged_raw_md   = ""
-            merged_ir       = {}
-            merged_ocr      = []
-            methods_used    = set()
-
-            for file_item in group_items:
-                html_raw = file_item.get_body_content().decode("utf-8", errors="replace")
-                raw_md, ir_dict, ocr_texts = "", {}, []
-
-                if DOCLING_AVAILABLE and self._converter:
-                    raw_md, ir_dict, ocr_texts = self._docling_html(
-                        html_raw, epub_book=ocr_book, epub_item_name=file_item.get_name() or ""
-                    )
-                    if raw_md:
-                        methods_used.add("docling")
-
-                if not raw_md:
-                    raw_md = self._bs_fallback(html_raw, epub_book=ocr_book, epub_item_name=file_item.get_name() or "")
-                    methods_used.add("beautifulsoup")
-
-                # Append with a blank line separator
-                merged_raw_md += ("\n\n" if merged_raw_md else "") + raw_md
-                merged_ocr.extend(ocr_texts)
-                if not merged_ir:
-                    merged_ir = ir_dict   # keep the lead file's IR for 0_docling_ir.json
-
-            method = "docling" if "docling" in methods_used else "beautifulsoup"
-            if len(group_items) > 1:
-                method += f"+merged({len(group_items)} files)"
-
-            total_words = sum(
-                len(BeautifulSoup(
-                    fi.get_body_content().decode("utf-8", errors="replace"), "html.parser"
-                ).get_text().split())
-                for fi in group_items
-            )
-
-            # Phase 3: classify — use the lead file's position and word count
-            position_idx = items.index(lead_item)
-            classification, xgb_score = classifier.classify_item(
-                item_name=lead_name,
-                item_title=item_title,
-                word_count=total_words,
-                position_idx=position_idx,
-                chapter_hrefs=chapter_hrefs,
-                skip_hrefs=skip_hrefs,
-                doc_texts=[],
-                avg_font=12.0,
-            )
-
-            if classification != "chapter":
-                reason = {
-                    "front_matter": f"Classified as front matter (words={total_words})",
-                    "back_matter":  f"Classified as back matter (title={item_title!r})",
-                    "toc":          "Table of contents item",
-                    "gallery":      "Image/character gallery",
-                }.get(classification, classification)
-                skipped.append(SkippedItem(
-                    name=lead_name, title=item_title,
-                    reason=reason, xgb_score=xgb_score,
-                ))
-                continue
-
-            # Phase 4: normalize the merged text
-            normalized = normalizer.normalize(merged_raw_md, item_title, merged_ocr)
-            sentences  = normalizer.split_sentences(normalized)
-
-            if len(normalized.strip()) < 50:
-                skipped.append(SkippedItem(
-                    name=lead_name, title=item_title,
-                    reason="Normalized text too short (<50 chars)",
-                    xgb_score=xgb_score,
-                ))
-                continue
-
-            chapters.append(ChapterItem(
-                num=chapter_num,
-                title=item_title,
-                raw_md=merged_raw_md,
-                normalized=normalized,
-                sentences=sentences,
-                method=method,
-                ir_json=merged_ir,
-                xgb_score=xgb_score,
-            ))
-            chapter_num += 1
-
-        return chapters, skipped, toc_entries
+        chosen = select_sections(sections, selections)
+        chosen_ids = {id(s) for s in chosen}
+        skipped.extend(
+            SkippedItem(s.href, s.title, s.reason if s.kind != "chapter" else "Not selected")
+            for s in sections if id(s) not in chosen_ids
+        )
+        if language is None:
+            try:
+                language = (book.get_metadata("DC", "language") or [(None, {})])[0][0]
+            except Exception:
+                language = None
+        chapters, unconverted = self.convert_sections(
+            chosen, normalizer, ocr_book=book if enable_ocr else None, language=language,
+        )
+        return chapters, skipped + unconverted, toc_entries
 
     # ── Public PDF ingestion ──────────────────────────────────────────────────
 
@@ -1061,24 +1899,21 @@ class DocumentIngestor:
         try:
             result  = self._converter.convert(pdf_path)
             doc     = result.document
-            raw_md  = doc.export_to_markdown()
+            raw_md  = self._export_markdown(doc)
 
             try:
                 ir_dict = doc.export_to_dict()
             except Exception:
                 ir_dict = {}
 
-            # OCR blocks
-            ocr_texts = []
-            for block in getattr(doc, "texts", []):
-                prov = getattr(block, "prov", [])
-                for p in (prov if isinstance(prov, list) else [prov]):
-                    if getattr(p, "charspan", None) == (0, 0):
-                        ocr_texts.append(getattr(block, "text", ""))
+            ocr_texts = self._docling_ocr_blocks(doc)
 
             title   = os.path.splitext(os.path.basename(pdf_path))[0]
             # Pass is_pdf=True so header/footer noise stripping is enabled
-            norm    = normalizer.normalize(raw_md, title, ocr_texts, is_pdf=True)
+            demarkdown = getattr(normalizer, "strip_markdown_structure", None)
+            norm    = normalizer.normalize(
+                demarkdown(raw_md) if demarkdown else raw_md, title, ocr_texts, is_pdf=True,
+            )
             sents   = normalizer.split_sentences(norm)
 
             chapter = ChapterItem(
