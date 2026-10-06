@@ -155,7 +155,18 @@ class GPUDetector:
         if device == "cpu":
             return _MIN_BATCH_SIZE
         info = GPUDetector.get_device_info(device)
-        free_gb = max(0.0, info["free_vram_gb"] - vram_headroom_gb)
+        # mem_get_info() reports memory PyTorch has reserved but is not using
+        # as "used". It is reusable by the next batch, so count it as free;
+        # otherwise every batch after the first is sized as if VRAM were full.
+        reclaimable_gb = 0.0
+        try:
+            idx = int(device.split(":")[1]) if ":" in device else 0
+            reclaimable_gb = max(
+                0, torch.cuda.memory_reserved(idx) - torch.cuda.memory_allocated(idx)
+            ) / _BYTES_PER_GB
+        except Exception as exc:
+            logger.debug("Could not read allocator stats for %s: %s", device, exc)
+        free_gb = max(0.0, info["free_vram_gb"] + reclaimable_gb - vram_headroom_gb)
         chars_scaling = base_chunk_chars / _DEFAULT_CHUNK_CHARS if _DEFAULT_CHUNK_CHARS > 0 else 1.0
         denom = _VRAM_PER_CHUNK_GB * chars_scaling
         estimated_batches = int(free_gb / denom) if denom > 0 else _MIN_BATCH_SIZE

@@ -51,6 +51,7 @@ def _config(out_dir: str, **overrides) -> AudiobookConfig:
         export_lrc=False,
         max_chapter_retries=0,
         retry_failed_at_end=False,
+        pack_sentences=False,  # one chunk per sentence keeps chunk counts explicit
     )
     settings.update(overrides)
     return AudiobookConfig(**settings)

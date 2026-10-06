@@ -9,28 +9,31 @@ use text::splitter::split_sentences_rust;
 /// Exposes the simple normalizer (legacy format).
 #[pyfunction]
 #[pyo3(name = "normalize_text")]
-fn normalize_text(text: &str) -> PyResult<String> {
-    Ok(normalize_text_rust(text))
+fn normalize_text(py: Python<'_>, text: &str) -> PyResult<String> {
+    // Pure Rust work on borrowed data: let other Python threads (TTS workers,
+    // the UI, the API event loop) run meanwhile.
+    Ok(py.allow_threads(|| normalize_text_rust(text)))
 }
 
 /// Exposes the full Page/MD normalizer pipeline (TextNormalizer class level).
 #[pyfunction]
 #[pyo3(name = "clean_text")]
-fn clean_text(raw_md: &str, title: &str, is_pdf: bool) -> PyResult<String> {
-    Ok(clean_text_full(raw_md, title, is_pdf))
+fn clean_text(py: Python<'_>, raw_md: &str, title: &str, is_pdf: bool) -> PyResult<String> {
+    Ok(py.allow_threads(|| clean_text_full(raw_md, title, is_pdf)))
 }
 
 /// Exposes the smart sentence splitter.
 #[pyfunction]
 #[pyo3(name = "split_sentences")]
-fn split_sentences(text: &str, max_len: usize) -> PyResult<Vec<String>> {
-    Ok(split_sentences_rust(text, max_len))
+fn split_sentences(py: Python<'_>, text: &str, max_len: usize) -> PyResult<Vec<String>> {
+    Ok(py.allow_threads(|| split_sentences_rust(text, max_len)))
 }
 
 /// Exposes the audio mastering pipeline.
 #[pyfunction]
 #[pyo3(name = "master_audio")]
 fn master_audio(
+    py: Python<'_>,
     chunk_paths: Vec<String>,
     out_path: String,
     pause_sec: f64,
@@ -39,15 +42,19 @@ fn master_audio(
     target_tp_db: f64,
     bitrate_kbps: u32,
 ) -> PyResult<()> {
-    audio::master::master_audio_rust(
-        chunk_paths,
-        out_path,
-        pause_sec,
-        sample_rate,
-        target_lufs,
-        target_tp_db,
-        bitrate_kbps,
-    ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    // Decoding, loudness analysis and MP3 encoding of a whole chapter take
+    // seconds; holding the GIL for that stalls every other Python thread.
+    py.allow_threads(|| {
+        audio::master::master_audio_rust(
+            chunk_paths,
+            out_path,
+            pause_sec,
+            sample_rate,
+            target_lufs,
+            target_tp_db,
+            bitrate_kbps,
+        )
+    }).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
 
 /// A Python module implemented in Rust.
