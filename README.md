@@ -14,7 +14,11 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 ## ✨ Features
 
 - **Fail-Safe Chapter Retry System with Exponential Backoff (`pipeline.py`, `progress_io.py`)** — Configurable per-chapter retries (`max_chapter_retries: int = 2`) with CUDA cache clearing (`torch.cuda.empty_cache()` and `gc.collect()`), exponential backoff delay, thread-safe retry persistence (`update_chapter_retry`), and an automatic end-of-run retry pass (`retry_failed_at_end`).
-- **Pluggable Provider System (Qwen3-TTS, VibeVoice-1.5B, F5-TTS)** — Multi-provider architecture supporting Qwen3-TTS, VibeVoice-1.5B (`bezzam/VibeVoice-1.5B-hf`), and F5-TTS zero-shot voice cloning.
+- **Six TTS engines behind one interface** — Qwen3-TTS (default), IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish Audio S2 Pro, Higgs Audio v3 (plus F5-TTS). Every engine's own controls are exposed; see [TTS engines](#-tts-engines).
+- **Natural pacing** — a paragraph's sentences are spoken together, paragraphs get their own pause, and dialogue tags stay with their quote; subtitles keep sentence-level timing.
+- **Chunk verification** — every chunk is checked for truncation, runaway generation and silence (optionally transcribed with Whisper) and re-synthesized when it fails.
+- **Spoken-form text** — numerals, currency, dates, roman numerals and abbreviations are rewritten the way a narrator would read them (English).
+- **One-file audiobooks with chapter markers** — M4B/MP3 output with a navigable chapter list, cover and tags.
 - **Single-GPU VRAM Optimization & Dynamic Batching (`gpu_pool.py`)** — Configurable VRAM headroom (`vram_headroom_gb: float = 2.0`) to compute safe batch sizes on lower-memory GPUs (e.g. 8 GB cards). Includes preflight low-VRAM auto-detection warnings (<= 8.5 GB).
 - **Completion Validation & Top-Level Summary Finalizer (`pipeline.py`)** — Enforces minimum WAV file size guard (`_MINIMUM_CHAPTER_WAV_BYTES = 10_000`) and outputs a top-level `generation_summary` block (completed/failed counts, failed chapter numbers, ISO timestamp) to `generation_progress.json` upon run completion.
 - **WebSocket Keep-Alive & Session End Protocol** — Background keep-alive pings (15s) and dedicated `session_end` WebSocket events for cloud proxy reliability (Kaggle/Colab).
@@ -51,7 +55,7 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 - **`torch.compile()` Speed Optimization** — Enable kernel fusion rendering to compile Qwen3 TTS model via the GPU compiler, speeding up audio generation throughput on RTX GPUs.
 - **Smart Attention Backend** — Automatically detects whether `flash_attn` is installed. Uses **Flash Attention 2** if available, otherwise gracefully falls back to PyTorch's built-in **SDPA** — no crashes on T4 or other GPUs that don't have `flash_attn`.
 - **Re-generate missing files control** — New checkbox on the Generate tab lets you decide whether chapters marked "completed" but missing audio should be re-generated or silently skipped.
-- **Modular TTS provider system** — Qwen3-TTS, VibeVoice-1.5B, and F5-TTS built-in; async processing keeps your GPU at peak utilization.
+- **Multi-GPU by default** — every GPU pulls batches from one shared queue, so two T4s share a chapter and a failing GPU hands its work to the other.
 - **Google Colab & Kaggle support** — Full end-to-end pipeline works directly in Google Colab (`AudiobookMaker_Colab.ipynb`) and Kaggle (`AudiobookMaker_Kaggle.ipynb`) with public shareable Gradio links.
 
 ---
@@ -113,9 +117,42 @@ AudiobookMaker/
     └── tts_providers/                    ← Modular TTS provider abstraction
         ├── base_tts_provider.py          ← BaseTTSProvider ABC + get_tts_provider() factory
         ├── qwen_provider.py              ← QwenTTSProvider (per-device binding, Flash Attention 2 / SDPA auto-detect)
-        ├── vibevoice_provider.py         ← VibeVoiceTTSProvider (bezzam/VibeVoice-1.5B-hf)
+        ├── registry.py                   ← Which engines exist (lazy imports)
+        ├── indextts_provider.py          ← IndexTTS-2.5 / IndexTTS-2
+        ├── moss_provider.py              ← MOSS-TTS
+        ├── omnivoice_provider.py         ← OmniVoice
+        ├── fish_provider.py              ← Fish Audio S2 Pro
+        ├── higgs_provider.py             ← Higgs Audio v3
         └── f5tts_provider.py             ← F5TTSProvider (f5_tts zero-shot voice cloning)
 ```
+
+---
+
+## 🎙️ TTS engines
+
+| Engine (`tts_provider_name`) | Weights licence | Commercial use | Min. VRAM* | Batched | Reference transcript | Notes |
+|---|---|---|---|---|---|---|
+| Qwen3-TTS (`qwen`, default) | Apache-2.0 | yes | 6 GB | yes | optional (improves cloning) | Voice clone, preset speakers, designed voices, saved voice presets |
+| IndexTTS-2.5 (`indextts`) | bilibili Model Use License | yes, below 100M MAU / RMB 1B revenue, with conditions | 7 GB | no | not used | Emotion controlled separately from timbre; 22 kHz |
+| MOSS-TTS (`moss`) | Apache-2.0 | yes | 11 GB | yes | optional | Duration control, pause tags; ~13 GB download |
+| OmniVoice (`omnivoice`) | CC-BY-NC | **no** | 4 GB | yes | optional | 600+ languages; style is attribute tags, not prose |
+| Fish Audio S2 Pro (`fish`) | Fish Audio Research License | **no** | 12 GB | no | **required** | 44.1 kHz, inline emotion tags; slower than real time on a T4 |
+| Higgs Audio v3 (`higgs`) | Boson research / non-commercial | **no** (creator grant with attribution) | 11 GB | yes | optional | Ported from the reference server; no official in-process path exists |
+| F5-TTS (`f5tts`) | CC-BY-NC-4.0 | **no** | 3 GB | no | optional | English / Chinese |
+
+\* Estimated from weight sizes. Run `python cli.py --list-providers` for each engine's options and install command.
+
+**One engine per environment.** The engines pin incompatible `transformers` versions (IndexTTS 4.52, Qwen 4.57, MOSS exactly 5.0.0, OmniVoice and Higgs 5.3+), so install only the one you use on top of `requirements.txt`:
+
+```bash
+pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | fish | higgs
+```
+
+`requirements/tts-<engine>.txt` lists any second step an engine needs. Read the licence of an engine before publishing audio made with it: the non-commercial ones do not allow selling the result.
+
+### Testing a branch on Kaggle
+
+`AudiobookMaker_Kaggle_Test.ipynb` clones a branch, runs the unit suite, extracts every fixture book, and synthesizes a test passage with every engine on both GPUs — each in its own environment — measuring speed, VRAM, loudness and word accuracy. It writes `abm_test_results.zip` with a report, logs and audio samples. Regenerate it for another branch with `python tests/kaggle/generate_test_notebook.py --branch <name>`.
 
 ---
 
@@ -489,8 +526,8 @@ This project would not have been possible without the incredible work from these
 The voice cloning and TTS engine powering high-quality audio generation.
 State-of-the-art text-to-speech with zero-shot voice cloning from a short reference clip.
 
-### [VibeVoice-1.5B](https://huggingface.co/bezzam/VibeVoice-1.5B-hf) by bezzam
-High-quality multi-lingual voice-cloning text-to-speech model integrated as a provider option in AudiobookMaker.
+### [IndexTTS](https://github.com/index-tts/index-tts), [MOSS-TTS](https://github.com/OpenMOSS/MOSS-TTS), [OmniVoice](https://github.com/k2-fsa/OmniVoice), [Fish Speech](https://github.com/fishaudio/fish-speech) and [Higgs Audio](https://github.com/boson-ai/higgs-audio)
+Optional TTS engines; each is used under its own licence (see [TTS engines](#-tts-engines)).
 
 ### [F5-TTS](https://github.com/SWAVE-LAB/F5-TTS) by SWAVE-LAB
 Fast, lightweight zero-shot text-to-speech voice cloning model integrated as a provider option in AudiobookMaker.
