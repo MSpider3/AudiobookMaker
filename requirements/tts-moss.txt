@@ -1,0 +1,48 @@
+# ─── AudiobookMaker — MOSS-TTS provider ──────────────────────────────────────
+# Provider: audiobook_factory/tts_providers/moss_provider.py
+# Upstream: https://github.com/OpenMOSS/MOSS-TTS  (models: OpenMOSS-Team/MOSS-TTS-*)
+#
+# Install with:  pip install -r requirements/tts-moss.txt
+#
+# Install PyTorch (torch + the matching torchaudio, 2.6 or newer) FIRST, or keep
+# the pair your Kaggle/Colab image ships; pip then leaves it alone. Upstream
+# develops against torch 2.9.1+cu128.
+#
+# Nothing from the GitHub repository is installed: the model, processor and
+# codec classes are Hugging Face remote code, downloaded with the weights from
+# commits pinned in the provider.
+#
+# CONFLICT: transformers must be exactly 5.0.x for the default model
+# (OpenMOSS-Team/MOSS-TTS-Local-Transformer):
+#   - 4.57.x cannot construct upstream's processor, so MOSS-TTS and qwen-tts
+#     (transformers==4.57.3) cannot share one environment;
+#   - on 5.1.0, 5.3.0 and 5.19.0 the default model's generate() fails
+#     ("MossTTSDelayConfig has no attribute num_hidden_layers"), so it cannot
+#     share one with omnivoice (transformers>=5.3.0) either.
+# The 4B v1.5 and 8B models also run on newer 5.x releases.
+# transformers 5.0.0 pulls huggingface-hub>=1.3 and tokenizers 0.22.x.
+#
+# Licence: code and weights Apache-2.0 (commercial use allowed). All
+# repositories are public: no HF token, no gating. First run downloads
+#   13.2 GB  MOSS-TTS-Local-Transformer (6.1) + MOSS-Audio-Tokenizer (7.1)
+#   17.6 GB  MOSS-TTS-Local-Transformer-v1.5 (9.1) + MOSS-Audio-Tokenizer-v2 (8.5)
+#   24.1 GB  MOSS-TTS-v1.5 or MOSS-TTS (17.0) + MOSS-Audio-Tokenizer (7.1)
+
+transformers==5.0.0
+
+# Upstream's processor module imports torchaudio (resampling of the reference
+# clip). Unpinned on purpose: it must match the installed torch build.
+torchaudio
+
+safetensors>=0.4.3
+tqdm
+
+# The provider reads the reference clip with soundfile, so torchcodec and
+# FFmpeg (needed by torchaudio.load on torchaudio 2.9+) are not required.
+soundfile
+numpy
+
+# ── Optional ──────────────────────────────────────────────────────────────────
+# FlashAttention 2 (Ampere or newer GPUs only; a T4 cannot use it). Builds from
+# source unless a wheel matches your torch/CUDA pair.
+# flash-attn
