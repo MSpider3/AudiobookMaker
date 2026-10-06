@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Rebuild the Rust extension after pulling (`cd audiobook_rust && maturin develop --release`): three of these fixes are in Rust, and a stale binary keeps the old behaviour.
 
+### ⚡ Added
+- **Five new TTS engines** behind a shared provider contract (`tts_providers/base_tts_provider.py`, `registry.py`): IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish Audio S2 Pro and Higgs Audio v3. Each exposes its own controls as provider options, declares its licence and VRAM needs, and installs from `requirements/tts-<engine>.txt`. Engines pin incompatible `transformers` versions, so install one per environment.
+- **Qwen3-TTS reworked**: validated preset speakers (CustomVoice), designed voices that are designed once and then cloned for the whole book on every GPU (VoiceDesign), saved voice presets, per-chunk token budgets against runaway generation, and every upstream sampling control.
+- **Natural pacing** (`chunk_planner.py`): a paragraph's sentences are spoken together up to `max_len`, paragraphs get `para_pause`, dialogue tags stay with their quote; subtitles keep sentence-level timing.
+- **Chunk verification** (`chunk_verifier.py`, `verify_chunks`): free duration/silence check by default, optional Whisper transcript check, automatic re-synthesis, and a list of chunks worth a listen in the run summary.
+- **Spoken-form text** (`speech_text.py`, `normalize_speech_text`): currency, dates, years, ordinals, roman numerals, units and abbreviations rewritten for narration (English).
+- **Chapter detection for TXT, DOCX, ODT and PDF**, real MOBI/AZW3 support (optional `mobi` package), and front/back matter that can be listed unticked instead of silently dropped.
+- **Single-file audiobooks with chapter markers** (M4B/MP3), speed control for every engine, per-chapter redo (`redo_chapters`, `--redo`), ETA and an end-of-run summary of failed chapters.
+- **CLI**: `--book` (no JSON needed), `--list-providers`, `--dry-run`, `--chapters`, `--redo`, `--tts-option`, `--verify` and the rest of the config as flags; exit codes 0 / 1 / 130.
+- **API**: `/api/v1/providers`, `/api/v1/tasks`, task file download, request validation.
+- **Kaggle test notebook** (`AudiobookMaker_Kaggle_Test.ipynb`, `tests/kaggle/abm_gpu_suite.py`) that tests a branch on real GPUs and packs the results into one archive.
+
+### 🚀 Changed
+- **Multi-GPU**: all GPUs pull length-sorted batches from one shared queue per chapter; a GPU that fails hands its batch to the others. Batch size no longer shrinks after the first batch and adapts after an out-of-memory retry.
+- **Progress file** is written once per batch instead of once per chunk; chapter numbers are stable across subset runs and status is matched by title.
+- **Mastering** normalises loudness once; Rust functions release the GIL.
+- **Reference-voice preprocessing** rewritten: loudness (LUFS) target applied last, edge-only silence trim with fades, peak-relative soft gate, pause-learned noise profile, downsample to 24 kHz mono, and a report with warnings.
+- **Config schema 7**: `voice_preset`, `tts_options`, `redo_chapters`, `batch_size`, `pack_sentences`, `normalize_speech_text`, `verify_*`.
+
+### 🗑️ Removed
+- **VibeVoice provider** — it could never synthesize (it called a method the model does not have). Saved configs naming it fall back to Qwen3-TTS.
+
 ### 🐛 Fixed
 - **Loudness normalisation never boosted quiet audio (`audiobook_rust/src/audio/master.rs`)**: the true peak (a linear amplitude) was added to a dB gain, so any chapter needing a boost was turned *down* ~1.5 dB instead of reaching the LUFS target.
 - **Real errors hidden behind `sub_future` `UnboundLocalError` (`pipeline.py`)**: any failure, cancel or empty chapter before the subtitle stage reported "cannot access local variable 'sub_future'" and was marked failed.
