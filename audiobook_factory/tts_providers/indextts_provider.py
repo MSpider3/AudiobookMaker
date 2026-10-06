@@ -335,6 +335,7 @@ class IndexTTSProvider(BaseTTSProvider):
         supports_batch=False,
         supports_speed=True,
         supports_seed=True,
+        recommended_settings={"temperature": 0.8, "top_p": 0.8, "top_k": 30},
         preset_voices=(),
         options=(
             # ── Emotion ──────────────────────────────────────────────────────

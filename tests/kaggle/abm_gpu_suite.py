@@ -454,6 +454,10 @@ def _build_config(args, out_dir: str, **overrides):
     if args.batch_size:
         settings["batch_size"] = args.batch_size
     settings.update(overrides)
+    # The shared sampling defaults are tuned for Qwen; test every engine at
+    # the operating point its authors recommend.
+    from audiobook_factory.tts_providers import apply_recommended_settings
+    apply_recommended_settings(args.name, settings)
     return AudiobookConfig(**settings)
 
 

@@ -809,6 +809,7 @@ class QwenTTSProvider(BaseTTSProvider):
         supports_batch=True,
         supports_speed=False,
         supports_seed=True,
+        supports_voice_preset=True,
         preset_voices=_PRESET_SPEAKERS,
         options=(
             ProviderOption(

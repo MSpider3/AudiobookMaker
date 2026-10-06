@@ -126,8 +126,17 @@ class ProviderInfo:
         Honours ``config.speed`` natively (otherwise the pipeline time-stretches).
     supports_seed : bool
         Honours ``config.seed``.
+    supports_voice_preset : bool
+        Implements ``save_voice_preset`` / ``load_voice_preset`` and honours
+        ``config.voice_preset``.
     preset_voices : tuple[str, ...]
         Built-in speaker names usable without a reference clip.
+    recommended_settings : dict[str, Any]
+        Upstream's own operating point for the shared ``AudiobookConfig``
+        fields this provider reads (``temperature``, ``top_p``, ``top_k``,
+        ``repetition_penalty`` …). The shared defaults were tuned for
+        Qwen3-TTS; the UI and CLI apply these instead when the user has not
+        chosen a value.
     options : tuple[ProviderOption, ...]
         Extra provider-specific settings.
     pip_requirements : tuple[str, ...]
@@ -153,7 +162,9 @@ class ProviderInfo:
     supports_batch: bool = False
     supports_speed: bool = False
     supports_seed: bool = False
+    supports_voice_preset: bool = False
     preset_voices: tuple[str, ...] = ()
+    recommended_settings: dict = field(default_factory=dict)
     options: tuple[ProviderOption, ...] = field(default_factory=tuple)
     pip_requirements: tuple[str, ...] = ()
     install_notes: str = ""
@@ -278,6 +289,41 @@ class BaseTTSProvider(ABC):
 
     def cleanup(self) -> None:
         """Release resources. Override if the provider holds GPU models."""
+
+    def save_voice_preset(
+        self,
+        path: str,
+        voice_ref: str | bytes | None = None,
+        *,
+        transcript: str | None = None,
+    ) -> dict[str, Any]:
+        """Saves the conditioned narrator voice so later runs need no reference clip.
+
+        Providers that support it set ``INFO.supports_voice_preset`` and
+        override this and :meth:`load_voice_preset`.
+
+        Args:
+            path: Destination file.
+            voice_ref: Reference clip (path or WAV bytes); defaults to
+                ``config.voice_file``.
+            transcript: Transcript of the clip; defaults to
+                ``config.voice_transcript``.
+
+        Returns:
+            A JSON-safe description of the preset, including ``"path"``.
+        """
+        raise NotImplementedError(f"{self.get_name()} does not support voice presets.")
+
+    def load_voice_preset(self, path: str) -> dict[str, Any]:
+        """Loads a preset written by :meth:`save_voice_preset` onto this device.
+
+        Returns:
+            A JSON-safe description of the preset.
+
+        Raises:
+            ValueError: If the file is not a compatible preset.
+        """
+        raise NotImplementedError(f"{self.get_name()} does not support voice presets.")
 
     # ── Helpers shared by providers ──────────────────────────────────────────
 

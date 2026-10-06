@@ -103,3 +103,26 @@ def list_providers(include_hidden: bool = False) -> list["ProviderInfo"]:
         except Exception as exc:
             logger.warning("TTS provider '%s' is unavailable: %s", name, exc)
     return infos
+
+
+def apply_recommended_settings(name: str | None, settings: dict, explicit: set[str] | None = None) -> dict:
+    """Fills a settings dict with the provider's recommended sampling values.
+
+    Args:
+        name: Provider name or alias.
+        settings: ``AudiobookConfig`` field values (mutated and returned).
+        explicit: Keys the user set deliberately; these are never overwritten.
+
+    Returns:
+        ``settings``, with every recommended key not in ``explicit`` set.
+    """
+    explicit = explicit or set()
+    try:
+        recommended = provider_info(name).recommended_settings
+    except Exception as exc:
+        logger.debug("No recommended settings for provider %r: %s", name, exc)
+        return settings
+    for key, value in recommended.items():
+        if key not in explicit:
+            settings[key] = value
+    return settings

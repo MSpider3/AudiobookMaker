@@ -13,6 +13,7 @@ from audiobook_factory.tts_providers.base_tts_provider import (
     get_tts_provider,
 )
 from audiobook_factory.tts_providers.registry import (
+    apply_recommended_settings,
     canonical_name,
     is_known_provider,
     list_providers,
@@ -26,6 +27,7 @@ __all__ = [
     "ProviderInfo",
     "ProviderOption",
     "get_tts_provider",
+    "apply_recommended_settings",
     "canonical_name",
     "is_known_provider",
     "list_providers",
