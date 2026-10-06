@@ -149,7 +149,7 @@ class TestTTSProviderContract:
         for evicted_path in created_paths[:4]:
             assert not os.path.exists(evicted_path), f"Evicted voice ref {evicted_path} should be deleted"
 
-    def test_qwen_asr_pipeline_is_cached(self, config, monkeypatch):
+    def test_qwen_asr_runs_once_per_reference_and_is_released(self, config, monkeypatch):
         pytest.importorskip("transformers")
         from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
         p = QwenTTSProvider(config, device="cpu")
@@ -161,13 +161,20 @@ class TestTTSProviderContract:
             return lambda path, **call_kwargs: {"text": "Transcribed speech"}
 
         monkeypatch.setattr("audiobook_factory.tts_providers.qwen_provider.pipeline", fake_pipeline)
+        monkeypatch.setattr("audiobook_factory.tts_providers.qwen_provider._SHARED_TRANSCRIPTS", {})
 
         t1 = p._get_voice_transcript("/nonexistent/fake_ref_1.wav")
         assert t1 == "Transcribed speech"
         assert len(pipeline_calls) == 1
+        # The ASR model is unloaded once the text is known, so it does not
+        # hold VRAM next to the TTS model for the rest of the book.
+        assert p._asr_pipe is None
 
-        # Second call with another path uses the already-instantiated pipeline
-        t2 = p._get_voice_transcript("/nonexistent/fake_ref_2.wav")
-        assert t2 == "Transcribed speech"
-        assert len(pipeline_calls) == 1, "Pipeline should be cached at instance level, not recreated"
+        # Later batches reuse the transcript: the ASR model is not loaded again,
+        # neither by this instance nor by the one on the other GPU.
+        for _ in range(3):
+            assert p._get_voice_transcript("/nonexistent/fake_ref_1.wav") == "Transcribed speech"
+        other = QwenTTSProvider(config, device="cpu")
+        assert other._get_voice_transcript("/nonexistent/fake_ref_1.wav") == "Transcribed speech"
+        assert len(pipeline_calls) == 1, "ASR must run once per reference clip, not per batch or per GPU"
 
