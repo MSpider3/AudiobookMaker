@@ -35,6 +35,13 @@ parameter model with random float32 weights (17 GiB resident) before it
 reads the 8.5 GiB checkpoint. The ``low_ram_load`` option skips that random
 initialisation, after checking that the checkpoint supplies every weight.
 
+Voice presets
+-------------
+``save_voice_preset`` stores the reference clip's codec tokens and transcript
+in a ``.pt`` file of tensors and plain values; ``config.voice_preset`` then
+replaces the reference clip. The ``.npy`` token files written by fish-speech's
+own tools are accepted too.
+
 Concurrency
 -----------
 One instance owns one device. Every model object lives on the instance; the
@@ -130,6 +137,8 @@ _TOP_K_DISABLED: int = 1_000_000
 _RECOMMENDED_MAX_REFERENCE_SECONDS: float = 30.0
 _RECOMMENDED_MIN_REFERENCE_SECONDS: float = 5.0
 _MAX_REFERENCE_CACHE: int = 4
+_PRESET_FORMAT: str = "abm-fish-voice-preset"
+_PRESET_FORMAT_VERSION: int = 1
 
 # ── Memory guards ────────────────────────────────────────────────────────────
 _BYTES_PER_GIB: float = 1024.0 ** 3
@@ -334,8 +343,15 @@ class FishSpeechProvider(BaseTTSProvider):
         supports_batch=False,
         supports_speed=False,
         supports_seed=True,
-        recommended_settings={"temperature": 0.8, "top_p": 0.8, "top_k": 30},
+        supports_voice_preset=True,
         preset_voices=(),
+        # Defaults shared by upstream's API server, WebUI and SGLang runner.
+        recommended_settings={
+            "temperature": 0.8,
+            "top_p": 0.8,
+            "top_k": 30,
+            "repetition_penalty": 1.1,
+        },
         options=(
             ProviderOption(
                 key="precision", label="Model precision", kind="choice", default="auto",
@@ -458,6 +474,7 @@ class FishSpeechProvider(BaseTTSProvider):
         self._compile_warmed: bool = False
 
         self._references: OrderedDict[tuple[str, str], _ReferencePrompt] = OrderedDict()
+        self._preset_meta: dict[str, dict[str, Any]] = {}
         self._path_digests: dict[str, tuple[int, int, str]] = {}
         self._oom_memo: tuple[_LoadKey, int, str] | None = None
         self._warned: set[str] = set()
@@ -997,6 +1014,7 @@ class FishSpeechProvider(BaseTTSProvider):
         self._context_len = 0
         self._compile_warmed = False
         self._references.clear()
+        self._preset_meta.clear()
         gc.collect()
         self._empty_cuda_cache()
 
@@ -1049,27 +1067,46 @@ class FishSpeechProvider(BaseTTSProvider):
                 break
         return _WHITESPACE_RE.sub(" ", _CONTROL_TOKEN_RE.sub(" ", text)).strip()
 
+    def _remember(self, cache_key: tuple[str, str], prompt: _ReferencePrompt) -> _ReferencePrompt:
+        self._references[cache_key] = prompt
+        self._references.move_to_end(cache_key)
+        while len(self._references) > _MAX_REFERENCE_CACHE:
+            self._references.popitem(last=False)
+        return prompt
+
+    def _require_transcript(self, transcript: str) -> None:
+        """Enforces the transcript rule shared by clips and presets."""
+        if transcript:
+            return
+        if not bool(self.option("allow_missing_transcript")):
+            raise RuntimeError(
+                "Fish Audio S2 Pro needs the transcript of the reference clip. Set "
+                "voice_transcript, put the text in a .txt file next to the clip, or "
+                "enable the allow_missing_transcript option (lower voice similarity)."
+            )
+        self._warn_once(
+            "no_transcript",
+            "[Fish] Reference clip has no transcript; voice similarity will suffer.",
+        )
+
     def _reference_prompt(self, voice_ref: str | bytes | None) -> _ReferencePrompt:
-        """Returns the cached prompt for the reference clip, encoding it once.
+        """Returns the narrator prompt: the saved preset if set, else the clip."""
+        preset = (getattr(self.config, "voice_preset", "") or "").strip()
+        if preset:
+            return self._preset_prompt(preset)[0]
+        return self._clip_prompt(voice_ref)[0]
+
+    def _clip_prompt(
+        self, voice_ref: str | bytes | None, transcript: str | None = None
+    ) -> tuple[_ReferencePrompt, str]:
+        """Returns ``(prompt, content digest)`` for a reference clip, encoding it once.
 
         The cache key is the SHA-256 of the clip's content plus the transcript,
         so the same narrator reaches the codec exactly once per model load.
         """
-        preset = (getattr(self.config, "voice_preset", "") or "").strip()
         voice_file = (getattr(self.config, "voice_file", "") or "").strip() or None
         source_path: str | None = None
-        is_preset = False
-
-        if preset:
-            if not os.path.isfile(preset):
-                raise RuntimeError(f"Fish voice preset not found: {preset}")
-            if not preset.lower().endswith((".npy", ".pt")):
-                raise RuntimeError(
-                    f"Fish voice presets are codec-token files (.npy or .pt); got {preset}."
-                )
-            source_path, is_preset = preset, True
-            digest = self._file_digest(preset)
-        elif isinstance(voice_ref, (bytes, bytearray)) and voice_ref:
+        if isinstance(voice_ref, (bytes, bytearray)) and voice_ref:
             if isinstance(voice_ref, bytearray):
                 voice_ref = bytes(voice_ref)
             self._validate_voice_ref(voice_ref)
@@ -1084,52 +1121,231 @@ class FishSpeechProvider(BaseTTSProvider):
             self._validate_voice_ref(source_path)
             digest = self._file_digest(source_path)
 
-        transcript = self._transcript_for(source_path, voice_file)
-        if not transcript:
-            if not bool(self.option("allow_missing_transcript")):
-                raise RuntimeError(
-                    "Fish Audio S2 Pro needs the transcript of the reference clip. Set "
-                    "voice_transcript, put the text in a .txt file next to the clip, or "
-                    "enable the allow_missing_transcript option (lower voice similarity)."
-                )
-            self._warn_once(
-                "no_transcript",
-                "[Fish] Reference clip has no transcript; voice similarity will suffer.",
-            )
+        if transcript is None:
+            transcript = self._transcript_for(source_path, voice_file)
+        else:
+            transcript = _WHITESPACE_RE.sub(" ", _CONTROL_TOKEN_RE.sub(" ", transcript)).strip()
+        self._require_transcript(transcript)
 
         cache_key = (digest, transcript)
         cached = self._references.get(cache_key)
         if cached is not None:
             self._references.move_to_end(cache_key)
-            return cached
-
-        if is_preset:
-            codes = self._load_preset_codes(source_path)  # type: ignore[arg-type]
-        else:
-            if source_path is None:
-                source_path = self.resolve_voice_path(voice_ref)
-            codes = self._encode_reference(source_path)  # type: ignore[arg-type]
+            return cached, digest
+        if source_path is None:
+            source_path = self.resolve_voice_path(voice_ref)
+        codes = self._encode_reference(source_path)  # type: ignore[arg-type]
         prompt = _ReferencePrompt(codes=codes, transcript=transcript, frames=int(codes.shape[1]))
-        self._references[cache_key] = prompt
-        while len(self._references) > _MAX_REFERENCE_CACHE:
-            self._references.popitem(last=False)
-        return prompt
+        return self._remember(cache_key, prompt), digest
+
+    # ── Voice presets ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _load_preset_codes(path: str) -> Any:
-        """Loads codec tokens saved by fish-speech (``fake.npy``) or ``torch.save``."""
+    def _read_preset_file(path: str) -> tuple[Any, dict[str, Any]]:
+        """Reads codec tokens and metadata from a preset file.
+
+        Accepts presets written by :meth:`save_voice_preset`, a bare token
+        tensor saved with ``torch.save``, and the ``.npy`` token files
+        fish-speech's own tools write. Nothing is unpickled: ``.pt`` files are
+        read with ``weights_only=True`` and ``.npy`` with ``allow_pickle=False``.
+
+        Raises
+        ------
+        ValueError
+            If the file is missing or is not a codec-token preset.
+        """
         import numpy as np
         import torch
 
-        if path.lower().endswith(".npy"):
-            codes = torch.from_numpy(np.load(path, allow_pickle=False))
-        else:
-            codes = torch.load(path, map_location="cpu", weights_only=True)
-        if not isinstance(codes, torch.Tensor) or codes.ndim != 2 or codes.shape[1] == 0:
-            raise RuntimeError(
-                f"{path} is not a (num_codebooks, frames) codec-token array."
+        if not os.path.isfile(path):
+            raise ValueError(f"Fish voice preset not found: {path}")
+        if not path.lower().endswith((".npy", ".pt")):
+            raise ValueError(f"Fish voice presets are .pt or .npy codec-token files; got {path}.")
+        try:
+            if path.lower().endswith(".npy"):
+                payload: Any = torch.from_numpy(np.load(path, allow_pickle=False))
+            else:
+                payload = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            raise ValueError(f"{path} is not a readable Fish voice preset: {exc}") from exc
+
+        meta: dict[str, Any] = {}
+        codes = payload
+        if isinstance(payload, dict):
+            codes = payload.get("codes")
+            meta = {
+                key: value for key, value in payload.items()
+                if isinstance(value, (str, int, float, bool))
+            }
+            if meta.get("format") != _PRESET_FORMAT:
+                raise ValueError(f"{path} is not a Fish voice preset (format {meta.get('format')!r}).")
+        if (
+            not isinstance(codes, torch.Tensor)
+            or codes.ndim != 2
+            or codes.shape[1] == 0
+            or codes.is_floating_point()
+            or codes.is_complex()
+        ):
+            raise ValueError(f"{path} does not hold a (num_codebooks, frames) codec-token array.")
+        return codes.to(dtype=torch.long).cpu(), meta
+
+    def _check_preset_compatible(self, path: str, codes: Any, meta: dict[str, Any]) -> None:
+        """Rejects tokens that do not fit the loaded model's codebooks."""
+        model_id = self._loaded.model_id if self._loaded is not None else ""
+        model_cfg = self._model.config
+        num_codebooks = int(getattr(model_cfg, "num_codebooks", codes.shape[0]))
+        if int(codes.shape[0]) != num_codebooks:
+            raise ValueError(
+                f"{path} has {int(codes.shape[0])} codebooks but {model_id} uses "
+                f"{num_codebooks}; it was made for a different model."
             )
-        return codes.to(dtype=torch.long).cpu()
+        codebook_size = int(getattr(model_cfg, "codebook_size", 0) or 0)
+        if int(codes.min()) < 0 or (codebook_size and int(codes.max()) >= codebook_size):
+            raise ValueError(f"{path} holds token ids outside the model's codebook range.")
+        saved_model = str(meta.get("model_id") or "")
+        if saved_model and saved_model != model_id:
+            raise ValueError(f"{path} was saved with {saved_model}, not {model_id}.")
+
+    @staticmethod
+    def _preset_info(path: str, prompt: _ReferencePrompt, meta: dict[str, Any]) -> dict[str, Any]:
+        """JSON-safe description of a preset."""
+        return {
+            "path": path,
+            "format": str(meta.get("format") or "codec-tokens"),
+            "format_version": int(meta.get("format_version") or 0),
+            "model_id": str(meta.get("model_id") or ""),
+            "num_codebooks": int(prompt.codes.shape[0]),
+            "frames": prompt.frames,
+            "seconds": round(prompt.frames / _CODEC_FRAME_RATE_HZ, 2),
+            "sample_rate": int(meta.get("sample_rate") or _NATIVE_SAMPLE_RATE),
+            "transcript": prompt.transcript,
+            "created_at": str(meta.get("created_at") or ""),
+            "source_sha256": str(meta.get("source_sha256") or ""),
+        }
+
+    def _preset_prompt(self, path: str) -> tuple[_ReferencePrompt, dict[str, Any]]:
+        """Returns ``(prompt, info)`` for a preset file, reading it once.
+
+        The transcript stored in the preset wins, because it is the text of
+        the audio that was encoded; token-only files fall back to
+        ``config.voice_transcript`` or a sidecar ``.txt``.
+        """
+        if not os.path.isfile(path):
+            raise ValueError(f"Fish voice preset not found: {path}")
+        fallback = self._transcript_for(path)
+        cache_key = (f"preset:{self._file_digest(path)}", fallback)
+        cached = self._references.get(cache_key)
+        if cached is not None:
+            self._references.move_to_end(cache_key)
+            return cached, self._preset_info(path, cached, self._preset_meta.get(cache_key[0], {}))
+
+        codes, meta = self._read_preset_file(path)
+        self._check_preset_compatible(path, codes, meta)
+        stored = _CONTROL_TOKEN_RE.sub(" ", str(meta.get("transcript") or ""))
+        transcript = _WHITESPACE_RE.sub(" ", stored).strip() or fallback
+        self._require_transcript(transcript)
+        prompt = _ReferencePrompt(codes=codes, transcript=transcript, frames=int(codes.shape[1]))
+        self._preset_meta[cache_key[0]] = meta
+        self._remember(cache_key, prompt)
+        logger.info(
+            "[Fish] Voice preset %s loaded on %s (%d codec frames).",
+            os.path.basename(path), self._device, prompt.frames,
+        )
+        return prompt, self._preset_info(path, prompt, meta)
+
+    def save_voice_preset(
+        self,
+        path: str,
+        voice_ref: str | bytes | None = None,
+        *,
+        transcript: str | None = None,
+    ) -> dict[str, Any]:
+        """Saves the encoded narrator reference so later runs skip the codec.
+
+        The file holds the reference clip's codec tokens, its transcript and
+        metadata, as a tensor plus plain values, so it loads with
+        ``torch.load(weights_only=True)``. Set ``config.voice_preset`` to the
+        file to use it; no reference clip is needed then.
+
+        Parameters
+        ----------
+        path : str
+            Destination file; must end in ``.pt``.
+        voice_ref : str | bytes | None
+            Reference clip (path or WAV bytes). Defaults to ``config.voice_file``.
+        transcript : str | None
+            Transcript of the clip; overrides ``config.voice_transcript`` and
+            sidecar files.
+
+        Returns
+        -------
+        dict[str, Any]
+            JSON-safe description of the preset, including ``"path"``.
+
+        Raises
+        ------
+        ValueError
+            If *path* is not a ``.pt`` file, or the clip or its transcript is missing.
+        """
+        import time
+
+        import torch
+
+        if not str(path).lower().endswith(".pt"):
+            raise ValueError(f"Fish voice presets are saved as .pt files; got {path}.")
+        with self._lock:
+            self._ensure_initialised()
+            self.bind_device()
+            try:
+                prompt, digest = self._clip_prompt(voice_ref, transcript)
+            except RuntimeError as exc:
+                if self._is_out_of_memory(exc):
+                    raise
+                raise ValueError(str(exc)) from exc
+            meta: dict[str, Any] = {
+                "format": _PRESET_FORMAT,
+                "format_version": _PRESET_FORMAT_VERSION,
+                "model_id": self._loaded.model_id if self._loaded is not None else "",
+                "sample_rate": int(self._codec.sample_rate),
+                "transcript": prompt.transcript,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "source_sha256": digest,
+            }
+            payload = dict(meta, codes=prompt.codes.detach().to("cpu", torch.long).clone())
+
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        tmp_path = f"{path}.{os.getpid()}.tmp"
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+        logger.info("[Fish] Voice preset saved to %s (%d codec frames).", path, prompt.frames)
+        return self._preset_info(path, prompt, meta)
+
+    def load_voice_preset(self, path: str) -> dict[str, Any]:
+        """Loads a preset and checks that it fits the loaded model.
+
+        Synthesis does this by itself when ``config.voice_preset`` is set;
+        call it directly to validate a file the user picked.
+
+        Returns
+        -------
+        dict[str, Any]
+            JSON-safe description of the preset.
+
+        Raises
+        ------
+        ValueError
+            If the file is missing, unreadable, or made for another model.
+        """
+        with self._lock:
+            self._ensure_initialised()
+            self.bind_device()
+            try:
+                return self._preset_prompt(path)[1]
+            except RuntimeError as exc:
+                if self._is_out_of_memory(exc):
+                    raise
+                raise ValueError(str(exc)) from exc
 
     @staticmethod
     def _resample(audio: Any, source_rate: int, target_rate: int) -> Any:

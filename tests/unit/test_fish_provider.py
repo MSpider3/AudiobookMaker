@@ -12,6 +12,7 @@ keyword the real code would reject is rejected here too.
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import math
@@ -35,9 +36,16 @@ sf = pytest.importorskip("soundfile")
 
 from audiobook_factory.pipeline import AudiobookConfig  # noqa: E402
 from audiobook_factory.tts_providers import fish_provider  # noqa: E402
-from audiobook_factory.tts_providers.base_tts_provider import get_tts_provider  # noqa: E402
+from audiobook_factory.tts_providers.base_tts_provider import (  # noqa: E402
+    BaseTTSProvider,
+    get_tts_provider,
+)
 from audiobook_factory.tts_providers.fish_provider import FishSpeechProvider  # noqa: E402
-from audiobook_factory.tts_providers.registry import canonical_name, provider_class  # noqa: E402
+from audiobook_factory.tts_providers.registry import (  # noqa: E402
+    apply_recommended_settings,
+    canonical_name,
+    provider_class,
+)
 
 _SAMPLE_RATE = 44100
 _FRAME_LENGTH = 2048
@@ -116,7 +124,9 @@ class _FakeModel(torch.nn.Module):
         super().__init__()
         self.recorder = recorder
         self.weight = torch.nn.Parameter(torch.zeros(2))
-        self.config = types.SimpleNamespace(max_seq_len=max_seq_len, num_codebooks=_NUM_CODEBOOKS)
+        self.config = types.SimpleNamespace(
+            max_seq_len=max_seq_len, num_codebooks=_NUM_CODEBOOKS, codebook_size=4096
+        )
         self.tokenizer = object()
 
     # llama.BaseTransformer.setup_caches(max_batch_size, max_seq_len, dtype=torch.bfloat16)
@@ -339,10 +349,33 @@ class TestInfo:
         assert info.supports_voice_clone and info.supports_instruct and info.supports_seed
         assert info.supports_batch is False and info.supports_speed is False
         assert info.preset_voices == ()
+        assert info.supports_voice_preset is True
         assert "English" in info.languages and len(info.languages) >= 80
         assert info.pip_requirements
         for needle in ("--no-deps", "ABM_FISH_REPO", "ABM_FISH_CHECKPOINT_DIR", "non-commercial"):
             assert needle in info.install_notes
+
+    def test_recommended_settings_are_upstream_defaults(self):
+        recommended = FishSpeechProvider.info().recommended_settings
+        # fish-speech API server / WebUI / SGLang runner defaults.
+        assert recommended == {
+            "temperature": 0.8, "top_p": 0.8, "top_k": 30, "repetition_penalty": 1.1,
+        }
+        config_fields = set(AudiobookConfig.__dataclass_fields__)
+        assert set(recommended) <= config_fields
+
+        settings = {"temperature": 0.3, "top_p": 0.95, "top_k": 50, "repetition_penalty": 1.05}
+        apply_recommended_settings("fish", settings, explicit={"top_p"})
+        assert settings == {
+            "temperature": 0.8, "top_p": 0.95, "top_k": 30, "repetition_penalty": 1.1,
+        }
+
+    def test_voice_preset_signatures_match_the_base_class(self):
+        for name in ("save_voice_preset", "load_voice_preset"):
+            assert inspect.signature(getattr(FishSpeechProvider, name)) == inspect.signature(
+                getattr(BaseTTSProvider, name)
+            )
+            assert getattr(FishSpeechProvider, name) is not getattr(BaseTTSProvider, name)
 
     def test_options_are_well_formed(self):
         options = FishSpeechProvider.info().options
@@ -693,6 +726,112 @@ class TestSynthesis:
         provider.synthesize("Hello.", _wav_bytes(), return_bytes=True)
         assert upstream.encode_calls == 0
         assert tuple(upstream.generate_calls[-1]["prompt_tokens"][0].shape) == (_NUM_CODEBOOKS, 33)
+
+    def test_voice_preset_round_trip(self, upstream, tmp_path):
+        voice = _wav_bytes()
+        saver = _provider(_config(voice_transcript="Ignored config transcript."))
+        path = str(tmp_path / "presets" / "narrator.pt")
+        info = saver.save_voice_preset(path, voice, transcript="Typed  by the <|im_end|> user.")
+
+        assert json.loads(json.dumps(info)) == info  # JSON-safe
+        assert info["path"] == path and os.path.isfile(path)
+        assert info["transcript"] == "Typed by the user."
+        assert info["format"] == "abm-fish-voice-preset" and info["model_id"] == "fishaudio/s2-pro"
+        assert info["num_codebooks"] == _NUM_CODEBOOKS
+        assert info["frames"] == math.ceil(_SAMPLE_RATE / _FRAME_LENGTH)
+        assert info["sample_rate"] == 44100 and info["created_at"]
+        assert upstream.encode_calls == 1
+
+        # Tensors and plain values only: loads without unpickling objects.
+        raw = torch.load(path, map_location="cpu", weights_only=True)
+        assert tuple(raw["codes"].shape) == (_NUM_CODEBOOKS, info["frames"])
+        assert raw["codes"].dtype == torch.long
+
+        # A fresh instance needs neither the clip nor a configured transcript.
+        user = _provider(_config(voice_preset=path, voice_transcript=""))
+        assert user.load_voice_preset(path) == info
+        user.synthesize("Hello there.", b"", return_bytes=True)
+        user.synthesize("Again.", voice, return_bytes=True)  # the preset replaces the clip
+        assert upstream.encode_calls == 1
+        for call in upstream.generate_calls:
+            assert call["prompt_text"] == ["Typed by the user."]
+            assert torch.equal(call["prompt_tokens"][0], raw["codes"])
+        assert upstream.generate_calls[0]["prompt_tokens"][0] is upstream.generate_calls[1]["prompt_tokens"][0]
+
+    def test_save_voice_preset_defaults_to_config_voice(self, upstream, tmp_path):
+        clip = tmp_path / "narrator.wav"
+        clip.write_bytes(_wav_bytes())
+        provider = _provider(_config(voice_file=str(clip)))
+        info = provider.save_voice_preset(str(tmp_path / "narrator.pt"))
+        assert info["transcript"] == _TRANSCRIPT and len(info["source_sha256"]) == 64
+
+    def test_save_voice_preset_rejects_bad_input(self, upstream, tmp_path):
+        provider = _provider(_config(voice_transcript=""))
+        with pytest.raises(ValueError, match="transcript"):
+            provider.save_voice_preset(str(tmp_path / "a.pt"), _wav_bytes())
+        with pytest.raises(ValueError, match="no built-in voices"):
+            provider.save_voice_preset(str(tmp_path / "a.pt"), None, transcript="Text.")
+        with pytest.raises(ValueError, match=r"\.pt"):
+            provider.save_voice_preset(str(tmp_path / "a.json"), _wav_bytes(), transcript="Text.")
+        assert not list(tmp_path.glob("a.*"))
+
+    @pytest.mark.filterwarnings("ignore:Detected pickle protocol")
+    def test_load_voice_preset_rejects_incompatible_files(self, upstream, tmp_path):
+        import pickle
+
+        provider = _provider()
+        with pytest.raises(ValueError, match="not found"):
+            provider.load_voice_preset(str(tmp_path / "missing.pt"))
+
+        wrong_books = tmp_path / "wrong_books.pt"
+        torch.save(torch.zeros((4, 20), dtype=torch.long), wrong_books)
+        with pytest.raises(ValueError, match="4 codebooks"):
+            provider.load_voice_preset(str(wrong_books))
+
+        out_of_range = tmp_path / "range.npy"
+        np.save(out_of_range, np.full((_NUM_CODEBOOKS, 5), 5000, dtype=np.int64))
+        with pytest.raises(ValueError, match="codebook range"):
+            provider.load_voice_preset(str(out_of_range))
+
+        floats = tmp_path / "floats.pt"
+        torch.save(torch.zeros((_NUM_CODEBOOKS, 5)), floats)
+        with pytest.raises(ValueError, match="codec-token array"):
+            provider.load_voice_preset(str(floats))
+
+        other_format = tmp_path / "other.pt"
+        torch.save({"format": "qwen-voice-preset", "codes": torch.zeros((10, 5), dtype=torch.long)},
+                   other_format)
+        with pytest.raises(ValueError, match="not a Fish voice preset"):
+            provider.load_voice_preset(str(other_format))
+
+        other_model = tmp_path / "other_model.pt"
+        torch.save({"format": "abm-fish-voice-preset", "model_id": "fishaudio/other",
+                    "transcript": "x", "codes": torch.zeros((10, 5), dtype=torch.long)}, other_model)
+        with pytest.raises(ValueError, match="fishaudio/other"):
+            provider.load_voice_preset(str(other_model))
+
+        class Payload:  # an arbitrary object must never be unpickled
+            def __reduce__(self):
+                return (os.system, ("echo unpickled > %s" % (tmp_path / "pwned"),))
+
+        malicious = tmp_path / "malicious.pt"
+        malicious.write_bytes(pickle.dumps(Payload()))
+        with pytest.raises(ValueError, match="not a readable Fish voice preset"):
+            provider.load_voice_preset(str(malicious))
+        assert not (tmp_path / "pwned").exists()
+
+        with pytest.raises(ValueError, match=r"\.pt or \.npy"):
+            provider.load_voice_preset(__file__)
+
+    def test_token_only_preset_uses_config_transcript(self, upstream, tmp_path):
+        preset = tmp_path / "fake.npy"  # what fish-speech's own encoder writes
+        np.save(preset, np.ones((_NUM_CODEBOOKS, 12), dtype=np.int64))
+        provider = _provider(_config(voice_transcript=""))
+        with pytest.raises(ValueError, match="transcript"):
+            provider.load_voice_preset(str(preset))
+        provider.config = _config(voice_transcript="Spoken words.")
+        info = provider.load_voice_preset(str(preset))
+        assert info["transcript"] == "Spoken words." and info["format"] == "codec-tokens"
 
     def test_missing_transcript_raises_unless_allowed(self, upstream):
         provider = _provider(_config(voice_transcript=""))
