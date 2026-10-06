@@ -105,9 +105,13 @@ class F5TTSProvider(BaseTTSProvider):
             speed = getattr(self.config, "speed", 1.0)
             seed = getattr(self.config, "seed", -1)
 
+            # An empty ref_text makes F5-TTS transcribe the clip itself; use
+            # the user's transcript when they supplied one.
+            ref_text = (getattr(self.config, "voice_transcript", "") or "").strip()
+
             infer_kwargs: dict[str, Any] = {
                 "ref_file": ref_file,
-                "ref_text": "",
+                "ref_text": ref_text,
                 "gen_text": text,
                 "nfe_step": nfe_step,
                 "speed": speed,

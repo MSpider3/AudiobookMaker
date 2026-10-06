@@ -122,16 +122,25 @@ def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConf
     import numpy as np
     import soundfile as sf
 
-    sr = int(config.sample_rate)
-    pause_len = int(config.pause * sr)
-    pause_samples = np.zeros(pause_len, dtype=np.float32)
-    fade_len = min(int(0.005 * sr), 120)  # 5ms micro-fade to eliminate digital clicks/pops
+    # The provider decides the rate of its chunks; config.sample_rate is the
+    # *output* rate and is applied when the chapter is encoded. Stamping the
+    # partial with config.sample_rate would change pitch and speed whenever
+    # the two differ.
+    sr = 0
+    pause_samples = np.zeros(0, dtype=np.float32)
+    fade_len = 0
 
     segments = []
     for i, p in enumerate(valid_paths):
         try:
             data, chunk_sr = sf.read(p, dtype="float32")
+            if data.ndim > 1:
+                data = data.mean(axis=1)
             if len(data) > 0:
+                if sr == 0:
+                    sr = int(chunk_sr)
+                    pause_samples = np.zeros(int(config.pause * sr), dtype=np.float32)
+                    fade_len = min(int(0.005 * sr), 120)  # 5ms micro-fade to eliminate digital clicks/pops
                 # Apply 5ms micro fade-in and fade-out to prevent boundary clicks/pops
                 if len(data) > 2 * fade_len and fade_len > 0:
                     fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
@@ -171,6 +180,7 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
         import soundfile as sf
 
         segments = []
+        sr = int(config.sample_rate)
         for p in valid_paths:
             try:
                 data, sr = sf.read(p, dtype="float32")
@@ -183,7 +193,7 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
             # Apply EBU R128 loudness normalization & true peak limiting in pure-Python
             try:
                 import pyloudnorm as pyln
-                meter = pyln.Meter(int(config.sample_rate))
+                meter = pyln.Meter(int(sr))
                 input_loudness = meter.integrated_loudness(raw)
                 if not np.isneginf(input_loudness) and not np.isnan(input_loudness):
                     target_lufs = float(config.lufs)
@@ -197,7 +207,7 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
             except Exception as norm_err:
                 logger.warning("pyloudnorm mastering normalization fallback error: %s", norm_err)
 
-            sf.write(out_path, raw, config.sample_rate)
+            sf.write(out_path, raw, int(sr))
 
 
 def _flush_accumulated_batch(
@@ -372,6 +382,12 @@ def _stage_b_device_worker(
     except CancelledError:
         logger.debug("Stage B worker on %s cancelled cleanly.", device)
         return
+    except Exception as exc:
+        # Stage C waits for one sentinel per worker; dying silently here
+        # would leave it polling forever.
+        logger.exception("Stage B worker on %s crashed", device)
+        master_queue.put(_StageError(exc))
+        master_queue.put(None)
 
 
 def run_chapter_pipeline(
@@ -523,6 +539,10 @@ def run_chapter_pipeline(
     try:
         for device in active_devices:
             provider = pool.acquire(cancel_token=cancel_token, preferred_device=device)
+            # Pools outlive a single run, so a pooled provider still carries
+            # the config of whichever job created it. It is exclusively ours
+            # until release(), so point it at this job's settings.
+            provider.config = config
             device_providers[device] = provider
 
         for device in active_devices:
@@ -601,7 +621,13 @@ def run_chapter_pipeline(
                         continue
                     elif isinstance(item, _SynthResult):
                         received_chunks[item.chunk_index] = item
-                        if isinstance(item.audio, str):
+                        # Canonical chunk files are the resume cache: they are
+                        # removed by run_chapter_pipeline once the chapter
+                        # succeeds, and must survive a failure or cancel.
+                        canonical = os.path.join(
+                            out_dir, f"chunk_ch_{chapter_index}_{item.chunk_index}.wav"
+                        )
+                        if isinstance(item.audio, str) and item.audio != canonical:
                             temp_files_to_clean.append(item.audio)
 
                         while next_expected_index in received_chunks:
@@ -626,6 +652,16 @@ def run_chapter_pipeline(
                                 accumulated_audio_paths.clear()
 
                             next_expected_index += 1
+
+                if (
+                    not cancel_token.is_cancelled
+                    and not _pipeline_failed
+                    and next_expected_index < total_chunks
+                ):
+                    raise RuntimeError(
+                        f"Only {next_expected_index} of {total_chunks} chunks were synthesized "
+                        f"for chapter {chapter_index}; refusing to write an incomplete chapter."
+                    )
 
                 # Flush remaining accumulated paths to final partial file
                 if accumulated_audio_paths and not cancel_token.is_cancelled and not _pipeline_failed:

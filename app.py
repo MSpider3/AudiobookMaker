@@ -41,6 +41,7 @@ from audiobook_factory.voice_preprocessor import (
 from audiobook_factory.pipeline import (
     AudiobookConfig, CancelToken, run_pipeline, preview_tts, preview_chapters,
 )
+from audiobook_factory.utils import decode_done_message, encode_done_message
 from audiobook_factory.progress_io import (
     read_progress_file, write_progress_file, update_chapter_status, update_chapter_chunk,
 )
@@ -135,6 +136,19 @@ def check_existing_progress(book_title: str, request: Any | None = None) -> str:
     return ""
 
 
+_TIMBRE_CHOICES: tuple[str, ...] = (
+    "[Chinese] vivian",
+    "[Chinese] serena",
+    "[Chinese] uncle_fu",
+    "[Chinese (Beijing Dialect)] dylan",
+    "[Chinese (Sichuan Dialect)] eric",
+    "[English] ryan",
+    "[English] aiden",
+    "[Japanese] ono_anna",
+    "[Korean] sohee",
+)
+
+
 def _parse_chapter_titles(labels: list[str]) -> list[str] | None:
     """Convert checkbox labels into plain titles."""
     if not labels:
@@ -170,18 +184,24 @@ def _load_cached_chapters_if_available(
         
         selected_titles = _parse_chapter_titles(selected_chapters_labels) if selected_chapters_labels else None
         
+        def _norm_title(t: str) -> str:
+            return " ".join(str(t or "").split()).lower()
+
+        wanted = {_norm_title(st) for st in selected_titles if st} if selected_titles else None
+        if wanted is not None:
+            # A substring test made "Chapter 1" also pull in "Chapter 10", and
+            # a partial hit silently replaced the selection: only use the cache
+            # when it holds every chapter that was asked for.
+            cached_titles = {_norm_title(c.get("title", "")) for c in ch_list}
+            if not wanted <= cached_titles:
+                return None
+
         chapters = []
         for c in ch_list:
             title = c.get("title", "")
             num = c.get("num", 0)
-            if selected_titles:
-                matched = False
-                for st in selected_titles:
-                    if st and (st == title or st in title):
-                        matched = True
-                        break
-                if not matched:
-                    continue
+            if wanted is not None and _norm_title(title) not in wanted:
+                continue
             chapters.append(ExtractedChapter(
                 num=num,
                 title=title,
@@ -249,7 +269,14 @@ def on_progress_upload_handler(file_obj: Any) -> list[Any]:
         pause_val = val("pause", 0.5)
         para_pause_val = val("para_pause", 1.2)
         mname_val = val("tts_model_name", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-        timbre_val = val("tts_timbre", "")
+        # Saved as the bare speaker id ("ryan"); the dropdown holds labels
+        # ("[English] ryan"), and an unknown value blocks every later submit.
+        timbre_saved = str(val("tts_timbre", "") or "")
+        timbre_update = gr.update()
+        for timbre_label in _TIMBRE_CHOICES:
+            if timbre_saved and timbre_label.split()[-1] == timbre_saved.split()[-1]:
+                timbre_update = gr.update(value=timbre_label)
+                break
         instruct_val = val("tts_instruct", "")
         max_len_val = val("max_len", 399)
         true_peak_val = val("true_peak", -1.5)
@@ -268,10 +295,10 @@ def on_progress_upload_handler(file_obj: Any) -> list[Any]:
         quantization_val = val("quantization", "none")
         resume_chunks_val = val("resume_incomplete_chunks", True)
         sample_rate_val = val("sample_rate", 24000)
-        bitrate_val = val("bitrate", "192k")
+        bitrate_val = val("bitrate_kbps", 64)
         channels_val = val("channels", 1)
         rep_penalty_val = val("repetition_penalty", 1.05)
-        top_k_val = val("top_k", 20)
+        top_k_val = val("top_k", 50)
         speed_val = val("speed", 1.0)
         nfe_step_val = val("nfe_step", 32)
         seed_val = val("seed", -1)
@@ -304,7 +331,7 @@ def on_progress_upload_handler(file_obj: Any) -> list[Any]:
             gr.update(value=pause_val),
             gr.update(value=para_pause_val),
             gr.update(value=mname_val),
-            gr.update(value=timbre_val),
+            timbre_update,
             gr.update(value=instruct_val),
             gr.update(value=max_len_val),
             gr.update(value=true_peak_val),
@@ -585,17 +612,7 @@ def build_app():
                         )
                         tts_timbre = gr.Dropdown(
                             label="Premium Timbre (CustomVoice only)",
-                            choices=[
-                                "[Chinese] vivian",
-                                "[Chinese] serena",
-                                "[Chinese] uncle_fu",
-                                "[Chinese (Beijing Dialect)] dylan",
-                                "[Chinese (Sichuan Dialect)] eric",
-                                "[English] ryan",
-                                "[English] aiden",
-                                "[Japanese] ono_anna",
-                                "[Korean] sohee"
-                            ],
+                            choices=list(_TIMBRE_CHOICES),
                             value="[English] ryan",
                             visible=False
                         )
@@ -1371,6 +1388,7 @@ def build_app():
                 quantization=str(quantization or "none"),
                 selected_chapters=selected_chapters or [],
                 regen_missing=bool(regen_missing),
+                resume_incomplete_chunks=bool(resume_incomplete_chunks),
                 sample_rate=int(sample_rate or 24000),
                 bitrate_kbps=int(bitrate_kbps or 64),
                 channels=int(channels or 1),
@@ -1406,17 +1424,21 @@ def build_app():
                                 if status in ("failed", "cancelled"):
                                     break
                             elif data["type"] in ("completed", "session_end"):
-                                paths = ",".join(data.get("files", []))
-                                log_q.put(f"__DONE__::{paths}")
+                                log_q.put(encode_done_message(data.get("files", [])))
                                 break
                 except Exception as e:
                     log_q.put(f"⚠️ [WebSocket Error] Disconnected or failed to connect to API server: {e}")
+                    # Re-raise so the caller polls the task instead of ending
+                    # the run with no result while the backend is still working.
+                    raise
 
             def _runner():
                 try:
                     # Check if progress JSON already has cached chapter text
                     prog_json_path = os.path.join(book_out, "generation_progress.json")
-                    chapters = _load_cached_chapters_if_available(prog_json_path, selected_chapters, log_q.put, request=request)
+                    chapters = None
+                    if not force_repro:
+                        chapters = _load_cached_chapters_if_available(prog_json_path, selected_chapters, log_q.put, request=request)
                     
                     if not chapters:
                         # Extract from book file
@@ -1471,8 +1493,7 @@ def build_app():
                                             if poll.ok:
                                                 st = poll.json()
                                                 if st["status"] == "completed":
-                                                    paths = ",".join(st.get("output_files", []))
-                                                    log_q.put(f"__DONE__::{paths}")
+                                                    log_q.put(encode_done_message(st.get("output_files", [])))
                                                     break
                                                 elif st["status"] in ("failed", "cancelled"):
                                                     err_msg_api = st.get("error_message") or ""
@@ -1480,7 +1501,7 @@ def build_app():
                                                         log_q.put(f"❌ API task {st['status']}: {err_msg_api}")
                                                     else:
                                                         log_q.put(f"❌ API task {st['status']}.")
-                                                    log_q.put("__DONE__::")
+                                                    log_q.put(encode_done_message())
                                                     break
                                         except Exception:
                                             pass
@@ -1491,7 +1512,7 @@ def build_app():
                                 if not getattr(cancel, "task_id", None):
                                     log_q.put(f"⚠️ API dispatch failed: {e}. Falling back to local generation...")
                                     out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
-                                    log_q.put(f"__DONE__::{','.join(out_files)}")
+                                    log_q.put(encode_done_message(out_files))
                                 else:
                                     # Task was enqueued — cancel it cleanly so we don't
                                     # have an orphaned GPU job and a local duplicate running.
@@ -1500,19 +1521,19 @@ def build_app():
                                         requests.post(f"http://127.0.0.1:8000/api/v1/tasks/{cancel.task_id}/cancel", timeout=3)
                                     except Exception:
                                         pass
-                                    log_q.put("__DONE__::")
+                                    log_q.put(encode_done_message())
                         else:
                             out_files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
-                            log_q.put(f"__DONE__::{','.join(out_files)}")
+                            log_q.put(encode_done_message(out_files))
                     else:
-                        log_q.put("__DONE__::")
+                        log_q.put(encode_done_message())
                 except Exception as e:
                     import traceback
                     err_msg = f"❌ [Fatal Error] Pipeline crashed: {e}"
                     print(err_msg)
                     traceback.print_exc()
                     log_q.put(err_msg)
-                    log_q.put("__DONE__::")
+                    log_q.put(encode_done_message())
 
             t = threading.Thread(target=_runner, daemon=True)
             t.start()
@@ -1536,9 +1557,9 @@ def build_app():
 
                 try:
                     msg = log_q.get(timeout=0.2)
-                    if msg.startswith("__DONE__::"):
-                        paths = msg.split("::", 1)[1]
-                        out_files = [p for p in paths.split(",") if p and os.path.exists(p)]
+                    done_files = decode_done_message(msg)
+                    if done_files is not None:
+                        out_files = [p for p in done_files if p and os.path.exists(p)]
                         break
                     log_text += msg + "\n"
                     yield log_text, prog_html_str, gr.update(visible=False), [], cancel

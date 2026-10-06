@@ -34,7 +34,7 @@ def test_vibevoice_accepts_blessed_model():
     
     # Mock transformers calls to verify it accepts the blessed model
     with patch("transformers.AutoProcessor.from_pretrained") as mock_proc, \
-         patch("transformers.AutoModelForCausalLM.from_pretrained") as mock_model:
+         patch("transformers.AutoModel.from_pretrained") as mock_model:
         mock_proc.return_value = MagicMock()
         mock_model.return_value = MagicMock()
         

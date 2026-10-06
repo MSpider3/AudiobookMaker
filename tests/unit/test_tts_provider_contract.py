@@ -159,7 +159,7 @@ class TestTTSProviderContract:
 
         def fake_pipeline(*args, **kwargs):
             pipeline_calls.append(kwargs)
-            return lambda path: {"text": "Transcribed speech"}
+            return lambda path, **call_kwargs: {"text": "Transcribed speech"}
 
         monkeypatch.setattr("audiobook_factory.tts_providers.qwen_provider.pipeline", fake_pipeline)
 

@@ -46,16 +46,6 @@ def _python_normalize_text(text):
     # This is a bit aggressive, so we perform it carefully.
     text = re.sub(r'(^|\n)([A-Z])\s*\n\s*([A-Z]{2,})', r'\1\2\3', text)
 
-    # 3. Fix Extraction Errors: Merged identifiers.
-    # This identifies "descriptor" words followed by a single-capital identifier joined to a word.
-    # We use a broad list of descriptors common in novel and technical extraction.
-    descriptors = (
-        r'Class|Room|Section|Level|Floor|Group|Area|Zone|Rank|Type|Grade|'
-        r'Exam|Test|Point|Score|Rank|Phase|Stage|Category|Model|Series|'
-        r'Volume|Chapter|Year|Course|Subject|Unit|Part|Item|Step'
-    )
-    text = re.sub(fr'(\b(?:{descriptors})\s+[A-Z])([a-z]{{2,}})', r'\1 \2', text, flags=re.IGNORECASE)
-    
     return text
 
 def smart_sentence_splitter(text, max_len=399):
@@ -65,9 +55,10 @@ def smart_sentence_splitter(text, max_len=399):
     Level 2: NLTK Sentences
     Level 3: Soft Split on Punctuation (if sentence > max_len)
     """
+    max_len = max(1, int(max_len))
     if _RUST_AVAILABLE:
         return audiobook_rust.split_sentences(text, max_len)
-        
+
     paragraphs = text.split('\n\n')
     final_chunks = []
 
@@ -88,8 +79,10 @@ def smart_sentence_splitter(text, max_len=399):
                 # We need to break this long sentence down.
                 sub_chunks = _soft_split_long_sentence(sentence, max_len)
                 final_chunks.extend(sub_chunks)
-                
-    return final_chunks
+
+    # A chunk with no letter or digit ("*", "...", "#") gives a TTS model
+    # nothing to say and tends to come back as noise or a hallucinated word.
+    return [c for c in final_chunks if any(ch.isalnum() for ch in c)]
 
 def _soft_split_long_sentence(sentence, max_len):
     """
@@ -120,13 +113,13 @@ def _soft_split_long_sentence(sentence, max_len):
         if best_split_idx == -1:
              best_split_idx = current_text.rfind(' ', 0, max_len)
              
-        # Priority 4: Hard limit (just chop)
-        if best_split_idx == -1:
-            best_split_idx = max_len
-            
         # Do the split
         # We include the punctuation in the first part usually to imply the pause
-        split_point = best_split_idx + 1
+        if best_split_idx == -1:
+            # Priority 4: Hard limit (just chop)
+            split_point = max(1, max_len)
+        else:
+            split_point = best_split_idx + 1
         
         chunk = current_text[:split_point].strip()
         if chunk: chunks.append(chunk)

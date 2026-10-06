@@ -4,6 +4,25 @@ All notable changes to **AudiobookMaker** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+> Rebuild the Rust extension after pulling (`cd audiobook_rust && maturin develop --release`): three of these fixes are in Rust, and a stale binary keeps the old behaviour.
+
+### 🐛 Fixed
+- **Loudness normalisation never boosted quiet audio (`audiobook_rust/src/audio/master.rs`)**: the true peak (a linear amplitude) was added to a dB gain, so any chapter needing a boost was turned *down* ~1.5 dB instead of reaching the LUFS target.
+- **Real errors hidden behind `sub_future` `UnboundLocalError` (`pipeline.py`)**: any failure, cancel or empty chapter before the subtitle stage reported "cannot access local variable 'sub_future'" and was marked failed.
+- **Cancellation (`pipeline.py`)**: `asyncio.CancelledError` from the chapter pipeline is now handled; a cancelled chapter stays `pending` instead of `failed`.
+- **Chapter order (`pipeline.py`)**: outputs (and the single-file concat) are ordered by chapter number, not by filename — "Chapter 10" no longer precedes "Chapter 2".
+- **Pronunciation map ignored (`pipeline.py`)**: fixes are now applied to pre-split sentences, which is what is actually synthesized.
+- **Encoder settings (`pipeline.py`)**: `bitrate_kbps` is honoured for MP3/OGG (`-q:a` used to override it); the Python fallback no longer emits 48/96/192 kHz files; sample-rate and stereo choices no longer change playback speed; Rust-encoded MP3s get ID3 tags.
+- **Resume cache (`pipeline.py`, `chapter_pipeline.py`)**: chunk WAVs survive a failed or cancelled chapter, retries reuse them, and a fingerprint discards them if the text, voice or TTS settings changed.
+- **Stale TTS settings (`chapter_pipeline.py`, `pipeline.py`, `qwen_provider.py`)**: pooled and preview providers now use the current run's config; the voice-prompt cache is keyed on file contents and transcript.
+- **Qwen provider (`qwen_provider.py`)**: reference auto-transcription no longer fails silently on an invalid Whisper kwarg; `top_k`, `repetition_penalty` and `seed` are passed through; CustomVoice/VoiceDesign no longer require a voice file.
+- **Text normalisation (`extractor_engine.py`, `text_processing.py`, Rust)**: removed the rules that split ordinary words ("room w as") and glued single capitals ("Vitamin Cis"); headings, HTML comments, entities and scene breaks are stripped; chapter titles such as "About a Boy" or "End of the Road" are no longer dropped as front matter.
+- **Rust sentence splitter panic on non-ASCII text (`splitter.rs`)**: lengths are counted in characters and slices land on UTF-8 boundaries.
+- **Extraction (`extractor_engine.py`, `text_extractor.py`)**: the OCR checkbox is honoured and an OCR failure no longer aborts extraction; inline HTML tags no longer split sentences in the fallback parser; TXT encoding is detected.
+- **API/UI (`api/server.py`, `api/worker.py`, `app.py`, `cli.py`)**: the WebSocket delivers the file list before closing, so API-mode runs no longer end in "No output files generated"; paths containing commas survive; restoring a progress JSON no longer blocks Generate; the chapter cache matches titles exactly; the CLI keeps every exported setting.
+
 ## [v1.5.0] - 2026-09-24
 
 ### ⚡ Added

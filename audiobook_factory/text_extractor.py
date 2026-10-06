@@ -12,12 +12,15 @@ extract(path, selections) -> list[ExtractedChapter]
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
+
+logger = logging.getLogger(__name__)
 
 # ── Ensure project root on sys.path ──────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -389,7 +392,9 @@ def _extract_epub(
     classifier = MLClassifier()
     normalizer = TextNormalizer()
 
-    chapters, skipped, _toc_entries = ingestor.ingest_epub(path, classifier, normalizer)
+    chapters, skipped, _toc_entries = ingestor.ingest_epub(
+        path, classifier, normalizer, enable_ocr=enable_ocr
+    )
 
     # Extract cover data separately — ingest_epub returns toc_entries, not cover bytes
     cover_data: bytes | None = None
@@ -435,13 +440,51 @@ def _extract_epub(
 
 # ── TXT extraction ────────────────────────────────────────────────────────────
 
+def read_text_file(path: str) -> str:
+    """Reads a plain-text book, detecting its encoding.
+
+    UTF-8 is tried first (a BOM is dropped). Anything else is detected with
+    chardet when available and otherwise read as Windows-1252, so legacy files
+    keep their apostrophes and quotes instead of turning into U+FFFD.
+
+    Parameters
+    ----------
+    path : str
+        Path to the text file.
+
+    Returns
+    -------
+    str
+        Decoded file contents.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    try:
+        import chardet  # type: ignore
+        guess = chardet.detect(data[:200_000])
+        encoding = guess.get("encoding")
+        if encoding and (guess.get("confidence") or 0.0) >= 0.5:
+            return data.decode(encoding, errors="replace")
+    except Exception as exc:
+        logger.debug("Encoding detection failed for %s: %s", path, exc)
+    return data.decode("cp1252", errors="replace")
+
+
 def _extract_txt(path: str, *, log) -> list[ExtractedChapter]:
     from audiobook_factory.text_processing import normalize_text, smart_sentence_splitter
     from audiobook_factory.extractor_engine import TextNormalizer  # type: ignore
 
     log("  Reading TXT file...")
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        raw = f.read()
+    raw = read_text_file(path)
 
     normalizer = TextNormalizer()
     text = normalizer.normalize(raw, title="", ocr_block_texts=[])
@@ -510,7 +553,7 @@ def _extract_pdf_ranges(path, page_ranges, ingestor, normalizer, log):
                 break
         all_text = "\n\n".join(parts)
         del parts
-        text = normalizer.normalize(all_text, title="", ocr_block_texts=[])
+        text = normalizer.normalize(all_text, title="", ocr_block_texts=[], fix_kerning=True)
         del all_text
         results.append(ExtractedChapter(
             num=1, title="Full Book", text=text,
@@ -532,7 +575,7 @@ def _extract_pdf_ranges(path, page_ranges, ingestor, normalizer, log):
             pages_left -= len(pages)
             raw   = "\n\n".join(_page_text(i) for i in pages)
             idx  += 1
-            text  = normalizer.normalize(raw, title="", ocr_block_texts=[])
+            text  = normalizer.normalize(raw, title="", ocr_block_texts=[], fix_kerning=True)
             del raw
             results.append(ExtractedChapter(
                 num=idx,

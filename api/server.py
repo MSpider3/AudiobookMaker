@@ -346,19 +346,34 @@ async def task_websocket_endpoint(websocket: WebSocket, task_id: str):
 
     ping_task = asyncio.create_task(_ws_keepalive())
 
+    _terminal = ("completed", "failed", "cancelled")
+    # A client that connects after the task ended has nothing more to wait for.
+    terminal_seen = task.status in _terminal
+
     try:
         while True:
-            # Poll updates from the task channel queue and send to client
-            data = await ws_queue.get()
+            # Poll updates from the task channel queue and send to client.
+            # The worker announces the terminal *status* first and the
+            # "completed"/"session_end" events (which carry the file list)
+            # after it, so keep draining for a short grace period instead of
+            # closing on the status message and dropping them.
+            if terminal_seen:
+                try:
+                    data = await asyncio.wait_for(ws_queue.get(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    break
+            else:
+                data = await ws_queue.get()
             await websocket.send_json(data)
             ws_queue.task_done()
-            
-            # If task terminates, we can close the socket connection cleanly
-            if data.get("type") in ("completed", "session_end", "status") and data.get("status") in ("completed", "failed", "cancelled"):
+
+            if data.get("type") == "session_end":
                 # Grace period to ensure all network proxies process the completion payload
                 await asyncio.sleep(3.0)
                 break
-                
+            if data.get("type") == "status" and data.get("status") in _terminal:
+                terminal_seen = True
+
     except WebSocketDisconnect:
         print(f"[WebSocket] Client disconnected from task subscription: {task_id}")
     except Exception as e:

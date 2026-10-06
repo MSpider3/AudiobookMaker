@@ -218,7 +218,8 @@ async def _process_single_task(task_id: str, sem: asyncio.Semaphore) -> None:
                     "success": False,
                     "cancelled": True,
                 })
-                task_queue.task_done()
+                # task_done() runs in the `finally` below; calling it here too
+                # raised "task_done() called too many times".
                 return
 
             log_q = queue.Queue()

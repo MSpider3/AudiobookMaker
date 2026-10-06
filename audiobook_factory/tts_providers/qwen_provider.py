@@ -124,6 +124,7 @@ class QwenTTSProvider(BaseTTSProvider):
         self._device: str = device
         self._model: Any = None
         self._loaded_model_name: str | None = None
+        self._loaded_quantization: str | None = None
         self._x_vector_cache: dict[str, torch.Tensor] = {}
         self._voice_prompt_cache: dict[str, Any] = {}
         self._transcript_cache: dict[str, str] = {}
@@ -161,6 +162,52 @@ class QwenTTSProvider(BaseTTSProvider):
     def estimate_cost(self, total_chars: int) -> float:
         """Return USD cost estimate for synthesis (0.0 for local model)."""
         return 0.0
+
+    def _needs_voice_ref(self) -> bool:
+        """Whether the configured checkpoint consumes a reference clip.
+
+        Only Base checkpoints clone a voice; CustomVoice and VoiceDesign
+        speak from a preset timbre or a text description.
+        """
+        name = (getattr(self.config, "tts_model_name", "") or "").lower()
+        return "customvoice" not in name and "voicedesign" not in name
+
+    def _sampling_kwargs(self) -> dict[str, Any]:
+        """Sampling arguments forwarded to every Qwen generate_* call."""
+        kwargs: dict[str, Any] = {
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+        }
+        top_k = int(getattr(self.config, "top_k", 0) or 0)
+        if top_k > 0:
+            kwargs["top_k"] = top_k
+        repetition_penalty = float(getattr(self.config, "repetition_penalty", 0.0) or 0.0)
+        if repetition_penalty > 0:
+            kwargs["repetition_penalty"] = repetition_penalty
+        return kwargs
+
+    def _apply_seed(self) -> None:
+        """Seeds torch's RNGs when config.seed >= 0 (qwen-tts takes no seed argument)."""
+        seed = getattr(self.config, "seed", -1)
+        if seed is None or int(seed) < 0:
+            return
+        import torch
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
+    @staticmethod
+    def _voice_ref_signature(ref_path: str) -> str:
+        """Identifies a reference file by path *and* current contents.
+
+        A path alone goes stale when the file is re-recorded or re-processed
+        in place, which would keep serving the previous voice from cache.
+        """
+        try:
+            stat = os.stat(ref_path)
+            return f"{ref_path}|{stat.st_size}|{stat.st_mtime_ns}"
+        except OSError:
+            return ref_path
 
     def _bind_cuda_device(self) -> None:
         """Sets the current active CUDA device to self._device to ensure thread safety on multi-GPU systems."""
@@ -212,8 +259,9 @@ class QwenTTSProvider(BaseTTSProvider):
             return str(cfg_transcript).strip()
 
         # 2. In-memory cache
-        if ref_path in self._transcript_cache:
-            return self._transcript_cache[ref_path]
+        cache_key = self._voice_ref_signature(ref_path)
+        if cache_key in self._transcript_cache:
+            return self._transcript_cache[cache_key] or None
 
         # 3. Sidecar transcript file (e.g. voice.wav.txt or voice.txt)
         import os
@@ -224,7 +272,7 @@ class QwenTTSProvider(BaseTTSProvider):
                     with open(sidecar, "r", encoding="utf-8", errors="replace") as f:
                         text = f.read().strip()
                     if text:
-                        self._transcript_cache[ref_path] = text
+                        self._transcript_cache[cache_key] = text
                         logger.info("    [QwenTTS] 🎙️ Loaded reference transcript from sidecar %s: '%s'", os.path.basename(sidecar), text[:60])
                         return text
                 except Exception as exc:
@@ -241,15 +289,24 @@ class QwenTTSProvider(BaseTTSProvider):
                     device=device_idx if (torch.cuda.is_available() and device_idx >= 0) else -1,
                     dtype=torch.float16 if (torch.cuda.is_available() and device_idx >= 0) else torch.float32,
                 )
-            res = self._asr_pipe(ref_path, chunk_length_s=30, clean_up_tokenization_spaces=False)
+            # No extra kwargs: the ASR pipeline forwards unknown ones to
+            # Whisper's generate(), which rejects them and aborts the call.
+            res = self._asr_pipe(ref_path, chunk_length_s=30)
             transcript = (res.get("text") or "").strip() if isinstance(res, dict) else ""
             if transcript:
-                self._transcript_cache[ref_path] = transcript
+                self._transcript_cache[cache_key] = transcript
                 logger.info("    [QwenTTS] 🎙️ Auto-transcribed reference audio '%s': \"%s\"", os.path.basename(ref_path), transcript)
                 return transcript
         except Exception as asr_err:
-            logger.debug("    [QwenTTS] Whisper auto-transcription skipped/unavailable: %s", asr_err)
+            logger.warning(
+                "    [QwenTTS] Could not auto-transcribe the reference voice (%s). "
+                "Cloning will fall back to speaker-embedding-only mode, which is less "
+                "faithful — provide the reference transcript to avoid this.",
+                asr_err,
+            )
 
+        # Remember the miss so every batch doesn't re-run (and re-warn about) ASR.
+        self._transcript_cache[cache_key] = ""
         return None
 
     def _ensure_voice_prompt_cached(self, voice_ref: str | bytes) -> tuple[Any, str | None, str | None]:
@@ -266,12 +323,13 @@ class QwenTTSProvider(BaseTTSProvider):
         if not ref_path:
             return None, None, None
 
-        if isinstance(voice_ref, bytes):
-            key = hashlib.sha256(voice_ref).hexdigest()[:16]
-        else:
-            key = hashlib.sha256(str(voice_ref).encode("utf-8", errors="replace")).hexdigest()[:16]
-
         ref_text = self._get_voice_transcript(ref_path)
+
+        # The prompt bakes in both the audio and its transcript, so either
+        # changing must miss the cache.
+        key = hashlib.sha256(
+            f"{self._voice_ref_signature(ref_path)}|{ref_text or ''}".encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
 
         if self._model is None or not hasattr(self._model, "model") or self._model.model is None:
             return None, None, ref_text
@@ -375,7 +433,8 @@ class QwenTTSProvider(BaseTTSProvider):
     ) -> tuple[str | bytes, float]:
         """Synthesize speech for input text and write output WAV file or return PCM bytes."""
         self._bind_cuda_device()
-        self._validate_voice_ref(voice_ref or self.config.voice_file)
+        if self._needs_voice_ref():
+            self._validate_voice_ref(voice_ref or self.config.voice_file)
         import io
         import soundfile as sf
         import torch
@@ -393,8 +452,7 @@ class QwenTTSProvider(BaseTTSProvider):
                         gen_kwargs = dict(
                             text=text,
                             language=getattr(self.config, "language", "English"),
-                            temperature=self.config.temperature,
-                            top_p=self.config.top_p,
+                            **self._sampling_kwargs(),
                         )
                         if prompt is not None:
                             gen_kwargs["voice_clone_prompt"] = prompt
@@ -408,23 +466,24 @@ class QwenTTSProvider(BaseTTSProvider):
                         else:
                             gen_kwargs["ref_audio"] = ref_path
                             gen_kwargs["x_vector_only_mode"] = True
+                        self._apply_seed()
                         wav_data, sr = self._model.generate_voice_clone(**gen_kwargs)
                     elif model_type == "custom_voice":
+                        self._apply_seed()
                         wav_data, sr = self._model.generate_custom_voice(
                             text=text,
                             speaker=self.config.tts_timbre or "serena",
                             language=getattr(self.config, "language", "English"),
                             instruct=self.config.tts_instruct,
-                            temperature=self.config.temperature,
-                            top_p=self.config.top_p,
+                            **self._sampling_kwargs(),
                         )
                     elif model_type == "voice_design":
+                        self._apply_seed()
                         wav_data, sr = self._model.generate_voice_design(
                             text=text,
                             instruct=self.config.tts_instruct,
                             language=getattr(self.config, "language", "English"),
-                            temperature=self.config.temperature,
-                            top_p=self.config.top_p,
+                            **self._sampling_kwargs(),
                         )
                     else:
                         raise ValueError(f"Unknown model type: {model_type}")
@@ -481,7 +540,8 @@ class QwenTTSProvider(BaseTTSProvider):
         this provider — do not call from two threads simultaneously.
         """
         self._bind_cuda_device()
-        self._validate_voice_ref(voice_ref or self.config.voice_file)
+        if self._needs_voice_ref():
+            self._validate_voice_ref(voice_ref or self.config.voice_file)
         # Guard: ensure model is initialized before lock acquisition
         if self._model is None:
             logger.warning(
@@ -518,8 +578,7 @@ class QwenTTSProvider(BaseTTSProvider):
                     gen_kwargs = dict(
                         text=texts,
                         language=languages,
-                        temperature=self.config.temperature,
-                        top_p=self.config.top_p,
+                        **self._sampling_kwargs(),
                     )
                     if prompt is not None:
                         gen_kwargs["voice_clone_prompt"] = prompt
@@ -533,26 +592,27 @@ class QwenTTSProvider(BaseTTSProvider):
                     else:
                         gen_kwargs["ref_audio"] = [ref_path] * len(texts)
                         gen_kwargs["x_vector_only_mode"] = True
+                    self._apply_seed()
                     wav_data_list, sr = self._model.generate_voice_clone(**gen_kwargs)
                 elif model_type == "custom_voice":
                     speakers = [self.config.tts_timbre or "serena"] * len(texts)
                     instructs = [self.config.tts_instruct] * len(texts)
+                    self._apply_seed()
                     wav_data_list, sr = self._model.generate_custom_voice(
                         text=texts,
                         speaker=speakers,
                         language=languages,
                         instruct=instructs,
-                        temperature=self.config.temperature,
-                        top_p=self.config.top_p,
+                        **self._sampling_kwargs(),
                     )
                 elif model_type == "voice_design":
                     instructs = [self.config.tts_instruct] * len(texts)
+                    self._apply_seed()
                     wav_data_list, sr = self._model.generate_voice_design(
                         text=texts,
                         instruct=instructs,
                         language=languages,
-                        temperature=self.config.temperature,
-                        top_p=self.config.top_p,
+                        **self._sampling_kwargs(),
                     )
                 else:
                     raise ValueError(f"Unknown model type: {model_type}")
@@ -651,7 +711,11 @@ class QwenTTSProvider(BaseTTSProvider):
 
     def _ensure_initialised(self) -> None:
         """Ensure the underlying Qwen model is loaded on self._device."""
-        if self._model is not None and self._loaded_model_name == self.config.tts_model_name:
+        if (
+            self._model is not None
+            and self._loaded_model_name == self.config.tts_model_name
+            and self._loaded_quantization == getattr(self.config, "quantization", "none")
+        ):
             return
 
         if self._model is not None:
@@ -729,8 +793,8 @@ class QwenTTSProvider(BaseTTSProvider):
         try:
             # Monkeypatch transformers 5.x to support older @check_model_inputs() decorators
             import transformers.utils.generic
-            _orig_check = transformers.utils.generic.check_model_inputs
-            if not getattr(_orig_check, "_is_patched_for_qwen", False):
+            _orig_check = getattr(transformers.utils.generic, "check_model_inputs", None)
+            if _orig_check is not None and not getattr(_orig_check, "_is_patched_for_qwen", False):
                 def _patched_check(*args, **kwargs):
                     if not args and not kwargs:
                         return _orig_check
@@ -759,6 +823,7 @@ class QwenTTSProvider(BaseTTSProvider):
             **self._build_model_load_kwargs(self.config),
         )
         self._loaded_model_name = self.config.tts_model_name
+        self._loaded_quantization = getattr(self.config, "quantization", "none")
 
         _sanitize_dict_keys(self._model)
 

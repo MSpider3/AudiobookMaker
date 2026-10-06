@@ -207,10 +207,12 @@ pub fn master_audio_rust(
         let gain_db = target_lufs - global_lufs;
         let mut gain = 10.0f32.powf((gain_db / 20.0) as f32);
         
-        // Scan for True Peak to avoid clipping
-        let peak_db = ebu.true_peak(0)
+        // Scan for True Peak to avoid clipping.
+        // ebur128 reports true peak as a linear amplitude, not dBTP.
+        let peak_linear = ebu.true_peak(0)
             .map_err(|e| format!("EBU R128 true peak check failed: {:?}", e))?;
-            
+        let peak_db = 20.0 * peak_linear.max(1e-10).log10();
+
         let peak_after_gain_db = peak_db + gain_db;
         if peak_after_gain_db > target_tp_db {
             // Cap gain so we do not exceed hard true_peak target

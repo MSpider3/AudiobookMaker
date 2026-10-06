@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 from audiobook_factory.progress_io import read_progress_file, write_progress_file
+from audiobook_factory.utils import decode_done_message, encode_done_message
 import queue
 import signal
 import sys
@@ -454,6 +455,20 @@ def _build_audiobook_config(meta: dict, settings: dict) -> "AudiobookConfig":
         torch_compile     = bool(settings.get("torch_compile", False)),
         quantization      = settings.get("quantization", "none"),
         regen_missing     = bool(settings.get("regen_missing", True)),
+        resume_incomplete_chunks = bool(settings.get("resume_incomplete_chunks", True)),
+        voice_transcript  = str(settings.get("voice_transcript", "") or ""),
+        sample_rate       = int(settings.get("sample_rate", 24000)),
+        bitrate_kbps      = int(settings.get("bitrate_kbps", 64)),
+        channels          = int(settings.get("channels", 1)),
+        repetition_penalty = float(settings.get("repetition_penalty", 1.05)),
+        top_k             = int(settings.get("top_k", 50)),
+        speed             = float(settings.get("speed", 1.0)),
+        nfe_step          = int(settings.get("nfe_step", 32)),
+        seed              = int(settings.get("seed", -1)),
+        max_chapter_retries = int(settings.get("max_chapter_retries", 2)),
+        retry_failed_at_end = bool(settings.get("retry_failed_at_end", True)),
+        gpu_count         = int(settings.get("gpu_count", 0)),
+        vram_headroom_gb  = float(settings.get("vram_headroom_gb", 2.0)),
         pronunciation_map = settings.get("pronunciation_map", {}),
         selected_chapters = settings.get("selected_chapters", []),
     )
@@ -586,9 +601,9 @@ def _consume_queues(log_q: queue.Queue, prog_q: queue.Queue, cancel, runner_thre
         # Log messages
         try:
             msg = log_q.get(timeout=0.15)
-            if msg.startswith("__DONE__::"):
-                paths = msg.split("::", 1)[1]
-                out_files = [p for p in paths.split(",") if p and os.path.exists(p)]
+            done_files = decode_done_message(msg)
+            if done_files is not None:
+                out_files = [p for p in done_files if p and os.path.exists(p)]
                 print()  # newline after progress line
                 return out_files
             print(f"\r  {msg}                                    ")
@@ -808,7 +823,7 @@ def main():
                             requests.post(f"http://127.0.0.1:8000/api/v1/tasks/{task_id}/cancel", timeout=3)
                         except Exception:
                             pass
-                        log_q.put("__DONE__::")
+                        log_q.put(encode_done_message())
                         return
                     try:
                         poll = requests.get(f"http://127.0.0.1:8000/api/v1/tasks/{task_id}", timeout=5)
@@ -817,12 +832,12 @@ def main():
                             if st.get("progress"):
                                 prog_q.put((st["progress"] * 100, 100))
                             if st["status"] == "completed":
-                                paths = ",".join(st.get("output_files", []))
-                                log_q.put(f"__DONE__::{paths}")
+                                log_q.put(encode_done_message(st.get("output_files", [])))
                                 return
                             elif st["status"] in ("failed", "cancelled"):
-                                log_q.put(f"❌ Task {st['status']}.")
-                                log_q.put("__DONE__::")
+                                reason = st.get("error_message") or ""
+                                log_q.put(f"❌ Task {st['status']}." + (f" {reason}" if reason else ""))
+                                log_q.put(encode_done_message())
                                 return
                     except Exception:
                         pass
@@ -830,12 +845,12 @@ def main():
             else:
                 # Local in-process run
                 files = run_pipeline(cfg, chapters, log_q, prog_q, cancel)
-                log_q.put(f"__DONE__::{','.join(files)}")
+                log_q.put(encode_done_message(files))
         except Exception as e:
             import traceback
             log_q.put(f"❌ Fatal error: {e}")
             traceback.print_exc()
-            log_q.put("__DONE__::")
+            log_q.put(encode_done_message())
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()

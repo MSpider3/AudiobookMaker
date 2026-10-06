@@ -13,6 +13,7 @@ Imported by audiobook_factory/text_extractor.py as the public API backend.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,6 +29,8 @@ from typing import Any
 import ebooklib
 from bs4 import BeautifulSoup
 from ebooklib import epub
+
+logger = logging.getLogger(__name__)
 
 # ── project root & temp folder ────────────────────────────────────────────────
 _ROOT = Path(__file__).resolve().parent.parent
@@ -79,14 +82,43 @@ _CHAPTER_KW = re.compile(
 
 # Skip-list for TOC entry titles (front/back-matter, gallery, legal…)
 _SKIP_TOC_TITLE = re.compile(
-    r"^(table\s*of\s*contents|toc|index|"
-    r"copyright|cover|title\s*page|about|postscript|newsletter|"
-    r"image\s*gallery|characters?|locations?|map|pathways?|"
-    r"end\s*of|to\s*be\s*continued|back\s*cover|"
-    r"coloph|errata|bibliography|glossary|character\s*gallery|"
-    r"pathways\s*guide|contact\s*us|credits?)",
+    r"^\s*(?:"
+    # Unambiguous front/back matter — a prefix is enough.
+    r"(?:table\s*of\s*contents|copyright|title\s*page|postscript|newsletter|"
+    r"image\s*gallery|to\s*be\s*continued|back\s*cover|coloph|errata|"
+    r"bibliography|glossary|character\s*gallery|pathways\s*guide|contact\s*us)"
+    r"|"
+    # Ordinary words that also begin real chapter titles ("About a Boy",
+    # "Maple Street", "End of the Road", "Cover of Darkness"): skip them only
+    # when they are the entire title.
+    r"(?:toc|contents|index|(?:front\s*)?cover(?:\s*(?:page|image|art))?|"
+    r"about(?:\s+(?:the\s+)?(?:authors?|book|publisher|translator|illustrator|series)"
+    r"|\s+this\s+(?:book|edition))?|"
+    r"characters?(?:\s+(?:list|profiles?|introduction))?|locations?|maps?|"
+    r"pathways?|credits?|"
+    r"end\s*of\s*(?:the\s+)?(?:book|volume|vol\.?|part|preview|sample|excerpt)(?:\s+\w+)?)"
+    r"\s*[.:!]*\s*$"
+    r")",
     re.I,
 )
+
+# Inline HTML elements: markup inside a sentence, never a paragraph boundary.
+_INLINE_TAGS: tuple[str, ...] = (
+    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "del", "dfn", "em", "font",
+    "i", "ins", "kbd", "mark", "q", "s", "samp", "small", "span", "strike",
+    "strong", "sub", "sup", "tt", "u", "var",
+)
+
+# Words that label a single-letter identifier ("Class D", "Plan B",
+# "Vitamin C", "Mr. T"). A capital following one is a name, not a kerning split.
+_LETTER_LABELS: frozenset[str] = frozenset({
+    "class", "room", "section", "level", "floor", "group", "area", "zone",
+    "rank", "type", "grade", "exam", "test", "point", "score", "phase",
+    "stage", "category", "model", "series", "volume", "chapter", "year",
+    "course", "subject", "unit", "part", "item", "step", "plan", "vitamin",
+    "option", "team", "block", "wing", "gate", "platform", "appendix",
+    "figure", "table", "exhibit", "mr", "mrs", "ms", "dr", "agent",
+})
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Data structures
@@ -285,7 +317,15 @@ class TextNormalizer:
 
     # Markdown patterns to remove / replace
     _IMG_TAG   = re.compile(r"!\[[^\]]*\]\([^)]*\)")      # ![alt](src)
-    _HR        = re.compile(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$", re.MULTILINE)
+    # Horizontal rules and scene breaks, contiguous or spaced: ---, ***, * * *
+    _HR        = re.compile(r"^[ \t]*(?:[-*_~#\u2022\u00b7][ \t]*){3,}$", re.MULTILINE)
+    _HEADING   = re.compile(r"^[ \t]*#{1,6}[ \t]+", re.MULTILINE)
+    _HTML_CMT  = re.compile(r"<!--.*?-->", re.DOTALL)
+    # Docling escapes these when exporting markdown; "&amp;" must come last.
+    _ENTITIES: tuple[tuple[str, str], ...] = (
+        ("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&#x27;", "'"),
+        ("&#39;", "'"), ("&apos;", "'"), ("&nbsp;", " "), ("&amp;", "&"),
+    )
     _BOLD_EM   = re.compile(r"\*{1,2}([^*]+?)\*{1,2}|_{1,2}([^_]+?)_{1,2}")
     _MULTI_BL  = re.compile(r"\n{3,}")
     _SOFT_WRAP = re.compile(r"(?<![.!?:;\"'\u2019\u201d])\n(?=[a-z])")
@@ -383,73 +423,79 @@ class TextNormalizer:
         text = re.sub(r"OCR_IMG_TEXT:\s*", "", text)
 
         text = self._IMG_TAG.sub("", text)              # strip ![...](...)
-        text = self._HR.sub("\n\n", text)               # strip --- and ***
+        text = self._HTML_CMT.sub("", text)             # strip <!-- image --> etc.
+        text = self._HR.sub("\n\n", text)               # strip --- / *** / * * *
+        text = self._HEADING.sub("", text)              # "## Title" → "Title"
+        text = text.replace("\\_", " ")                 # markdown-escaped underscore
         text = self._BOLD_EM.sub(r"\1\2", text)         # strip ** or _
         text = self._FOOTNOTE_LINK.sub("", text)        # strip footnotes like [[1]](#id_C0001)
-        
+        for entity, char in self._ENTITIES:
+            text = text.replace(entity, char)
+
         text = text.translate(self._SMART_Q)            # normalise smart quotes
         text = self._MULTI_BL.sub("\n\n", text)         # collapse blank lines
         return text
 
-    def _fix_isolated_capitals(self, text: str) -> str:
-        """
-        Fixes PDF kerning issues where a single capital letter is detached from
-        the rest of the word due to drop-cap or font spacing anomalies.
-        Examples: 'T HE' -> 'THE', 'W ar' -> 'War', 'T ohsaka' -> 'Tohsaka'
-        """
-        # A single capital letter at the start of a word, followed by a space,
-        # followed by lowercase letters or all-caps continuing the word.
-        # We use a negative lookbehind for letters to ensure it's the start of a word.
-        # Group 1: The isolated capital letter
-        # Group 2: The rest of the word (must be letters)
-        # We replace "C rest" with "Crest". We avoid merging "A dog" or "I am".
-        
-        # We need a function to conditionally merge because "A" and "I" are valid words.
-        def _merge_if_not_word(match):
-            cap = match.group(1)
-            rest = match.group(2)
-            
-            # The word was split in the PDF/EPUB. 
-            # E.g. cap="A", rest="nd" or cap="I", rest="t"
-            if cap in ("A", "I"):
-                rest_lower = rest.lower()
-                # Strict list of valid single-letter prefixed words (and, as, at, are, an, all, any, it, is, if, in, ill)
-                if cap == "A" and rest_lower in ("nd", "s", "t", "re", "n", "ll", "ny", "lthough", "gain", "nother", "lready", "lways"):
-                    return cap + rest
-                if cap == "I" and rest_lower in ("t", "s", "f", "n", "ll", "nto", "ndeed", "tself"):
-                    return cap + rest
-                # If it's anything else, it's likely a real word following "A" or "I"
-                # (e.g. "I didn't", "A New")
-                return f"{cap} {rest}"
-                
-            # For letters other than A and I, they are never standalone words in English 
-            # (e.g. "T HE", "W ar", "S he", "Y our", "C rest")
-            return cap + rest
+    # Kerning splits anywhere in a line ("W ar", "T ohsaka") — PDF text only.
+    _KERN_MIXED    = re.compile(r"(?<![a-zA-Z])([A-Z])[ \t]+([a-zA-Z]+)\b")
+    _KERN_CAPS     = re.compile(r"\b([A-Z])[ \t]+([A-Z]+)\b")
+    # Drop caps: a lone capital opening a line, split from the rest of its word.
+    _DROPCAP_MIXED = re.compile(r"^([ \t]*(?:#+[ \t]*)?)([A-Z])[ \t]+([a-z]+)\b", re.MULTILINE)
+    _DROPCAP_CAPS  = re.compile(r"^([ \t]*(?:#+[ \t]*)?)([A-Z])[ \t]+([A-Z]{2,})\b", re.MULTILINE)
+    _LABEL_BEFORE  = re.compile(r"([A-Za-z]+)\.?[ \t]+$")
 
-        # Pattern: [not letter] [Capital] [space] [letters]
-        _ISO_CAP = re.compile(r"(?<![a-zA-Z])([A-Z])\s+([a-zA-Z]{1,})\b")
-        text = _ISO_CAP.sub(_merge_if_not_word, text)
-        
-        # Handle all-caps splits specifically (e.g., "T HE", "W AR", "A ND", "I T", "A THURSDAY")
-        def _merge_all_caps(match):
-            cap = match.group(1)
-            rest = match.group(2)
-            if cap in ("A", "I"):
-                # "A ND", "I T", "A S", "I S"
-                if cap == "A" and rest in ("ND", "S", "T", "RE", "N", "LL", "NY"): return cap + rest
-                if cap == "I" and rest in ("T", "S", "F", "N"): return cap + rest
+    @staticmethod
+    def _merge_capital(cap: str, rest: str) -> str:
+        """Joins a detached capital to the rest of its word, unless "A"/"I" is a real word here."""
+        if cap in ("A", "I"):
+            if rest.isupper():
+                if cap == "A" and rest in ("ND", "S", "T", "RE", "N", "LL", "NY"):
+                    return cap + rest
+                if cap == "I" and rest in ("T", "S", "F", "N"):
+                    return cap + rest
                 return f"{cap} {rest}"  # "A THURSDAY", "I WANT"
-            # "T HE", "W AR", "Y OUR"
-            return cap + rest
-            
-        text = re.sub(r"\b([A-Z])\s+([A-Z]+)\b", _merge_all_caps, text)
-        
-        return text
+            rest_lower = rest.lower()
+            if cap == "A" and rest_lower in ("nd", "s", "t", "re", "n", "ll", "ny", "lthough", "gain", "nother", "lready", "lways"):
+                return cap + rest
+            if cap == "I" and rest_lower in ("t", "s", "f", "n", "ll", "nto", "ndeed", "tself"):
+                return cap + rest
+            return f"{cap} {rest}"  # "I didn't", "A New"
+        return cap + rest
 
-    def _fix_broken_lines(self, text: str) -> str:
+    def _fix_isolated_capitals(self, text: str, aggressive: bool = False) -> str:
+        """
+        Re-joins a single capital letter that extraction detached from its word.
+
+        By default only drop-cap position is repaired — a lone capital opening
+        a line ('T he sun' -> 'The sun'). Merging everywhere would corrupt
+        ordinary prose ('Vitamin C is' -> 'Vitamin Cis', 'Plan B was' ->
+        'Plan Bwas'), so that is reserved for ``aggressive=True``, used for PDF
+        text where kerning splits words mid-line ('W ar', 'T ohsaka'). Even
+        then a capital that follows a label word ('Class D students') is left
+        alone. Never joins across a line break.
+        """
+        if not aggressive:
+            text = self._DROPCAP_MIXED.sub(
+                lambda m: m.group(1) + self._merge_capital(m.group(2), m.group(3)), text
+            )
+            return self._DROPCAP_CAPS.sub(
+                lambda m: m.group(1) + self._merge_capital(m.group(2), m.group(3)), text
+            )
+
+        def _merge_unless_labelled(match: re.Match) -> str:
+            before = match.string[max(0, match.start(1) - 24):match.start(1)]
+            label = self._LABEL_BEFORE.search(before)
+            if label and label.group(1).lower() in _LETTER_LABELS:
+                return match.group(0)
+            return self._merge_capital(match.group(1), match.group(2))
+
+        text = self._KERN_MIXED.sub(_merge_unless_labelled, text)
+        return self._KERN_CAPS.sub(_merge_unless_labelled, text)
+
+    def _fix_broken_lines(self, text: str, is_pdf: bool = False) -> str:
         text = self._HYPHEN_WR.sub(r"\1", text)         # "conver-\nsion" → "conversion"
         text = self._SOFT_WRAP.sub(" ", text)            # soft-wrap join
-        text = self._fix_isolated_capitals(text)        # "W ar" → "War"
+        text = self._fix_isolated_capitals(text, aggressive=is_pdf)  # "T he" → "The"
         return text
 
     def _remove_duplicate_title(self, title: str, text: str) -> str:
@@ -458,13 +504,19 @@ class TextNormalizer:
         often emits it as an h1 AND the EPUB has it as a paragraph), remove
         the duplicate.
         """
+        stripped_title = title.strip().lower()
+        if not stripped_title:
+            # An empty title would "match" every blank line and glue the
+            # opening paragraphs together.
+            return text
         lines = text.split("\n")
         cleaned = []
-        stripped_title = title.strip().lower()
+        skipped = False
         for i, line in enumerate(lines):
             # Strip markdown heading markers for comparison
             bare = re.sub(r"^#+\s*", "", line).strip().lower()
-            if i < 4 and bare == stripped_title and cleaned:
+            if i < 4 and bare == stripped_title and cleaned and not skipped:
+                skipped = True
                 continue  # skip duplicate title line
             cleaned.append(line)
         return "\n".join(cleaned)
@@ -472,11 +524,14 @@ class TextNormalizer:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def normalize(self, raw_md: str, title: str, ocr_block_texts: list[str],
-                  is_pdf: bool = False) -> str:
+                  is_pdf: bool = False, fix_kerning: bool = False) -> str:
         """
         Full normalization pipeline.
         ocr_block_texts: list of text strings extracted by OCR (from Docling IR).
-        is_pdf: if True, also run _strip_pdf_noise() to clean running headers/footers.
+        is_pdf: if True, also run _strip_pdf_noise() to clean running headers/footers
+                and repair kerning-split words anywhere in a line.
+        fix_kerning: repair kerning-split words without the PDF noise stripping
+                (for PDF text that did not come through Docling).
         """
         text = raw_md
 
@@ -486,6 +541,11 @@ class TextNormalizer:
                 repaired = self.llm_repair_ocr_block(ocr_txt)
                 if repaired != ocr_txt:
                     text = text.replace(ocr_txt, repaired, 1)
+
+        if fix_kerning and not is_pdf:
+            # Done here rather than in the shared pipeline so the Rust and
+            # Python back ends both see already-repaired text.
+            text = self._fix_isolated_capitals(text, aggressive=True)
 
         # Try Rust compiled clean pipeline first for speed
         try:
@@ -503,7 +563,7 @@ class TextNormalizer:
         text = self._remove_duplicate_title(title, text)
 
         # 4. Fix broken lines before noise strip to avoid stripping mid-word
-        text = self._fix_broken_lines(text)
+        text = self._fix_broken_lines(text, is_pdf=is_pdf)
 
         # 5. Markdown noise strip
         text = self._strip_noise(text)
@@ -657,8 +717,16 @@ class DocumentIngestor:
                 import easyocr  # type: ignore
                 # We initialize lazily so we don't block startup or throw errors if missing
                 if not hasattr(DocumentIngestor, "_easyocr_reader"):
-                    DocumentIngestor._easyocr_reader = easyocr.Reader(["en"], gpu=True)
-                
+                    try:
+                        DocumentIngestor._easyocr_reader = easyocr.Reader(["en"], gpu=True)
+                    except Exception as reader_err:
+                        # No network for the model download, CUDA OOM, … — image
+                        # text is optional, the chapter text is not.
+                        logger.warning("EasyOCR unavailable (%s); skipping image OCR.", reader_err)
+                        DocumentIngestor._easyocr_reader = None
+                if DocumentIngestor._easyocr_reader is None:
+                    return str(soup), extracted_images
+
                 for img in soup.find_all(["img", "image"]):
                     src = img.get("src") or img.get("xlink:href")
                     if not src: continue
@@ -753,6 +821,12 @@ class DocumentIngestor:
         """BeautifulSoup plain-text fallback."""
         processed, extracted_images = self._preprocess_html(html_content, epub_book, epub_item_name)
         soup = BeautifulSoup(processed, "html.parser")
+        # get_text() puts the separator around *every* tag, so "<i>Titanic</i>"
+        # mid-sentence would become its own paragraph (and its own TTS chunk).
+        # Dissolve inline markup first so only block boundaries split.
+        for inline in soup.find_all(_INLINE_TAGS):
+            inline.unwrap()
+        soup.smooth()
         text = soup.get_text(separator="\n\n", strip=True)
         if extracted_images:
             text += "\n\n" + "\n\n".join(extracted_images) + "\n\n"
@@ -818,11 +892,14 @@ class DocumentIngestor:
         epub_path: str,
         classifier: MLClassifier,
         normalizer: TextNormalizer,
+        enable_ocr: bool = True,
     ) -> tuple[list[ChapterItem], list[SkippedItem], list[TocEntry]]:
         from audiobook_factory.text_extractor import _assert_zip_safe  # type: ignore
         _assert_zip_safe(epub_path)
 
         book  = epub.read_epub(epub_path)
+        # Image OCR only runs when a book handle is passed down.
+        ocr_book = book if enable_ocr else None
         items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
         print(f"    Found {len(items)} EPUB document items.")
 
@@ -886,13 +963,13 @@ class DocumentIngestor:
 
                 if DOCLING_AVAILABLE and self._converter:
                     raw_md, ir_dict, ocr_texts = self._docling_html(
-                        html_raw, epub_book=book, epub_item_name=file_item.get_name() or ""
+                        html_raw, epub_book=ocr_book, epub_item_name=file_item.get_name() or ""
                     )
                     if raw_md:
                         methods_used.add("docling")
 
                 if not raw_md:
-                    raw_md = self._bs_fallback(html_raw, epub_book=book, epub_item_name=file_item.get_name() or "")
+                    raw_md = self._bs_fallback(html_raw, epub_book=ocr_book, epub_item_name=file_item.get_name() or "")
                     methods_used.add("beautifulsoup")
 
                 # Append with a blank line separator
@@ -1025,8 +1102,8 @@ class DocumentIngestor:
         normalizer: TextNormalizer,
     ) -> tuple[list[ChapterItem], list[SkippedItem], list[TocEntry]]:
         try:
-            with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-                raw = f.read()
+            from audiobook_factory.text_extractor import read_text_file  # type: ignore
+            raw = read_text_file(txt_path)
             title = os.path.splitext(os.path.basename(txt_path))[0]
             norm  = normalizer.normalize(raw, title, [])
             sents = normalizer.split_sentences(norm)
