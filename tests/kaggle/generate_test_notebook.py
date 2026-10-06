@@ -71,7 +71,7 @@ RUN_UNIT_TESTS   = True    # pytest suite (mock engine, CPU)
 RUN_QWEN_MODES   = True    # preset speaker, designed voice, saved voice preset
 RUN_SCALING      = True    # same text on 1 GPU and on 2 GPUs
 RUN_RESUME       = True    # kill a run mid-chapter and resume it
-RUN_BOOK         = True    # fixture EPUB -> M4B with chapter markers
+RUN_BOOK         = True    # fixture EPUB and MOBI -> M4B with chapter markers (pipeline and cli.py)
 ASR_SCORING      = True    # transcribe each result with Whisper and score word accuracy
 
 # Optional: your own narrator clip (5-30 s of clean speech) and its exact transcript.
@@ -250,6 +250,8 @@ if RUN_RESUME:
     suite("resume --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="resume_qwen")
 if RUN_BOOK:
     suite("book --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="book_qwen")
+    # The headless CLI on the MOBI fixture: dry run, real run to M4B, and a re-run that must skip.
+    suite("cli --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="cli_qwen")
 """),
         _md("""
 ## 7 · Other engines

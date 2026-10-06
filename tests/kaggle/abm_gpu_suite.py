@@ -22,6 +22,7 @@ preset      Save the narrator as a voice preset, then narrate from the preset al
 scaling     Same passage on 1 GPU and on all GPUs; reports the speed-up.
 resume      Kill a run mid-chapter, resume it, confirm cached chunks are reused.
 book        Extract a fixture book and produce an M4B with chapter markers.
+cli         Drive cli.py for real: MOBI fixture -> M4B, dry run, provider listing, re-run.
 report      Aggregate every result into REPORT.md and results.zip.
 """
 from __future__ import annotations
@@ -854,6 +855,75 @@ def cmd_book(args) -> None:
     _guarded(tag, body)
 
 
+def cmd_cli(args) -> None:
+    tag = args.tag or f"cli_{args.name}"
+
+    def body():
+        book = args.book or os.path.join(_FIXTURES, "dummy_book.mobi")
+        work = os.path.join(RESULTS_DIR, "work", tag)
+        shutil.rmtree(work, ignore_errors=True)
+        voice_file, transcript = _default_voice()
+        cli = os.path.join(_ROOT, "cli.py")
+        metrics: dict[str, Any] = {"book": os.path.basename(book)}
+        problems: list[str] = []
+
+        listing = subprocess.run([sys.executable, cli, "--list-providers"], cwd=_ROOT,
+                                 capture_output=True, text=True, timeout=300)
+        metrics["list_providers_exit"] = listing.returncode
+        if listing.returncode != 0:
+            problems.append("--list-providers failed")
+
+        command = [sys.executable, cli, "--book", book, "--local", "--provider", args.name,
+                   "--chapters", args.chapters, "--single-file", "--output-format", "m4b",
+                   "--output-dir", work, "--verify", args.verify, "--seed", str(args.seed)]
+        if args.model:
+            command += ["--tts-model-name", args.model]
+        if voice_file:
+            command += ["--voice-file", voice_file]
+        if transcript:
+            command += ["--voice-transcript", transcript]
+
+        dry = subprocess.run(command + ["--dry-run"], cwd=_ROOT, capture_output=True, text=True, timeout=600)
+        metrics["dry_run_exit"] = dry.returncode
+        if dry.returncode != 0:
+            problems.append(f"--dry-run exited {dry.returncode}: {(dry.stdout + dry.stderr)[-300:]}")
+
+        started = time.monotonic()
+        run = subprocess.run(command, cwd=_ROOT, capture_output=True, text=True,
+                             timeout=args.timeout_min * 60)
+        output = (run.stdout + run.stderr).splitlines()
+        print("\n".join(output[-60:]))
+        metrics.update(exit_code=run.returncode, wall_seconds=round(time.monotonic() - started, 1))
+        if run.returncode != 0:
+            problems.append(f"cli.py exited {run.returncode}")
+        books = [f for f in os.listdir(work) if f.endswith(".m4b")] if os.path.isdir(work) else []
+        metrics["output_files"] = books
+        if len(books) != 1:
+            problems.append(f"expected one .m4b, found {books}")
+        else:
+            probe = json.loads(subprocess.run(
+                ["ffprobe", "-v", "error", "-show_chapters", "-show_format", "-of", "json",
+                 os.path.join(work, books[0])], capture_output=True, text=True, check=True).stdout)
+            metrics["chapter_markers"] = [c.get("tags", {}).get("title", "") for c in probe.get("chapters", [])]
+            metrics["duration_seconds"] = round(float(probe["format"].get("duration", 0)), 1)
+            if len(metrics["chapter_markers"]) < 2:
+                problems.append("combined file has fewer than two chapter markers")
+            samples_dir = os.path.join(RESULTS_DIR, "samples")
+            os.makedirs(samples_dir, exist_ok=True)
+            shutil.copyfile(os.path.join(work, books[0]), os.path.join(samples_dir, f"{tag}.m4b"))
+
+        # A second run of a finished book must do nothing and still succeed.
+        rerun = subprocess.run(command, cwd=_ROOT, capture_output=True, text=True, timeout=1200)
+        metrics["rerun_exit"] = rerun.returncode
+        metrics["rerun_skipped"] = "Already complete" in (rerun.stdout + rerun.stderr)
+        if rerun.returncode != 0 or not metrics["rerun_skipped"]:
+            problems.append("re-running a finished book did not skip cleanly")
+
+        _write_result(tag, "pass" if not problems else "fail", metrics,
+                      error="; ".join(problems), log_tail=output)
+    _guarded(tag, body)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Report
 # ══════════════════════════════════════════════════════════════════════════════
@@ -996,6 +1066,13 @@ def main() -> None:
     book.add_argument("--max-chapters", type=int, default=3)
     book.add_argument("--max-paragraphs", type=int, default=3)
     book.set_defaults(handler=cmd_book)
+
+    cli = sub.add_parser("cli")
+    _add_synthesis_args(cli)
+    cli.add_argument("--book", default="")
+    cli.add_argument("--chapters", default="1-2")
+    cli.add_argument("--timeout-min", type=float, default=45.0)
+    cli.set_defaults(handler=cmd_cli)
 
     args = parser.parse_args()
     if getattr(args, "keep_work_dir", ""):
