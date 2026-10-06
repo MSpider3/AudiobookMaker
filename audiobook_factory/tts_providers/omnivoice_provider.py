@@ -20,7 +20,18 @@ upstream calls used here are:
 * ``OmniVoice.create_voice_clone_prompt(ref_audio=path, ref_text=...,
   preprocess_prompt=...)`` which returns a reusable ``VoiceClonePrompt``
 * ``OmniVoice.load_asr_model(model_name=..., device=...)`` (Whisper)
-* ``VoiceClonePrompt.save(path)`` / ``VoiceClonePrompt.load(path)``
+* ``VoiceClonePrompt.save(path)`` and the ``VoiceClonePrompt(...)`` constructor
+
+Saved prompts (``config.voice_preset`` files and the voice cache) are read
+back with ``torch.load(weights_only=True)`` and rebuilt field by field here
+rather than through ``VoiceClonePrompt.load``. Upstream 0.2.1 loads the same
+way, but a preset is a file the user picks, so the provider guarantees it is
+never unpickled whatever upstream version is installed, and it checks the
+tokens fit the loaded model before they reach ``generate``.
+
+Voice Studio entry points: ``design_voice`` returns the designed narrator clip
+for auditioning, ``save_voice_preset`` writes the conditioned voice with
+``VoiceClonePrompt.save`` and ``load_voice_preset`` validates such a file.
 
 How the narrator voice is resolved (first match wins)
 -----------------------------------------------------
@@ -59,6 +70,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -120,6 +132,9 @@ _VOICE_CACHE_DIR_NAME: str = ".omnivoice_voices"
 _VOICE_CACHE_FALLBACK_DIR_NAME: str = "abm_omnivoice_voices"
 _PROMPT_FILE_SUFFIXES: tuple[str, ...] = (".pt", ".pth")
 _PROMPT_CACHE_MAX: int = 4
+# Layout written by upstream's VoiceClonePrompt.save():
+# {"format_version": 1, "ref_audio_tokens": LongTensor(C, T), "ref_text": str, "ref_rms": float}
+_PROMPT_FORMAT_VERSION: int = 1
 _FILE_LOCK_TIMEOUT_S: float = 900.0
 _MIN_VOICE_BYTES: int = 100
 
@@ -304,6 +319,7 @@ class OmniVoiceProvider(BaseTTSProvider):
         supports_batch=True,
         supports_speed=True,
         supports_seed=True,
+        supports_voice_preset=True,
         preset_voices=(),
         options=(
             ProviderOption(
@@ -510,7 +526,7 @@ class OmniVoiceProvider(BaseTTSProvider):
                 message = f"OmniVoice {reason}. Install it with: {_INSTALL_COMMAND}"
                 logger.error("[OmniVoice] %s", message)
                 raise RuntimeError(message) from exc
-            if not hasattr(VoiceClonePrompt, "load") or not hasattr(VoiceClonePrompt, "save"):
+            if not hasattr(VoiceClonePrompt, "save"):
                 raise RuntimeError(
                     "The installed OmniVoice is too old (it cannot save voice prompts). "
                     f"Upgrade it with: {_INSTALL_COMMAND}"
@@ -610,13 +626,20 @@ class OmniVoiceProvider(BaseTTSProvider):
             )
         return str(declared.default)
 
-    def _language(self, model_id: str) -> str | None:
-        """Language name or id handed to upstream; ``None`` is language-agnostic."""
+    def _language(self, model_id: str, override: str | None = None) -> str | None:
+        """Language name or id handed to upstream; ``None`` is language-agnostic.
+
+        *override* replaces the configured language (``language_id`` option,
+        then ``config.language``).
+        """
         if model_id == _EMILIA_MODEL:
             return None
-        raw = str(self.option("language_id", "") or "").strip()
-        if not raw:
-            raw = str(getattr(self.config, "language", "") or "").strip()
+        if override is not None:
+            raw = str(override).strip()
+        else:
+            raw = str(self.option("language_id", "") or "").strip()
+            if not raw:
+                raw = str(getattr(self.config, "language", "") or "").strip()
         key = raw.lower()
         if key in _LANGUAGE_ALIASES:
             return _LANGUAGE_ALIASES[key]
@@ -806,15 +829,23 @@ class OmniVoiceProvider(BaseTTSProvider):
                     audios.extend(self._generate(model, [text], prompt))
         return audios
 
-    @staticmethod
-    def _seed_torch(seed: int) -> None:
-        """Seeds torch's RNGs with *seed*; a negative seed leaves them random."""
+    def _seed_torch(self, seed: int) -> None:
+        """Seeds torch's RNGs for this device; a negative seed leaves them random.
+
+        Like ``seed_everything`` it reseeds only this instance's GPU, so the
+        other GPU's worker is not disturbed mid-generation.
+        """
         if seed < 0:
             return
         import torch
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        if self._device.startswith("cuda") and torch.cuda.is_available():
+            try:
+                index = int(self._device.split(":")[1]) if ":" in self._device else torch.cuda.current_device()
+                with torch.cuda.device(index):
+                    torch.cuda.manual_seed(seed)
+            except Exception as exc:
+                logger.debug("[OmniVoice] Could not seed %s: %s", self._device, exc)
 
     @contextlib.contextmanager
     def _decoding_guard(self) -> Iterator[None]:
@@ -919,15 +950,86 @@ class OmniVoiceProvider(BaseTTSProvider):
         return FileLock(path, timeout=_FILE_LOCK_TIMEOUT_S)
 
     @staticmethod
-    def _load_prompt_file(path: str) -> Any:
-        """Loads a saved ``VoiceClonePrompt``; ``None`` when absent or unreadable."""
+    def _read_prompt_file(path: str) -> Any:
+        """Reads a file written by ``VoiceClonePrompt.save`` without unpickling.
+
+        The file is loaded with ``weights_only=True`` (tensors and plain values
+        only), checked field by field and rebuilt into a ``VoiceClonePrompt``.
+
+        Raises
+        ------
+        ValueError
+            If the file is missing or is not a valid saved voice prompt.
+        """
+        import torch
+        from omnivoice import VoiceClonePrompt
+
+        if not os.path.isfile(path):
+            raise ValueError(f"OmniVoice voice preset not found: {path}")
+        try:
+            data = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            raise ValueError(f"{path} is not an OmniVoice voice preset: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} is not an OmniVoice voice preset (unexpected content).")
+        version = data.get("format_version")
+        if version != _PROMPT_FORMAT_VERSION:
+            raise ValueError(
+                f"{path} uses voice preset format {version!r}; this provider reads "
+                f"format {_PROMPT_FORMAT_VERSION}."
+            )
+        tokens = data.get("ref_audio_tokens")
+        if (
+            not isinstance(tokens, torch.Tensor) or tokens.dim() != 2 or tokens.numel() == 0
+            or tokens.is_floating_point() or tokens.is_complex() or tokens.dtype == torch.bool
+        ):
+            raise ValueError(f"{path} holds no usable reference audio tokens.")
+        ref_text = data.get("ref_text")
+        if not isinstance(ref_text, str) or not ref_text.strip():
+            raise ValueError(f"{path} holds no reference transcript.")
+        try:
+            ref_rms = float(data.get("ref_rms"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path} holds no reference loudness.") from exc
+        if not math.isfinite(ref_rms) or ref_rms <= 0:
+            raise ValueError(f"{path} holds an invalid reference loudness ({ref_rms}).")
+        return VoiceClonePrompt(ref_audio_tokens=tokens.long(), ref_text=ref_text, ref_rms=ref_rms)
+
+    def _fit_prompt(self, model: Any, prompt: Any, path: str) -> Any:
+        """Checks a loaded prompt against the model and moves it to its device.
+
+        Raises
+        ------
+        ValueError
+            If the tokens were made for a different codec layout.
+        """
+        tokens = prompt.ref_audio_tokens
+        model_config = getattr(model, "config", None)
+        codebooks = getattr(model_config, "num_audio_codebook", None)
+        if codebooks is not None and int(tokens.shape[0]) != int(codebooks):
+            raise ValueError(
+                f"{path} has {int(tokens.shape[0])} audio codebooks but "
+                f"{self.resolve_model_id()} uses {int(codebooks)}."
+            )
+        vocab = getattr(model_config, "audio_vocab_size", None)
+        if vocab is not None and (int(tokens.min()) < 0 or int(tokens.max()) >= int(vocab)):
+            raise ValueError(f"{path} contains audio tokens outside the model's vocabulary.")
+        device = getattr(model, "device", None)
+        if device is not None:
+            try:
+                prompt.ref_audio_tokens = tokens.to(device)
+            except Exception as exc:  # generate() moves them per call anyway
+                logger.debug("[OmniVoice] Could not move voice prompt to %s: %s", device, exc)
+        return prompt
+
+    def _load_prompt_file(self, model: Any, path: str) -> Any:
+        """Loads a cached prompt; ``None`` when it is absent or unusable."""
         if not os.path.isfile(path):
             return None
-        from omnivoice import VoiceClonePrompt
         try:
-            return VoiceClonePrompt.load(path)
-        except Exception as exc:
-            logger.warning("[OmniVoice] Ignoring unreadable voice file %s: %s", path, exc)
+            return self._fit_prompt(model, self._read_prompt_file(path), path)
+        except ValueError as exc:
+            logger.warning("[OmniVoice] Ignoring unusable voice file: %s", exc)
             return None
 
     @staticmethod
@@ -944,30 +1046,56 @@ class OmniVoiceProvider(BaseTTSProvider):
                 except OSError:
                     pass
 
-    def _load_or_build(self, cache_path: str, build: Callable[[], Any], must_persist: bool) -> Any:
+    @staticmethod
+    def _disk_key(kind: str, path: str) -> tuple:
+        """In-memory cache key of a disk-backed prompt, tied to the file's state.
+
+        Another instance re-rolling the voice, or the user deleting the file,
+        changes the key, so a stale in-memory copy is never used.
+        """
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return (kind, path, 0, 0)
+        return (kind, path, stat.st_size, stat.st_mtime_ns)
+
+    def _disk_prompt(
+        self,
+        model: Any,
+        kind: str,
+        cache_path: str,
+        build: Callable[[], Any],
+        must_persist: bool,
+        force: bool = False,
+    ) -> Any:
         """Returns the voice stored at *cache_path*, building it once if absent.
 
         The check and the build run under a process-wide lock and a file lock,
         so of several instances asking for the same voice exactly one creates
-        it and the others load the identical result.
+        it and the others load the identical result. *force* rebuilds and
+        overwrites it.
         """
+        if not force:
+            cached = self._cache_get(self._disk_key(kind, cache_path))
+            if cached is not None:
+                return cached
         with _VOICE_CACHE_LOCK, self._file_lock(cache_path + ".lock"):
-            prompt = self._load_prompt_file(cache_path)
+            prompt = None if force else self._load_prompt_file(model, cache_path)
             if prompt is not None:
                 logger.info("[OmniVoice] Reusing saved voice %s on %s.", cache_path, self._device)
-                return prompt
-            prompt = build()
-            try:
-                self._save_prompt_file(prompt, cache_path)
-            except Exception as exc:
-                if must_persist:
-                    raise RuntimeError(
-                        f"OmniVoice could not save the designed voice to {cache_path}: {exc}. "
-                        "Without it every GPU would narrate in a different voice; set the "
-                        "'voice_cache_dir' option to a writable folder."
-                    ) from exc
-                logger.warning("[OmniVoice] Could not save voice file %s: %s", cache_path, exc)
-            return prompt
+            else:
+                prompt = build()
+                try:
+                    self._save_prompt_file(prompt, cache_path)
+                except Exception as exc:
+                    if must_persist:
+                        raise RuntimeError(
+                            f"OmniVoice could not save the designed voice to {cache_path}: {exc}. "
+                            "Without it every GPU would narrate in a different voice; set the "
+                            "'voice_cache_dir' option to a writable folder."
+                        ) from exc
+                    logger.warning("[OmniVoice] Could not save voice file %s: %s", cache_path, exc)
+            return self._cache_put(self._disk_key(kind, cache_path), prompt)
 
     def _create_prompt(self, model: Any, path: str, transcript: str | None, preprocess: bool) -> Any:
         """Encodes a reference clip into a reusable ``VoiceClonePrompt``."""
@@ -1008,7 +1136,10 @@ class OmniVoiceProvider(BaseTTSProvider):
             if not os.path.isfile(preset):
                 raise RuntimeError(f"OmniVoice voice preset not found: {preset}")
             if preset.lower().endswith(_PROMPT_FILE_SUFFIXES):
-                return self._preset_prompt(preset)
+                try:
+                    return self._preset_prompt(model, preset)
+                except ValueError as exc:
+                    raise RuntimeError(str(exc)) from exc
             voice_path: str | None = preset
         else:
             voice_path = self._voice_path(voice_ref)
@@ -1027,19 +1158,19 @@ class OmniVoiceProvider(BaseTTSProvider):
             raise RuntimeError(f"OmniVoice voice reference not found: {path}")
         return path
 
-    def _preset_prompt(self, preset: str) -> Any:
-        """Loads a saved ``VoiceClonePrompt`` preset."""
-        stat = os.stat(preset)
-        key = ("preset", preset, stat.st_size, stat.st_mtime_ns)
+    def _preset_prompt(self, model: Any, preset: str) -> Any:
+        """Loads and validates a saved ``VoiceClonePrompt`` preset.
+
+        Raises
+        ------
+        ValueError
+            If the file is not a preset this model can use.
+        """
+        key = self._disk_key("preset", preset)
         cached = self._cache_get(key)
         if cached is not None:
             return cached
-        prompt = self._load_prompt_file(preset)
-        if prompt is None:
-            raise RuntimeError(
-                f"OmniVoice could not load the voice preset {preset}; it must be a file "
-                "written by VoiceClonePrompt.save()."
-            )
+        prompt = self._fit_prompt(model, self._read_prompt_file(preset), preset)
         logger.info("[OmniVoice] Loaded voice preset %s on %s.", preset, self._device)
         return self._cache_put(key, prompt)
 
@@ -1059,10 +1190,13 @@ class OmniVoiceProvider(BaseTTSProvider):
                 logger.debug("[OmniVoice] Could not read %s: %s", voice_file, exc)
         return ""
 
-    def _clone_prompt(self, model: Any, path: str) -> Any:
-        """Voice prompt for a reference clip, encoded once per clip and transcript."""
+    def _clone_prompt(self, model: Any, path: str, transcript: str | None = None) -> Any:
+        """Voice prompt for a reference clip, encoded once per clip and transcript.
+
+        *transcript* overrides the configured transcript and auto-transcription.
+        """
         digest = self._file_digest(path)
-        transcript = self._transcript_for(path, digest)
+        transcript = (transcript or "").strip() or self._transcript_for(path, digest)
         preprocess = bool(self.option("preprocess_prompt", True))
 
         if transcript:
@@ -1087,16 +1221,11 @@ class OmniVoiceProvider(BaseTTSProvider):
             self._voice_cache_dir(),
             "clone_" + _stable_hash("clone-asr", digest, self.resolve_model_id(), asr_model, preprocess) + ".pt",
         )
-        key = ("clone-asr", cache_path)
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
-        prompt = self._load_or_build(
-            cache_path,
+        return self._disk_prompt(
+            model, "clone-asr", cache_path,
             lambda: self._transcribe_and_create(model, path, asr_model, preprocess),
             must_persist=False,
         )
-        return self._cache_put(key, prompt)
 
     def _transcribe_and_create(self, model: Any, path: str, asr_model: str, preprocess: bool) -> Any:
         """Transcribes the clip with Whisper once, then drops the ASR model."""
@@ -1138,9 +1267,9 @@ class OmniVoiceProvider(BaseTTSProvider):
             model._asr_pipe = None
             self._free_cuda_memory()
 
-    def _design_text(self, language: str | None, texts: list[str]) -> str:
-        """Sentence spoken to create a designed voice."""
-        explicit = str(self.option("design_text", "") or "").strip()
+    @staticmethod
+    def _design_text(language: str | None, texts: list[str], explicit: str) -> str:
+        """Sentence spoken to create a designed voice; ``""`` when none is available."""
         if explicit:
             return explicit
         key = (language or "").lower()
@@ -1150,9 +1279,7 @@ class OmniVoiceProvider(BaseTTSProvider):
             return _DESIGN_TEXTS["zh"]
         # Any other language: the book's own opening words are in the right language.
         excerpt = _leading_excerpt(texts)
-        if not excerpt:
-            return _DESIGN_TEXTS["en"]
-        if _text_weight(excerpt) >= _DESIGN_TEXT_MIN_WEIGHT:
+        if not excerpt or _text_weight(excerpt) >= _DESIGN_TEXT_MIN_WEIGHT:
             return excerpt
         # The model is unreliable on 1-2 s utterances without a reference, so a
         # very short opening ("Chapter one") is repeated up to about 3 s.
@@ -1163,20 +1290,26 @@ class OmniVoiceProvider(BaseTTSProvider):
             design_text = f"{design_text} {excerpt}"
         return design_text
 
-    def _designed_prompt(self, model: Any, texts: list[str]) -> Any:
-        """Voice prompt for a book with no reference clip.
+    def _design_spec(
+        self,
+        instruct: str | None = None,
+        language: str | None = None,
+        text: str | None = None,
+    ) -> dict[str, Any]:
+        """Identity of a designed voice and where it is cached.
 
-        The voice is designed once per (instruct, language, voice seed, model)
-        and then cloned for every chunk, by every instance. ``config.seed`` is
-        deliberately not part of that identity: the pipeline changes it to
-        re-take a rejected chunk, which must not change the narrator.
+        Arguments override ``config.tts_instruct``, the configured language
+        and the ``design_text`` option. ``config.seed`` is deliberately not
+        part of the identity: the pipeline changes it to re-take a rejected
+        chunk, which must not change the narrator. The ``voice_seed`` option is.
         """
         model_id = self.resolve_model_id()
-        instruct = self._instruct()
-        language = self._language(model_id)
+        if instruct is None:
+            instruct = getattr(self.config, "tts_instruct", "") or ""
+        instruct = instruct.strip() or None
+        language = self._language(model_id, override=language)
         seed = max(-1, int(self._bounded("voice_seed")))
-        explicit_text = str(self.option("design_text", "") or "").strip()
-
+        explicit_text = (text if text is not None else str(self.option("design_text", "") or "")).strip()
         cache_path = os.path.join(
             self._voice_cache_dir(),
             "design_" + _stable_hash(
@@ -1184,17 +1317,38 @@ class OmniVoiceProvider(BaseTTSProvider):
                 seed, model_id, explicit_text,
             ) + ".pt",
         )
-        key = ("design", cache_path)
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
-        design_text = self._design_text(language, texts)
-        prompt = self._load_or_build(
-            cache_path,
-            lambda: self._design_voice(model, cache_path, design_text, instruct, language, seed),
-            must_persist=True,
-        )
-        return self._cache_put(key, prompt)
+        return {
+            "model_id": model_id, "instruct": instruct, "language": language, "seed": seed,
+            "text": explicit_text, "cache_path": cache_path,
+        }
+
+    def _designed_prompt(
+        self,
+        model: Any,
+        texts: list[str],
+        spec: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> Any:
+        """Voice prompt for a book with no reference clip.
+
+        The voice is designed once per (instruct, language, voice seed, model)
+        and then cloned for every chunk, by every instance.
+        """
+        spec = spec or self._design_spec()
+
+        def build() -> Any:
+            design_text = self._design_text(spec["language"], texts, spec["text"])
+            if not design_text:
+                raise ValueError(
+                    f"OmniVoice has no built-in voice design sentence for language "
+                    f"{spec['language']!r}: pass a sentence in that language (the 'text' "
+                    "argument or the 'design_text' option)."
+                )
+            return self._design_voice(
+                model, spec["cache_path"], design_text, spec["instruct"], spec["language"], spec["seed"],
+            )
+
+        return self._disk_prompt(model, "design", spec["cache_path"], build, must_persist=True, force=force)
 
     def _design_voice(
         self,
@@ -1261,6 +1415,187 @@ class OmniVoiceProvider(BaseTTSProvider):
             "delete the file.", cache_path, wav_path,
         )
         return prompt
+
+    # ── Voice Studio: audition, save and load a voice ────────────────────────
+
+    def design_voice(
+        self,
+        instruct: str | None = None,
+        text: str | None = None,
+        language: str | None = None,
+        *,
+        force: bool = False,
+    ) -> tuple[bytes, int, str]:
+        """Creates (or fetches) the designed narrator clip for auditioning.
+
+        The clip is the one a book run with the same style, language,
+        ``voice_seed`` and design sentence clones, taken from the same on-disk
+        voice cache, so what the user hears is what the audiobook gets.
+
+        Parameters
+        ----------
+        instruct : str | None
+            Voice attribute tags; defaults to ``config.tts_instruct``. Empty
+            lets the model choose a voice.
+        text : str | None
+            Sentence to speak; defaults to the ``design_text`` option, then a
+            built-in sentence (English and Chinese only).
+        language : str | None
+            Target language name or id; defaults to the configured language.
+        force : bool
+            Design the voice again and replace the cached one (a re-roll when
+            the seed is random).
+
+        Returns
+        -------
+        tuple[bytes, int, str]
+            ``(wav_bytes, sample_rate, text_spoken)``. Pass the bytes and the
+            text to :meth:`save_voice_preset` to keep the voice.
+
+        Raises
+        ------
+        ValueError
+            If no sentence is available for the language.
+        RuntimeError
+            If the voice cannot be designed.
+        """
+        import soundfile as sf
+
+        with self._lock:
+            self._ensure_initialised()
+            model = self._model
+            self.bind_device()
+            spec = self._design_spec(instruct, language, text)
+            prompt = self._designed_prompt(model, [], spec, force=force)
+            stem = spec["cache_path"][: -len(".pt")]
+            wav_path = stem + ".wav"
+            if not os.path.isfile(wav_path):
+                raise RuntimeError(
+                    f"The audition clip of the designed voice is missing ({wav_path}); "
+                    "call design_voice(force=True) to design the voice again."
+                )
+            with open(wav_path, "rb") as fh:
+                wav_bytes = fh.read()
+            sample_rate = int(sf.info(wav_path).samplerate)
+            spoken = ""
+            try:
+                with open(stem + ".json", encoding="utf-8") as fh:
+                    spoken = str(json.load(fh).get("text") or "")
+            except (OSError, ValueError, AttributeError) as exc:
+                logger.debug("[OmniVoice] No voice description next to %s: %s", wav_path, exc)
+            spoken = spoken or str(getattr(prompt, "ref_text", "") or "")
+        return wav_bytes, sample_rate, spoken
+
+    def _describe_prompt(self, model: Any, prompt: Any, path: str, mode: str) -> dict[str, Any]:
+        """JSON-safe description of a voice prompt."""
+        tokens = prompt.ref_audio_tokens
+        return {
+            "path": path,
+            "provider": self.info().name,
+            "format": "omnivoice.VoiceClonePrompt",
+            "format_version": _PROMPT_FORMAT_VERSION,
+            "mode": mode,
+            "model_id": self.resolve_model_id(),
+            "ref_text": str(prompt.ref_text),
+            "ref_seconds": round(self._prompt_seconds(model, prompt), 3),
+            "ref_frames": int(tokens.shape[-1]),
+            "num_codebooks": int(tokens.shape[0]),
+            "ref_rms": float(prompt.ref_rms),
+            "sample_rate": int(getattr(model, "sampling_rate", 0) or _NATIVE_SAMPLE_RATE),
+        }
+
+    def save_voice_preset(
+        self,
+        path: str,
+        voice_ref: str | bytes | None = None,
+        *,
+        transcript: str | None = None,
+    ) -> dict[str, Any]:
+        """Saves the conditioned narrator voice as a reusable preset file.
+
+        The file is written by upstream's ``VoiceClonePrompt.save``: the
+        reference audio tokens, the reference transcript and its loudness.
+        Set ``config.voice_preset`` to it and later runs need neither the
+        clip nor a transcription.
+
+        Parameters
+        ----------
+        path : str
+            Destination file; use a ``.pt`` name so ``config.voice_preset``
+            recognises it.
+        voice_ref : str | bytes | None
+            Reference clip (path or audio bytes); defaults to
+            ``config.voice_file``. With no clip at all the designed voice
+            (``config.tts_instruct``) is saved.
+        transcript : str | None
+            Transcript of the clip; defaults to ``config.voice_transcript``,
+            a sidecar ``.txt``, then a one-off Whisper transcription.
+
+        Returns
+        -------
+        dict[str, Any]
+            ``path``, ``mode`` (``"clone"`` or ``"design"``), ``ref_text``,
+            ``model_id`` and the prompt's size.
+
+        Raises
+        ------
+        ValueError
+            If *path* is empty, or a voice has to be designed and no sentence
+            is available for the language.
+        RuntimeError
+            If the voice cannot be prepared or the file cannot be written.
+        """
+        if not path or not str(path).strip():
+            raise ValueError("save_voice_preset needs a destination path.")
+        path = str(path)
+        with self._lock:
+            self._ensure_initialised()
+            model = self._model
+            self.bind_device()
+            voice_path = self._voice_path(voice_ref)
+            if voice_path:
+                mode = "clone"
+                prompt = self._clone_prompt(model, voice_path, transcript=transcript)
+            else:
+                mode = "design"
+                prompt = self._designed_prompt(model, [])
+            try:
+                directory = os.path.dirname(path)
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
+                self._save_prompt_file(prompt, path)
+            except Exception as exc:
+                raise RuntimeError(f"OmniVoice could not write the voice preset {path}: {exc}") from exc
+            info = self._describe_prompt(model, prompt, path, mode)
+        logger.info("[OmniVoice] Saved %s voice preset to %s.", mode, path)
+        return info
+
+    def load_voice_preset(self, path: str) -> dict[str, Any]:
+        """Loads a preset onto this instance's device and checks it fits the model.
+
+        Synthesis does this by itself when ``config.voice_preset`` is set;
+        call it directly to validate a file the user picked. The file is read
+        with ``torch.load(weights_only=True)``, never unpickled.
+
+        Returns
+        -------
+        dict[str, Any]
+            The same description :meth:`save_voice_preset` returns. ``mode``
+            is ``"unknown"``: upstream's file format does not record whether
+            the voice was cloned or designed.
+
+        Raises
+        ------
+        ValueError
+            If the file is missing, is not a saved voice prompt, or was made
+            for a different codec layout.
+        """
+        with self._lock:
+            self._ensure_initialised()
+            model = self._model
+            self.bind_device()
+            prompt = self._preset_prompt(model, str(path))
+            return self._describe_prompt(model, prompt, str(path), "unknown")
 
     # ── Teardown ─────────────────────────────────────────────────────────────
 

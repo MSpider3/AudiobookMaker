@@ -90,6 +90,8 @@ class FakeOmniVoice:
         self.name = name
         self.load_kwargs = load_kwargs
         self.sampling_rate = _SAMPLE_RATE
+        # OmniVoiceConfig defaults (models/omnivoice.py:247-267).
+        self.config = types.SimpleNamespace(num_audio_codebook=8, audio_vocab_size=1025, audio_mask_id=1024)
         self._asr_pipe = None
         self._asr_model_name = "openai/whisper-large-v3-turbo"
         self.generate_calls: list[dict] = []
@@ -224,6 +226,10 @@ def test_info_is_complete_and_flags_non_commercial_weights():
     assert info.supports_voice_clone and info.supports_instruct
     assert info.supports_batch and info.supports_speed and info.supports_seed
     assert info.preset_voices == ()
+    assert info.supports_voice_preset is True
+    # No shared sampling field (temperature, top_p, ...) is mapped, so there is
+    # no upstream operating point to recommend for them.
+    assert info.recommended_settings == {}
     assert info.pip_requirements == ("omnivoice>=0.2.1",)
     assert "transformers>=5.3.0" in info.install_notes
 
@@ -889,3 +895,210 @@ def test_flashinfer_missing_module_raises_a_clear_error(fake_omnivoice, config, 
     with pytest.raises(RuntimeError, match="flashinfer"):
         provider.ensure_ready()
     assert provider.is_ready is False
+
+
+# ── Voice presets ─────────────────────────────────────────────────────────────
+
+
+def test_save_voice_preset_round_trips_through_config_voice_preset(fake_omnivoice, config, voice_bytes, tmp_path):
+    clip = tmp_path / "narrator.wav"
+    clip.write_bytes(voice_bytes)
+    config.voice_file = str(clip)
+    config.voice_transcript = "Reference words."
+    saver = _provider(config, device="cuda:0")
+    saver.synthesize_batch(["Warm up."], voice_bytes)
+
+    preset = str(tmp_path / "presets" / "narrator.pt")
+    info = saver.save_voice_preset(preset)  # defaults: config.voice_file + config.voice_transcript
+    assert json.loads(json.dumps(info)) == info  # JSON-safe
+    assert info["path"] == preset and info["mode"] == "clone"
+    assert info["ref_text"] == "Reference words." and info["model_id"] == "k2-fsa/OmniVoice"
+    assert info["num_codebooks"] == 8 and info["ref_frames"] == 50 and info["ref_seconds"] == 2.0
+    assert os.path.isfile(preset)
+    # The prompt already encoded for synthesis was reused, not rebuilt.
+    assert len(_model().prompt_calls) == 1
+    saved = _model().generate_calls[-1]["voice_clone_prompt"]
+
+    # A new instance needs neither the clip nor a transcript any more.
+    loader = _provider(AudiobookConfig(output_dir=config.output_dir, voice_preset=preset), device="cuda:1")
+    loader.synthesize_batch(["One.", "Two."], b"")
+    model = _model()
+    assert model.prompt_calls == [] and model.asr_loads == [] and _design_calls(model) == []
+    used = model.generate_calls[-1]["voice_clone_prompt"]
+    assert isinstance(used, FakeVoiceClonePrompt)
+    assert torch.equal(used.ref_audio_tokens, saved.ref_audio_tokens)
+    assert used.ref_text == saved.ref_text and used.ref_rms == pytest.approx(saved.ref_rms)
+
+    described = loader.load_voice_preset(preset)
+    assert described["path"] == preset and described["ref_text"] == "Reference words."
+    assert described["model_id"] == "k2-fsa/OmniVoice" and described["mode"] == "unknown"
+    assert {k: v for k, v in described.items() if k != "mode"} == {k: v for k, v in info.items() if k != "mode"}
+    assert json.loads(json.dumps(described)) == described
+
+
+def test_save_voice_preset_takes_an_explicit_clip_and_transcript(fake_omnivoice, config, voice_bytes, tmp_path):
+    config.voice_transcript = "Configured transcript."
+    provider = _provider(config)
+    preset = str(tmp_path / "narrator.pt")
+    info = provider.save_voice_preset(preset, voice_bytes, transcript="Explicit transcript.")
+    assert info["mode"] == "clone" and info["ref_text"] == "Explicit transcript."
+    assert _model().prompt_calls[0]["ref_text"] == "Explicit transcript."
+    assert _model().asr_loads == []
+    with pytest.raises(ValueError, match="destination path"):
+        provider.save_voice_preset("", voice_bytes)
+
+
+def test_save_voice_preset_without_a_clip_saves_the_designed_voice(fake_omnivoice, config, tmp_path):
+    config.tts_instruct = "female, low pitch"
+    provider = _provider(config)
+    provider.synthesize_batch(["Chunk one."], b"")
+    narrator = _model().generate_calls[-1]["voice_clone_prompt"]
+
+    preset = str(tmp_path / "designed.pt")
+    info = provider.save_voice_preset(preset)
+    assert info["mode"] == "design" and info["ref_text"] == ov._DESIGN_TEXTS["en"]
+    assert len(_design_calls(_model())) == 1  # the book's voice, not a new one
+
+    loader = _provider(AudiobookConfig(output_dir=str(tmp_path / "elsewhere"), voice_preset=preset))
+    loader.synthesize("Chunk two.", b"", return_bytes=True)
+    assert _design_calls(_model()) == []
+    assert torch.equal(_model().generate_calls[-1]["voice_clone_prompt"].ref_audio_tokens, narrator.ref_audio_tokens)
+
+
+class _NotATensor:
+    """An arbitrary object: pickling it into a preset must not be loadable."""
+
+
+def test_load_voice_preset_rejects_files_that_are_not_presets(fake_omnivoice, config, tmp_path):
+    provider = _provider(config)
+
+    def write(name: str, payload) -> str:
+        path = str(tmp_path / name)
+        torch.save(payload, path)
+        return path
+
+    good = {"format_version": 1, "ref_audio_tokens": torch.zeros((8, 20), dtype=torch.long),
+            "ref_text": "Words.", "ref_rms": 0.1}
+    assert provider.load_voice_preset(write("good.pt", good))["ref_frames"] == 20
+
+    garbage = tmp_path / "garbage.pt"
+    garbage.write_bytes(b"this is not a torch file")
+    cases = {
+        str(tmp_path / "missing.pt"): "not found",
+        str(garbage): "not an OmniVoice voice preset",
+        # weights_only=True refuses to unpickle arbitrary classes.
+        write("object.pt", {**good, "ref_text": _NotATensor()}): "not an OmniVoice voice preset",
+        write("list.pt", [1, 2, 3]): "unexpected content",
+        write("version.pt", {**good, "format_version": 2}): "format 2",
+        write("float.pt", {**good, "ref_audio_tokens": torch.zeros((8, 20))}): "no usable reference audio tokens",
+        write("text.pt", {**good, "ref_text": "  "}): "no reference transcript",
+        write("rms.pt", {**good, "ref_rms": float("nan")}): "invalid reference loudness",
+        write("codebooks.pt", {**good, "ref_audio_tokens": torch.zeros((4, 20), dtype=torch.long)}): "4 audio codebooks",
+        write("vocab.pt", {**good, "ref_audio_tokens": torch.full((8, 20), 5000)}): "outside the model's vocabulary",
+    }
+    for path, message in cases.items():
+        with pytest.raises(ValueError, match=message):
+            provider.load_voice_preset(path)
+
+    # The same file set as config.voice_preset fails the run instead of being ignored.
+    provider.config.voice_preset = str(garbage)
+    with pytest.raises(RuntimeError, match="not an OmniVoice voice preset"):
+        provider.synthesize("Hello.", b"", return_bytes=True)
+    assert _model().generate_calls == []
+
+
+# ── design_voice ──────────────────────────────────────────────────────────────
+
+
+def test_design_voice_returns_the_clip_the_book_will_clone(fake_omnivoice, config):
+    config.tts_instruct = "female, low pitch"
+    studio = _provider(config, device="cuda:0")
+    wav, sample_rate, spoken = studio.design_voice()
+
+    assert sample_rate == _SAMPLE_RATE and spoken == ov._DESIGN_TEXTS["en"]
+    audio, read_rate = sf.read(io.BytesIO(wav), dtype="float32")
+    assert read_rate == _SAMPLE_RATE and len(audio) == len(_waveform(spoken))
+    design = _design_calls(_model())
+    assert len(design) == 1 and design[0]["instruct"] == "female, low pitch"
+    assert design[0]["language"] == "English" and design[0]["text"] == [spoken]
+
+    # Cached: asking again, on this instance or another, returns the same clip.
+    assert studio.design_voice() == (wav, sample_rate, spoken)
+    assert len(_design_calls(_model())) == 1
+    other = _provider(config, device="cuda:1")
+    assert other.design_voice() == (wav, sample_rate, spoken)
+    assert _design_calls(_model()) == [] and _model().prompt_calls == []
+
+    # The book narrates with exactly that voice: no second design, and the
+    # clip that was encoded is the clip that was auditioned.
+    other.synthesize_batch(["Chunk one.", "Chunk two."], b"")
+    assert _design_calls(_model()) == []
+    encoded = FakeOmniVoice.instances[0].prompt_calls[0]
+    with open(encoded["ref_audio"], "rb") as fh:
+        assert fh.read() == wav
+    assert encoded["ref_text"] == spoken
+    assert torch.equal(
+        _model().generate_calls[-1]["voice_clone_prompt"].ref_audio_tokens,
+        torch.full((8, 50), 1, dtype=torch.long),
+    )
+
+
+def test_design_voice_arguments_override_the_config(fake_omnivoice, config):
+    config.tts_instruct = "female"
+    provider = _provider(config)
+    wav, _, spoken = provider.design_voice("male, elderly", "A sentence chosen in the studio.", "German")
+    call = _design_calls(_model())[-1]
+    assert call["instruct"] == "male, elderly" and call["language"] == "German"
+    assert call["text"] == ["A sentence chosen in the studio."] and spoken == "A sentence chosen in the studio."
+    assert provider.design_voice("male, elderly", "A sentence chosen in the studio.", "German")[0] == wav
+    assert len(_design_calls(_model())) == 1
+
+    # A different voice is a different cache entry.
+    provider.design_voice()
+    assert len(_design_calls(_model())) == 2
+    assert _design_calls(_model())[-1]["instruct"] == "female"
+
+
+def test_design_voice_force_re_rolls_for_every_instance(fake_omnivoice, config):
+    config.tts_instruct = "male"
+    first = _provider(config, device="cuda:0")
+    second = _provider(config, device="cuda:1")
+    first.design_voice()
+    second.synthesize("Chunk.", b"", return_bytes=True)
+    before = FakeOmniVoice.instances[1].generate_calls[-1]["voice_clone_prompt"].ref_audio_tokens.clone()
+
+    first.design_voice(force=True)
+    assert len(_design_calls(FakeOmniVoice.instances[0])) == 2
+    # The other instance drops its in-memory copy of the replaced voice.
+    second.synthesize("Chunk.", b"", return_bytes=True)
+    after = FakeOmniVoice.instances[1].generate_calls[-1]["voice_clone_prompt"].ref_audio_tokens
+    assert not torch.equal(before, after)
+    assert _design_calls(FakeOmniVoice.instances[1]) == []
+    mine = first.synthesize_batch(["Chunk."], b"")
+    assert len(mine) == 1
+    assert torch.equal(FakeOmniVoice.instances[0].generate_calls[-1]["voice_clone_prompt"].ref_audio_tokens.cpu(), after.cpu())
+
+
+def test_design_voice_needs_a_sentence_for_languages_without_a_built_in_one(fake_omnivoice, config):
+    config.language = "German"
+    provider = _provider(config)
+    with pytest.raises(ValueError, match="pass a sentence in that language"):
+        provider.design_voice()
+    assert _design_calls(_model()) == []
+    _, _, spoken = provider.design_voice(text="Guten Abend, liebe Hörerinnen und Hörer.")
+    assert spoken == "Guten Abend, liebe Hörerinnen und Hörer."
+
+
+def test_auditioned_voice_can_be_saved_as_a_preset(fake_omnivoice, config, tmp_path):
+    """The Voice Studio flow: design_voice -> save_voice_preset(path, wav, transcript=text)."""
+    config.tts_instruct = "female, british accent"
+    provider = _provider(config)
+    wav, _, spoken = provider.design_voice()
+    preset = str(tmp_path / "studio.pt")
+    info = provider.save_voice_preset(preset, wav, transcript=spoken)
+    assert info["mode"] == "clone" and info["ref_text"] == spoken
+    encoded = _model().prompt_calls[-1]
+    assert encoded["ref_text"] == spoken
+    with open(encoded["ref_audio"], "rb") as fh:
+        assert fh.read() == wav
+    assert provider.load_voice_preset(preset)["ref_text"] == spoken
