@@ -232,7 +232,11 @@ class ChunkVerifier:
                 kwargs.update(device="cpu")
             self._asr = WhisperModel(name, **kwargs)
             self._asr_backend = "faster-whisper"
-        except ImportError:
+        except Exception as exc:
+            # Not installed, or its CUDA/cuDNN build does not match this
+            # machine: the transformers implementation needs nothing extra.
+            if not isinstance(exc, ImportError):
+                logger.info("[verify] faster-whisper unavailable (%s); using transformers Whisper.", exc)
             import torch
             from transformers import pipeline  # type: ignore
 

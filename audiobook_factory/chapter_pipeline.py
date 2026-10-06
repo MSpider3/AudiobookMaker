@@ -441,6 +441,7 @@ def _stage_b_device_worker(
     chunk_completed_cb: Callable[[int], None] | None = None,
     chunks_completed_cb: Callable[[list[int]], None] | None = None,
     chunk_flagged_cb: Callable[[int, str], None] | None = None,
+    device_stats: dict[str, int] | None = None,
 ) -> None:
     """Dedicated synthesis thread for one GPU device.
 
@@ -466,6 +467,8 @@ def _stage_b_device_worker(
         chunk_completed_cb: Optional per-chunk callback.
         chunks_completed_cb: Optional per-batch callback.
         chunk_flagged_cb: Optional callback for chunks that failed verification.
+        device_stats: Optional dict receiving the number of chunks this
+            device synthesized, keyed by device.
     """
     try:
         batch_size = max(1, _batch_size_for(device, provider, config))
@@ -483,6 +486,8 @@ def _stage_b_device_worker(
 
             def _note_written(indices: list[int]) -> None:
                 written.update(indices)
+                if device_stats is not None:
+                    device_stats[device] = device_stats.get(device, 0) + len(indices)
                 if chunks_completed_cb is not None:
                     chunks_completed_cb(indices)
 
@@ -642,6 +647,7 @@ def run_chapter_pipeline(
     device_providers: dict[str, BaseTTSProvider] = {}
     stage_b_threads: list[threading.Thread] = []
     worker_errors: list[BaseException] = []
+    device_stats: dict[str, int] = {device: 0 for device in active_devices}
 
     durations_res: list[float] = [0.0] * total_chunks
     stage_c_exception: BaseException | None = None
@@ -675,6 +681,7 @@ def run_chapter_pipeline(
                     chunk_completed_cb,
                     chunks_completed_cb,
                     chunk_flagged_cb,
+                    device_stats,
                 ),
                 name=f"StageB-{device}-Ch{chapter_index}",
                 daemon=False,
@@ -786,6 +793,11 @@ def run_chapter_pipeline(
 
         if stage_c_exception is None and not cancel_token.is_cancelled and os.path.exists(out_wav_path) and os.path.getsize(out_wav_path) > 0:
             _chapter_succeeded = True
+            if pending_count and len(active_devices) > 1:
+                log_callback(
+                    f"  [Ch{chapter_index}] Device share: "
+                    + ", ".join(f"{dev} {count} chunk(s)" for dev, count in device_stats.items())
+                )
             if worker_errors:
                 log_callback(
                     f"  [Ch{chapter_index}] ⚠ {len(worker_errors)} device worker(s) failed "
