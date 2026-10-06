@@ -44,7 +44,8 @@ echo [OK]    Virtual environment activated.
 
 :: ── Launch app.py & API Backend ────────────────────────────────────────────────
 echo [INFO]  Launching API Orchestration Backend ...
-start /min "AudiobookMaker API Server" python start_api.py
+set API_WINDOW_TITLE=AudiobookMaker API Server
+start /min "%API_WINDOW_TITLE%" python start_api.py
 
 echo [INFO]  Starting AudiobookMaker on %URL% ...
 echo [INFO]  Press Ctrl+C in this window to stop the server.
@@ -60,5 +61,17 @@ echo.
 
 :: Start app.py in the foreground (blocks until closed by user)
 python "%APP%"
+set APP_EXIT=%ERRORLEVEL%
 
-endlocal
+:: ── Stop the API server when app.py ends ─────────────────────────────────────
+:: The API server runs in its own window and keeps the TTS model in VRAM, so
+:: it must not outlive the UI. This runs whenever app.py returns: on its own
+:: (crash, port in use) or after Ctrl+C when "Terminate batch job (Y/N)?" is
+:: answered N. Answering Y aborts this script before it gets here; in that
+:: case close the "AudiobookMaker API Server" window by hand.
+echo.
+echo [INFO]  Stopping API Orchestration Backend ...
+taskkill /FI "WINDOWTITLE eq %API_WINDOW_TITLE%*" /T /F >nul 2>&1
+echo [OK]    AudiobookMaker stopped.
+
+endlocal & exit /b %APP_EXIT%

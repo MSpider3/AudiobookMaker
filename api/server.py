@@ -1,5 +1,19 @@
+"""
+api/server.py
+=============
+FastAPI routes and the WebSocket event stream of the AudiobookMaker backend.
+
+Handlers never run model loading, synthesis or DSP on the event loop: a
+blocked loop makes the health check time out, and a client that believes the
+API is down loads a second copy of the model in its own process.
+"""
+from __future__ import annotations
+
 import asyncio
+import dataclasses
 import io
+import logging
+import mimetypes
 import os
 import sys
 from typing import Any, Dict, List, Optional
@@ -17,14 +31,33 @@ import threading
 import time
 from fastapi import (
     FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Response,
-    UploadFile, File, Form, Depends, Header, Request
+    UploadFile, File, Form, Depends, Header, Query, Request
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from audiobook_factory.pipeline import AudiobookConfig, preview_tts
 from audiobook_factory.voice_preprocessor import PreprocessConfig, preprocess as voice_preprocess
-from api.worker import tasks, task_queue, Task, worker_loop, evict_old_tasks
+from api.worker import (
+    ConfigError, Task, evict_old_tasks, prepare_config, task_queue, tasks, worker_loop,
+)
+
+logger = logging.getLogger(__name__)
+
+_TERMINAL_STATUSES: tuple[str, ...] = ("completed", "failed", "cancelled")
+# How long the socket stays open after the last event of a finished task, so
+# proxies deliver the completion payload before the close frame.
+_WS_CLOSE_GRACE_SEC: float = 3.0
+_WS_PING_INTERVAL_SEC: float = 15.0
+# mimetypes does not know the audiobook container.
+_AUDIO_MEDIA_TYPES: dict[str, str] = {
+    ".m4b": "audio/mp4",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+}
 
 
 # ── Lifespan Event Handler ───────────────────────────────────────────────────
@@ -35,25 +68,14 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(worker_loop())
     print("[API Server] Background worker consumer task spawned successfully.")
 
-    def _warmup_gpu_pool():
-        if os.environ.get("ABM_SKIP_GPU_WARMUP") == "1":
-            return
-        try:
-            from audiobook_factory.gpu_pool import GPUPoolManager
-            from audiobook_factory.pipeline import AudiobookConfig
-            from audiobook_factory.tts_providers import get_tts_provider
-            cfg = AudiobookConfig()
-            if cfg.tts_provider_name != "mock":
-                GPUPoolManager.instance().get_pool(
-                    provider_name=cfg.tts_provider_name,
-                    provider_factory=lambda dev: get_tts_provider(cfg.tts_provider_name, cfg, device=dev),
-                )
-        except Exception as exc:
-            print(f"[API Server] GPU pool warmup warning: {exc}")
-
-    if os.environ.get("ABM_SKIP_GPU_WARMUP") != "1":
-        import threading
-        threading.Thread(target=_warmup_gpu_pool, daemon=True).start()
+    # No model is loaded here. The pipeline builds the provider pool for the
+    # engine and model a task actually asks for, the first time one runs;
+    # warming the default engine at startup made every user of another engine
+    # pay an evict + reload and kept VRAM occupied by an idle server.
+    # ABM_SKIP_GPU_WARMUP used to disable that warmup and is still accepted
+    # (it has nothing left to skip).
+    if os.environ.get("ABM_SKIP_GPU_WARMUP"):
+        logger.debug("ABM_SKIP_GPU_WARMUP is set; startup warmup no longer exists.")
 
     yield
 
@@ -180,11 +202,58 @@ async def health_check():
     }
 
 
+def _reject(exc: ConfigError) -> HTTPException:
+    """Maps a rejected request config to an HTTP 400 with a structured detail."""
+    return HTTPException(status_code=400, detail=exc.as_detail())
+
+
+def _get_task_or_404(task_id: str) -> Task:
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return task
+
+
+@app.get("/api/v1/providers", dependencies=[Depends(require_auth)])
+def list_tts_providers(include_hidden: bool = False):
+    """Describes every TTS provider that can be imported on this server.
+
+    Each entry is the provider's ``ProviderInfo`` as JSON (tuples become
+    arrays), with ``name`` set to the registry key that ``tts_provider_name``
+    accepts. Providers whose module fails to import are reported under
+    ``unavailable`` instead of breaking the listing.
+    """
+    from audiobook_factory.tts_providers.registry import provider_info, provider_names
+
+    providers: List[Dict[str, Any]] = []
+    unavailable: List[Dict[str, str]] = []
+    for name in provider_names(include_hidden=include_hidden):
+        try:
+            entry = dataclasses.asdict(provider_info(name))
+        except Exception as exc:
+            unavailable.append({"name": name, "error": str(exc)})
+            continue
+        entry["name"] = name
+        providers.append(entry)
+    return {
+        "providers": providers,
+        "unavailable": unavailable,
+        "default": AudiobookConfig().tts_provider_name,
+    }
+
+
 @app.post("/api/v1/generate", dependencies=[Depends(require_auth), Depends(check_generate_rate_limit)])
 async def enqueue_generation(payload: GenerateRequest):
+    # Reject a bad request now, with a reason, rather than as a failed task.
+    # The worker validates again when the task starts.
+    try:
+        await asyncio.to_thread(prepare_config, payload.config)
+    except ConfigError as exc:
+        raise _reject(exc)
+
     evict_old_tasks()
     task_id = str(uuid.uuid4())
-    
+
     # Store task details
     task = Task(
         task_id=task_id,
@@ -192,42 +261,79 @@ async def enqueue_generation(payload: GenerateRequest):
         chapters=payload.chapters
     )
     tasks[task_id] = task
-    
+
     # Push to queue
     await task_queue.put(task_id)
     print(f"[API Server] Enqueued task: {task_id}")
     return {"task_id": task_id, "status": "queued"}
 
 
+@app.get("/api/v1/tasks", dependencies=[Depends(require_auth)])
+async def list_tasks():
+    """Lists known tasks, newest first, without logs or chapter text."""
+    ordered = sorted(tasks.values(), key=lambda t: t.created_at, reverse=True)
+    return {"tasks": [t.summary() for t in ordered]}
+
+
 @app.post("/api/v1/tasks/{task_id}/cancel", dependencies=[Depends(require_auth)])
 async def cancel_task(task_id: str):
-    task = tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
-        
+    task = _get_task_or_404(task_id)
+
     task.cancel_token.cancel()
     if task.status in ("queued", "running"):
         await task.add_log("⛔ Cancellation requested by client.")
         if task.status == "queued":
             await task.update_status("cancelled")
-            
+            # The worker skips a cancelled task without another word, so the
+            # end of the session has to be announced here; otherwise a
+            # WebSocket client waits out its whole grace timeout.
+            await task.end_session()
+
     return {"task_id": task_id, "status": task.status}
 
 
 @app.get("/api/v1/tasks/{task_id}", dependencies=[Depends(require_auth)])
-async def get_task_status(task_id: str):
-    task = tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
-        
-    return {
-        "task_id": task.task_id,
-        "status": task.status,
-        "progress": task.progress,
-        "logs": task.logs,
+async def get_task_status(task_id: str, since: Optional[int] = Query(default=None, ge=0)):
+    """Returns a task's state.
+
+    Without ``since`` the whole log is returned. With ``?since=<n>`` only the
+    log lines from index ``n`` on are; pass the previous response's
+    ``log_count`` to receive just the new ones.
+    """
+    task = _get_task_or_404(task_id)
+    offset = min(since or 0, len(task.logs))
+    body = task.summary()
+    body.update({
+        "logs": task.logs[offset:],
+        "log_offset": offset,
+        "log_count": len(task.logs),
         "output_files": task.output_files,
-        "error_message": task.error_message
-    }
+    })
+    return body
+
+
+@app.get("/api/v1/tasks/{task_id}/files/{index}", dependencies=[Depends(require_auth)])
+def download_task_file(task_id: str, index: int):
+    """Downloads output file number ``index`` of a finished task.
+
+    Only paths the pipeline recorded in the task's ``output_files`` are
+    served; the client supplies an index, never a path.
+    """
+    task = _get_task_or_404(task_id)
+    if not task.is_finished:
+        raise HTTPException(status_code=409, detail="Task has not finished yet.")
+    if index < 0 or index >= len(task.output_files):
+        raise HTTPException(status_code=404, detail="No such output file.")
+    path = task.output_files[index]
+    if not isinstance(path, str) or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Output file is no longer on disk.")
+    extension = os.path.splitext(path)[1].lower()
+    media_type = (
+        _AUDIO_MEDIA_TYPES.get(extension)
+        or mimetypes.guess_type(path)[0]
+        or "application/octet-stream"
+    )
+    return FileResponse(path, media_type=media_type, filename=os.path.basename(path))
 
 
 @app.post("/api/v1/voice-test", dependencies=[Depends(require_auth)])
@@ -236,16 +342,18 @@ async def api_voice_test(payload: VoiceTestRequest):
     Generates preview speech using the backend's shared loaded model.
     """
     try:
-        cfg = AudiobookConfig.from_dict(payload.config)
-        wav_bytes = preview_tts(payload.text, cfg)
-        if wav_bytes is None:
-            raise HTTPException(status_code=500, detail="TTS generation returned empty audio data.")
-            
-        return StreamingResponse(io.BytesIO(wav_bytes), media_type="audio/wav")
+        cfg = await asyncio.to_thread(prepare_config, payload.config, contain_output_dir=False)
+    except ConfigError as exc:
+        raise _reject(exc)
+    try:
+        # Loads the model on first use and synthesizes: seconds to minutes.
+        wav_bytes = await asyncio.to_thread(preview_tts, payload.text, cfg)
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Voice test failed")
         raise HTTPException(status_code=500, detail=f"TTS synthesis error: {e}")
+    if wav_bytes is None:
+        raise HTTPException(status_code=500, detail="TTS synthesis error: TTS generation returned empty audio data.")
+    return StreamingResponse(io.BytesIO(wav_bytes), media_type="audio/wav")
 
 
 @app.post("/api/v1/preprocess", dependencies=[Depends(require_auth), Depends(check_preprocess_rate_limit)])
@@ -293,10 +401,11 @@ async def api_preprocess(
             resample=resample,
             target_sample_rate=target_sample_rate
         )
-        
+
         in_bytes = await audio_file.read()
-        out_bytes = voice_preprocess(in_bytes, cfg, use_cache=use_cache)
-        
+        # Decoding, noise reduction and resampling are CPU-bound.
+        out_bytes = await asyncio.to_thread(voice_preprocess, in_bytes, cfg, use_cache=use_cache)
+
         return StreamingResponse(io.BytesIO(out_bytes), media_type="audio/wav")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preprocessing error: {e}")
@@ -321,67 +430,95 @@ async def task_websocket_endpoint(websocket: WebSocket, task_id: str):
         await websocket.send_json({"type": "error", "message": "Requested task not found."})
         await websocket.close()
         return
-        
-    # Create connection channel queue
-    ws_queue = asyncio.Queue()
+
+    # Subscribe and snapshot the history in the same step (no await between
+    # them), so a log line is delivered exactly once: from the snapshot or
+    # from the queue, never both and never neither.
+    ws_queue: asyncio.Queue = asyncio.Queue()
     task.subscribers.append(ws_queue)
+    history = list(task.logs)
     print(f"[WebSocket] Client connected to task subscription: {task_id}")
-    
-    # Send historical logs first
-    for log_msg in task.logs:
-        await websocket.send_json({"type": "log", "message": log_msg})
-    # Send progress baseline
-    await websocket.send_json({"type": "progress", "progress": task.progress})
-    await websocket.send_json({"type": "status", "status": task.status})
-    if task.status == "completed" and task.output_files:
-        await websocket.send_json({"type": "completed", "files": task.output_files})
-        
+
     async def _ws_keepalive():
         while True:
-            await asyncio.sleep(15.0)
+            await asyncio.sleep(_WS_PING_INTERVAL_SEC)
             try:
                 await websocket.send_json({"type": "ping"})
             except Exception:
                 break
 
-    ping_task = asyncio.create_task(_ws_keepalive())
+    async def _wait_for_disconnect():
+        # The client sends nothing in this protocol; anything it does send is
+        # discarded. Returns when the peer has gone.
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
 
-    _terminal = ("completed", "failed", "cancelled")
-    # A client that connects after the task ended has nothing more to wait for.
-    terminal_seen = task.status in _terminal
+    ping_task = asyncio.create_task(_ws_keepalive())
+    # Awaiting only the task queue never notices a client that went away: the
+    # handler and its subscriber queue would live until the task ends (for a
+    # stalled task, forever) and hold up the server's graceful shutdown.
+    gone_task = asyncio.create_task(_wait_for_disconnect())
+    next_event: asyncio.Task | None = None
 
     try:
+        # Send historical logs first
+        for log_msg in history:
+            await websocket.send_json({"type": "log", "message": log_msg})
+        # Send progress baseline
+        await websocket.send_json({"type": "progress", "progress": task.progress})
+        await websocket.send_json({"type": "status", "status": task.status})
+        if task.status == "completed" and task.output_files:
+            await websocket.send_json({"type": "completed", "files": task.output_files})
+
+        # A client that connects after the task ended has nothing more to wait for.
+        terminal_seen = task.status in _TERMINAL_STATUSES
+
         while True:
-            # Poll updates from the task channel queue and send to client.
+            # Forward updates from the task channel queue to the client.
             # The worker announces the terminal *status* first and the
             # "completed"/"session_end" events (which carry the file list)
             # after it, so keep draining for a short grace period instead of
             # closing on the status message and dropping them.
-            if terminal_seen:
-                try:
-                    data = await asyncio.wait_for(ws_queue.get(), timeout=3.0)
-                except asyncio.TimeoutError:
-                    break
-            else:
-                data = await ws_queue.get()
+            if next_event is None:
+                next_event = asyncio.create_task(ws_queue.get())
+            done, _pending = await asyncio.wait(
+                {next_event, gone_task},
+                timeout=_WS_CLOSE_GRACE_SEC if terminal_seen else None,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if next_event not in done:
+                # Client disconnected, or the grace period ran out.
+                break
+            data = next_event.result()
+            next_event = None
             await websocket.send_json(data)
             ws_queue.task_done()
 
             if data.get("type") == "session_end":
-                # Grace period to ensure all network proxies process the completion payload
-                await asyncio.sleep(3.0)
+                # Grace period to ensure all network proxies process the
+                # completion payload; cut short if the client hangs up first.
+                await asyncio.wait({gone_task}, timeout=_WS_CLOSE_GRACE_SEC)
                 break
-            if data.get("type") == "status" and data.get("status") in _terminal:
+            if data.get("type") == "status" and data.get("status") in _TERMINAL_STATUSES:
                 terminal_seen = True
 
     except WebSocketDisconnect:
-        print(f"[WebSocket] Client disconnected from task subscription: {task_id}")
+        pass
     except Exception as e:
         print(f"[WebSocket] Event transmission exception: {e}")
     finally:
-        ping_task.cancel()
+        for pending in (ping_task, gone_task, next_event):
+            if pending is not None and not pending.done():
+                pending.cancel()
+        if gone_task.done() and not gone_task.cancelled():
+            # Retrieve the result so a failed receive is not reported as an
+            # un-awaited task exception.
+            gone_task.exception()
         if ws_queue in task.subscribers:
             task.subscribers.remove(ws_queue)
+        print(f"[WebSocket] Client disconnected from task subscription: {task_id}")
         try:
             await websocket.close()
         except Exception:
