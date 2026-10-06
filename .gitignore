@@ -79,6 +79,8 @@ desktop.ini
 .ipynb_checkpoints/
 *.ipynb
 !AudiobookMaker_Colab.ipynb
+!AudiobookMaker_Kaggle.ipynb
+!AudiobookMaker_Kaggle_Test.ipynb
 !program_testing.ipynb
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
@@ -96,6 +98,10 @@ results/
 abm_ch*/
 # Benchmark test output
 test_output_speed/
+# Kaggle GPU test harness output (tests/kaggle/abm_gpu_suite.py)
+kaggle_results/
+abm_results/
+abm_test_results.zip
 # Voice preprocessing cache
 .voice_cache/
 audiobook_factory/.voice_cache/
