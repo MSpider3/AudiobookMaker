@@ -328,6 +328,14 @@ PROVIDER_SETUP: dict[str, dict] = {
         ],
         "env": {"USE_MODELSCOPE": "false"},
     },
+    "fish": {
+        # fish-speech pins torch/pydantic/datasets and pulls gradio, wandb and
+        # lightning; its real inference dependencies are in the requirements file.
+        "post": [
+            "{python} -m pip install -q --no-deps descript-audiotools descript-audio-codec "
+            "\"fish-speech @ git+https://github.com/fishaudio/fish-speech.git@214da3cd841bda85da2496b96cd3c4d7edb1337e\"",
+        ],
+    },
 }
 
 
