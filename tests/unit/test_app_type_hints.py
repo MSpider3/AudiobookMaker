@@ -36,6 +36,10 @@ def test_check_existing_progress_type_hints():
     hints_check = typing.get_type_hints(check_existing_progress)
     assert "book_title" in hints_check
     assert "request" in hints_check
+    # Gradio only injects the request when the annotation IS gr.Request;
+    # ``Any | None`` silently received None.
+    import gradio as gr
+    assert hints_check["request"] is gr.Request
 
     hints_sess = typing.get_type_hints(_get_session_id)
     assert "request" in hints_sess
@@ -56,6 +60,20 @@ def test_cli_functions_type_hints():
             functions_checked += 1
 
     assert functions_checked >= 15, f"Expected at least 15 cli functions, got {functions_checked}"
+
+
+def test_request_parameters_are_typed_for_gradio_injection():
+    """Every handler with a ``request`` parameter must annotate it as gr.Request."""
+    import app
+    import gradio as gr
+
+    handlers = [
+        obj for name, obj in inspect.getmembers(app, inspect.isfunction)
+        if obj.__module__ == "app" and name.startswith(("on_", "check_")) and "request" in inspect.signature(obj).parameters
+    ]
+    assert len(handlers) >= 6
+    for handler in handlers:
+        assert typing.get_type_hints(handler)["request"] is gr.Request, handler.__name__
 
 
 def test_build_app_succeeds():
