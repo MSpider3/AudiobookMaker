@@ -1,0 +1,35 @@
+# ─── AudiobookMaker — OmniVoice TTS provider ─────────────────────────────────
+# Provider: audiobook_factory/tts_providers/omnivoice_provider.py
+# Upstream: https://github.com/k2-fsa/OmniVoice  (model: k2-fsa/OmniVoice)
+#
+# Install with:  pip install -r requirements/tts-omnivoice.txt
+#
+# Install PyTorch (torch + torchaudio >= 2.4, matching CUDA build) FIRST, or keep
+# the one your Kaggle/Colab image ships; pip then leaves it alone.
+#
+# CONFLICT: omnivoice requires transformers>=5.3.0. qwen-tts needs
+# transformers 4.57.x, so OmniVoice and Qwen3-TTS cannot share one environment.
+#
+# Licence: code Apache-2.0; pretrained weights CC-BY-NC (non-commercial only).
+# The model repo is public (no HF token). First run downloads about 3.3 GB,
+# plus about 1.6 GB for Whisper if the reference clip has no transcript.
+
+omnivoice>=0.2.1
+
+# pydub (an omnivoice dependency) imports the stdlib module `audioop`, which
+# was removed in Python 3.13.
+audioop-lts; python_version >= "3.13"
+
+# Cross-process lock for the shared voice cache (already pulled in by torch and
+# huggingface-hub; listed because the provider imports it directly).
+filelock
+
+# ── Optional ──────────────────────────────────────────────────────────────────
+# "Spell out numbers" option (normalize_text): WeTextProcessing + num2words.
+# omnivoice[tn]>=0.2.1
+#
+# "FlashInfer acceleration" option: not in the PyPI release, needs the GitHub
+# source plus FlashInfer wheels built for your CUDA version (cu128 shown).
+# omnivoice @ git+https://github.com/k2-fsa/OmniVoice.git
+# flashinfer-python==0.6.15.post1
+# flashinfer-jit-cache==0.6.15.post1+cu128  --extra-index-url https://flashinfer.ai/whl/cu128/

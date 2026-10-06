@@ -374,14 +374,24 @@ class BaseTTSProvider(ABC):
         return ""
 
     def seed_everything(self) -> None:
-        """Seeds torch's RNGs when ``config.seed >= 0``."""
+        """Seeds torch's RNGs for this provider's device when ``config.seed >= 0``.
+
+        Only this instance's GPU is reseeded: ``manual_seed_all`` would reset
+        the generator of the other GPU while its worker is mid-generation.
+        """
         seed = getattr(self.config, "seed", -1)
         if seed is None or int(seed) < 0:
             return
         import torch
         torch.manual_seed(int(seed))
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(int(seed))
+        dev = self.device or ""
+        if dev.startswith("cuda") and torch.cuda.is_available():
+            try:
+                index = int(dev.split(":")[1]) if ":" in dev else torch.cuda.current_device()
+                with torch.cuda.device(index):
+                    torch.cuda.manual_seed(int(seed))
+            except Exception as exc:
+                logger.debug("Could not seed %s: %s", dev, exc)
 
     def bind_device(self) -> None:
         """Makes this provider's GPU the calling thread's current CUDA device."""
