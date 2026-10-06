@@ -11,7 +11,11 @@ import os
 import threading
 from typing import TYPE_CHECKING, Any
 
-from audiobook_factory.tts_providers.base_tts_provider import BaseTTSProvider
+from audiobook_factory.tts_providers.base_tts_provider import (
+    BaseTTSProvider,
+    ProviderInfo,
+    ProviderOption,
+)
 
 if TYPE_CHECKING:
     from audiobook_factory.pipeline import AudiobookConfig
@@ -23,6 +27,32 @@ class F5TTSProvider(BaseTTSProvider):
     """
     F5-TTS Zero-Shot Provider implementation.
     """
+
+    INFO = ProviderInfo(
+        name="f5tts",
+        display_name="F5-TTS",
+        description="Fast flow-matching zero-shot voice cloning (English / Chinese).",
+        license="CC-BY-NC-4.0",
+        commercial_use=False,
+        homepage="https://github.com/SWivid/F5-TTS",
+        default_model="F5TTS_v1_Base",
+        models=("F5TTS_v1_Base",),
+        native_sample_rate=24000,
+        min_vram_gb=3.0,
+        languages=("English", "Chinese"),
+        supports_voice_clone=True,
+        transcript="optional",
+        supports_speed=True,
+        supports_seed=True,
+        options=(
+            ProviderOption(
+                key="nfe_step", label="Sampling steps", kind="int", default=32,
+                minimum=8, maximum=64, step=1,
+                help="Flow-matching steps per chunk; more is slower and slightly cleaner.",
+            ),
+        ),
+        pip_requirements=("f5-tts",),
+    )
 
     def __init__(
         self,
@@ -101,7 +131,7 @@ class F5TTSProvider(BaseTTSProvider):
                 _tmp_ref_file = tf.name
 
         try:
-            nfe_step = getattr(self.config, "nfe_step", 32)
+            nfe_step = int(self.option("nfe_step", getattr(self.config, "nfe_step", 32)))
             speed = getattr(self.config, "speed", 1.0)
             seed = getattr(self.config, "seed", -1)
 

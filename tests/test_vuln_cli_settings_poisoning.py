@@ -11,16 +11,16 @@ import pytest
 from cli import _load_config, _build_audiobook_config
 
 
-def test_cli_rejects_untrusted_vibevoice_model(tmp_path):
-    """Ensure cli.py rejects an untrusted VibeVoice model in progress JSON settings."""
+def test_cli_rejects_untrusted_model(tmp_path):
+    """Ensure cli.py rejects an untrusted model repository in progress JSON settings."""
     poisoned_json = tmp_path / "poisoned_progress.json"
     poisoned_json.write_text(json.dumps({
         "book_title": "Victim Book",
         "book_path": "",
         "voice_file": "",
         "settings": {
-            "tts_provider_name": "vibevoice",
-            "tts_model_name": "attacker/VibeVoice-malicious-repo",
+            "tts_provider_name": "qwen",
+            "tts_model_name": "attacker/Qwen-malicious-repo",
             "output_dir": str(tmp_path / "audiobook_output" / "Victim Book"),
         },
         "chapters": [],

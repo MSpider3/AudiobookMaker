@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 _VALID_QUANTIZATION_MODES: frozenset[str] = frozenset({"none", "int8"})
 
+_RETIRED_PROVIDERS: frozenset[str] = frozenset({"vibevoice", "vibe-voice", "vibevoice-1.5b"})
+# Providers that existed in earlier releases; configs naming them still load.
+
 _subtitle_executor: concurrent.futures.ThreadPoolExecutor = (
     concurrent.futures.ThreadPoolExecutor(
         max_workers=2,
@@ -207,7 +210,7 @@ def _get_chapter_parallelism(
     return 1
 
 
-_CONFIG_SCHEMA_VERSION: int = 6
+_CONFIG_SCHEMA_VERSION: int = 7
 # Increment this integer whenever AudiobookConfig fields are added,
 # removed, or renamed. Used to detect stale generation_progress.json
 # files from older versions.
@@ -258,8 +261,11 @@ class AudiobookConfig:
     # ── Multi-Model Qwen3 ─────────────────────────────────────────────────────
     device:              str   = "cuda"
     tts_model_name:      str   = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-    tts_instruct:        str   = ""       # For VoiceDesign/CustomVoice instructions
-    tts_timbre:          str   = ""       # For CustomVoice premium speakers
+    tts_instruct:        str   = ""       # Natural-language style / voice-design prompt
+    tts_timbre:          str   = ""       # Built-in preset speaker (providers with preset voices)
+    voice_preset:        str   = ""       # Saved provider voice preset file; replaces voice_file when set
+    # Provider-specific settings, keyed by ProviderOption.key (see tts_providers/).
+    tts_options:         dict  = field(default_factory=dict)
 
     # ── Modes ─────────────────────────────────────────────────────────────────
     preview_mode:        bool  = False   # show stats, no TTS
@@ -299,6 +305,11 @@ class AudiobookConfig:
         Unknown keys are silently dropped. Missing keys use the field's
         default value. A version mismatch logs a warning but does not raise.
 
+        Migration notes: every field added since schema version 1 has a
+        default, so older files load unchanged. Version 7 added
+        ``voice_preset`` and ``tts_options`` and retired the ``vibevoice``
+        provider, which is mapped back to the default engine here.
+
         Args:
             data: Dict from generation_progress.json settings section.
 
@@ -307,6 +318,16 @@ class AudiobookConfig:
         """
         known_fields = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in data.items() if k in known_fields}
+
+        if str(filtered.get("tts_provider_name", "")).lower().strip() in _RETIRED_PROVIDERS:
+            logger.warning(
+                "TTS provider '%s' was removed; falling back to the default engine.",
+                filtered["tts_provider_name"],
+            )
+            filtered["tts_provider_name"] = "qwen"
+            filtered.pop("tts_model_name", None)
+        if not isinstance(filtered.get("tts_options", {}), dict):
+            filtered["tts_options"] = {}
 
         # Version check
         incoming_version = data.get("config_version", 0)

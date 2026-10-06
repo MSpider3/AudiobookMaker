@@ -474,7 +474,7 @@ class GPUPoolManager:
         currently loaded evicts the other loaded provider pool(s) first, so
         two TTS engines' weights are never resident on the same GPU(s) at
         once — this is what previously caused CUDA OOMs / failures when
-        switching TTS engines (e.g. Qwen → VibeVoice) within one process,
+        switching TTS engines (e.g. Qwen → IndexTTS) within one process,
         since old pools were created but never freed. Pass
         `keep_other_providers=True` to opt out (only safe if you know the
         combined VRAM footprint of all providers fits).

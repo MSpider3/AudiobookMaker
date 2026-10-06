@@ -654,11 +654,9 @@ class TestPhase1AndPhase2Hardening(unittest.TestCase):
 
 class TestPhase3AndPhase4Features(unittest.TestCase):
 
-    def test_get_tts_provider_vibevoice_and_f5tts(self):
+    def test_get_tts_provider_f5tts(self):
         from audiobook_factory.tts_providers import get_tts_provider
         cfg = AudiobookConfig()
-        p1 = get_tts_provider("vibevoice", cfg)
-        self.assertEqual(p1.get_name(), "VibeVoice-1.5B")
         p2 = get_tts_provider("f5tts", cfg)
         self.assertEqual(p2.get_name(), "F5-TTS")
 

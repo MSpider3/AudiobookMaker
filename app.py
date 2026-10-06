@@ -585,7 +585,7 @@ def build_app():
                 gr.Markdown("#### TTS Engine & Provider Selection")
                 tts_provider_dd = gr.Dropdown(
                     label="TTS Provider",
-                    choices=["qwen", "vibevoice", "f5tts"],
+                    choices=["qwen", "f5tts"],
                     value="qwen",
                     info="Choose TTS Engine: Qwen3-TTS (local model), VibeVoice-1.5B, or F5-TTS.",
                     interactive=True,

@@ -78,16 +78,16 @@ class TestTTSProviderContract:
 
     def test_get_tts_provider_all_valid_names(self, config):
         from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
-        from audiobook_factory.tts_providers.vibevoice_provider import VibeVoiceTTSProvider
         from audiobook_factory.tts_providers.f5tts_provider import F5TTSProvider
 
         for name in ("qwen", "qwen3", "qwen3-tts", ""):
             p = get_tts_provider(name, config)
             assert isinstance(p, QwenTTSProvider)
 
+        # VibeVoice was removed: it could never synthesize.
         for name in ("vibevoice", "vibe-voice", "vibevoice-1.5b"):
-            p = get_tts_provider(name, config)
-            assert isinstance(p, VibeVoiceTTSProvider)
+            with pytest.raises(ValueError, match="Unknown TTS provider"):
+                get_tts_provider(name, config)
 
         for name in ("f5tts", "f5-tts", "f5_tts"):
             p = get_tts_provider(name, config)
@@ -102,14 +102,13 @@ class TestTTSProviderContract:
             with pytest.raises(RuntimeError, match="pip install f5-tts"):
                 p.ensure_ready()
 
-    def test_vibevoice_unapproved_model_raises(self):
-        bad_cfg = AudiobookConfig(
-            tts_provider_name="vibevoice",
-            tts_model_name="evil-repo/unapproved-vibevoice",
-        )
-        p = get_tts_provider("vibevoice", bad_cfg)
-        with pytest.raises(ValueError, match="Refusing to load unapproved VibeVoice model"):
-            p.ensure_ready()
+    def test_retired_provider_in_saved_config_falls_back_to_default(self):
+        cfg = AudiobookConfig.from_dict({
+            "tts_provider_name": "vibevoice",
+            "tts_model_name": "bezzam/VibeVoice-1.5B-hf",
+        })
+        assert cfg.tts_provider_name == "qwen"
+        assert cfg.tts_model_name == AudiobookConfig().tts_model_name
 
     def test_f5tts_temp_file_cleaned_up(self, config, monkeypatch):
         import numpy as np
