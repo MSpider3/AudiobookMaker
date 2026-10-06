@@ -457,9 +457,14 @@ class TestHandlersOffTheEventLoop:
             seen["on_loop"] = self._on_event_loop()
             seen["bytes"] = len(data)
             seen["use_cache"] = use_cache
-            return b"RIFF-clean"
 
-        monkeypatch.setattr(server_mod, "voice_preprocess", _fake_preprocess)
+            class _Report:
+                def to_dict(self):
+                    return {"warnings": []}
+
+            return b"RIFF-clean", _Report()
+
+        monkeypatch.setattr(server_mod, "preprocess_with_report", _fake_preprocess)
         form = {
             "noise_reduce": "true", "noise_reduce_strength": "0.5", "noise_gate": "false",
             "noise_gate_threshold_db": "-40", "highpass_filter": "true", "highpass_cutoff_hz": "80",
@@ -601,3 +606,64 @@ class TestCancelAndWebSocket:
                 sub.put_nowait({"type": "session_end", "files": ["/x/a.mp3"], "status": "completed"})
                 kinds = [ws.receive_json()["type"] for _ in range(3)]
         assert kinds == ["status", "completed", "session_end"]
+
+
+class TestPreprocessEndpoint:
+
+    _ORIGINAL_FIELDS = {
+        "noise_reduce": "false", "noise_reduce_strength": "0.25", "noise_gate": "false",
+        "noise_gate_threshold_db": "-45", "highpass_filter": "true", "highpass_cutoff_hz": "80",
+        "silence_removal": "false", "silence_threshold_db": "-40", "min_segment_ms": "100",
+        "max_silence_kept_ms": "500", "normalize_volume": "true", "normalize_target_dbfs": "-3",
+        "formant_shift": "false", "formant_quefrency": "1.0", "formant_timbre": "1.0",
+        "resample": "true", "target_sample_rate": "24000",
+    }
+
+    @staticmethod
+    def _voice() -> bytes:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        with open(os.path.join(root, "tests", "fixtures", "audio", "synthetic_voice_reference.wav"), "rb") as fh:
+            return fh.read()
+
+    def test_original_fields_still_work_and_a_report_is_returned(self):
+        import json as _json
+        from fastapi.testclient import TestClient
+        from api.server import app
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/preprocess", data=self._ORIGINAL_FIELDS,
+                files={"audio_file": ("voice.wav", self._voice(), "audio/wav")},
+            )
+        assert response.status_code == 200
+        assert response.content[:4] == b"RIFF"
+        report = _json.loads(response.headers["x-voice-report"])
+        assert report["sample_rate"] == 24000 and "warnings" in report
+
+    def test_new_settings_reach_the_preprocessor(self):
+        import json as _json
+        from fastapi.testclient import TestClient
+        from api.server import app
+
+        loudness = {}
+        with TestClient(app) as client:
+            for target in ("-16", "-26"):
+                response = client.post(
+                    "/api/v1/preprocess",
+                    data={**self._ORIGINAL_FIELDS, "loudness_target_lufs": target, "trim_silence": "true"},
+                    files={"audio_file": ("voice.wav", self._voice(), "audio/wav")},
+                )
+                assert response.status_code == 200
+                loudness[target] = _json.loads(response.headers["x-voice-report"])["loudness_lufs"]
+        assert loudness["-16"] - loudness["-26"] > 6.0
+
+    def test_undecodable_audio_is_a_client_error(self):
+        from fastapi.testclient import TestClient
+        from api.server import app
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/preprocess", data=self._ORIGINAL_FIELDS,
+                files={"audio_file": ("voice.wav", b"this is not audio", "audio/wav")},
+            )
+        assert response.status_code == 400

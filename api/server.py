@@ -9,6 +9,7 @@ API is down loads a second copy of the model in its own process.
 """
 from __future__ import annotations
 
+import json
 import asyncio
 import dataclasses
 import io
@@ -37,7 +38,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from audiobook_factory.pipeline import AudiobookConfig, preview_tts
-from audiobook_factory.voice_preprocessor import PreprocessConfig, preprocess as voice_preprocess
+from audiobook_factory.voice_preprocessor import (
+    PreprocessConfig,
+    preprocess as voice_preprocess,
+    preprocess_with_report,
+)
+
+_PREPROCESS_DEFAULTS = PreprocessConfig()
 from api.worker import (
     ConfigError, Task, evict_old_tasks, prepare_config, task_queue, tasks, worker_loop,
 )
@@ -376,10 +383,26 @@ async def api_preprocess(
     resample: bool = Form(...),
     target_sample_rate: int = Form(...),
     use_cache: bool = Form(default=False),
+    # Added with the rewritten preprocessor. Defaults mirror PreprocessConfig,
+    # so clients that only send the original fields keep working.
+    noise_gate_range_db: float = Form(default=_PREPROCESS_DEFAULTS.noise_gate_range_db),
+    trim_silence: bool = Form(default=_PREPROCESS_DEFAULTS.trim_silence),
+    edge_silence_ms: int = Form(default=_PREPROCESS_DEFAULTS.edge_silence_ms),
+    edge_fade_ms: int = Form(default=_PREPROCESS_DEFAULTS.edge_fade_ms),
+    normalize_mode: str = Form(default=_PREPROCESS_DEFAULTS.normalize_mode),
+    loudness_target_lufs: float = Form(default=_PREPROCESS_DEFAULTS.loudness_target_lufs),
+    true_peak_ceiling_dbfs: float = Form(default=_PREPROCESS_DEFAULTS.true_peak_ceiling_dbfs),
+    allow_upsample: bool = Form(default=_PREPROCESS_DEFAULTS.allow_upsample),
+    select_best_window: bool = Form(default=_PREPROCESS_DEFAULTS.select_best_window),
+    best_window_seconds: float = Form(default=_PREPROCESS_DEFAULTS.best_window_seconds),
     audio_file: UploadFile = File(...)
 ):
     """
     Cleans raw uploaded audio files using voice preprocessor algorithms.
+
+    The cleaned WAV is the response body. The analysis of the result
+    (duration, loudness, SNR, warnings…) is returned as ASCII JSON in the
+    ``X-Voice-Report`` response header.
     """
     try:
         cfg = PreprocessConfig(
@@ -399,14 +422,29 @@ async def api_preprocess(
             formant_quefrency=formant_quefrency,
             formant_timbre=formant_timbre,
             resample=resample,
-            target_sample_rate=target_sample_rate
+            target_sample_rate=target_sample_rate,
+            noise_gate_range_db=noise_gate_range_db,
+            trim_silence=trim_silence,
+            edge_silence_ms=edge_silence_ms,
+            edge_fade_ms=edge_fade_ms,
+            normalize_mode=normalize_mode,
+            loudness_target_lufs=loudness_target_lufs,
+            true_peak_ceiling_dbfs=true_peak_ceiling_dbfs,
+            allow_upsample=allow_upsample,
+            select_best_window=select_best_window,
+            best_window_seconds=best_window_seconds,
         )
 
         in_bytes = await audio_file.read()
         # Decoding, noise reduction and resampling are CPU-bound.
-        out_bytes = await asyncio.to_thread(voice_preprocess, in_bytes, cfg, use_cache=use_cache)
-
-        return StreamingResponse(io.BytesIO(out_bytes), media_type="audio/wav")
+        out_bytes, report = await asyncio.to_thread(
+            preprocess_with_report, in_bytes, cfg, use_cache=use_cache
+        )
+        headers = {"X-Voice-Report": json.dumps(report.to_dict(), ensure_ascii=True)}
+        return StreamingResponse(io.BytesIO(out_bytes), media_type="audio/wav", headers=headers)
+    except ValueError as e:
+        # Undecodable, empty or over-long audio is the caller's problem, not a server fault.
+        raise HTTPException(status_code=400, detail=f"Preprocessing error: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preprocessing error: {e}")
 

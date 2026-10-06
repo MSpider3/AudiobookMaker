@@ -786,7 +786,8 @@ def run_pipeline(
                     break
                 _process(t, pinned_device=None)
 
-        progress(total, total)
+        if not cancel.is_cancelled:
+            progress(total, total)
 
         if cancel.is_cancelled:
             log(f"\n[Pipeline] ⛔ Cancelled — {len(output_files)} file(s) saved.")
