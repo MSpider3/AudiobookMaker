@@ -54,7 +54,7 @@ When it finishes, download **`/kaggle/working/abm_test_results.zip`** (Output pa
 | Setup | clone, dependencies, Rust extension | 10–15 min |
 | CPU tests | unit suite, book extraction on every fixture format, mastering | 5 min |
 | Qwen3-TTS | cloning, preset voice, designed voice, saved preset, 1-vs-2 GPU speed-up, resume, full book → M4B | 30–45 min |
-| Other engines | IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish S2 Pro, Higgs Audio v3 — each in its own environment | 15–30 min each |
+| Other engines | IndexTTS-2.5, OmniVoice, MOSS-TTS, Fish S2 Pro, Higgs Audio v3 — each in its own environment, 3–13 GB of weights each | 15–40 min each |
 | Report | `REPORT.md` + `abm_test_results.zip` | 1 min |
 """),
         _md("## 1 · Settings"),
@@ -63,7 +63,8 @@ REPO_URL = "{_REPO_URL}"
 BRANCH   = "{branch}"
 
 # Engines to test after Qwen. Remove any you do not want; order = run order.
-# fish and higgs are 4B-parameter models: they are attempted and reported, and may not fit a T4.
+# None of these has run on a GPU before this notebook. fish and higgs are 4B-parameter
+# models that should just fit a T4 on paper; fish is expected to be slower than real time.
 OTHER_PROVIDERS = ["indextts", "omnivoice", "moss", "fish", "higgs"]
 
 RUN_UNIT_TESTS   = True    # pytest suite (mock engine, CPU)
@@ -78,11 +79,11 @@ ASR_SCORING      = True    # transcribe each result with Whisper and score word 
 VOICE_FILE       = ""
 VOICE_TRANSCRIPT = ""
 
-PROVIDER_TIMEOUT_MIN = 40  # per engine, including model download
+PROVIDER_TIMEOUT_MIN = 60  # per engine, including model download
 """),
         _md("## 2 · Environment check"),
         _code("""
-import os, socket, subprocess, sys, time
+import os, signal, socket, subprocess, sys, threading, time
 
 try:
     print(subprocess.check_output("nvidia-smi", shell=True).decode())
@@ -140,26 +141,40 @@ def sh(command, check=False, log_name=None, timeout=None, env=None):
     log_path = os.path.join(RESULTS, "logs", f"{log_name}.log") if log_name else None
     if log_path:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    started = time.time()
     proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, env=env or os.environ.copy(), cwd=os.getcwd())
+                            text=True, env=env or os.environ.copy(), cwd=os.getcwd(),
+                            start_new_session=True)
+    timed_out = threading.Event()
+
+    def _kill():
+        # Kill the whole process group: a hung model download or a silent
+        # deadlock prints nothing, so this cannot rely on output arriving.
+        timed_out.set()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    timer = threading.Timer(timeout, _kill) if timeout else None
+    if timer:
+        timer.start()
     handle = open(log_path, "a", encoding="utf-8") if log_path else None
     try:
         for line in proc.stdout:
             print(line, end="", flush=True)
             if handle:
                 handle.write(line)
-            if timeout and time.time() - started > timeout:
-                proc.kill()
-                message = f"\\n⏱ TIMEOUT after {timeout/60:.0f} min — killed.\\n"
-                print(message)
-                if handle:
-                    handle.write(message)
-                break
+        code = proc.wait()
+        if timed_out.is_set():
+            message = f"\\n⏱ TIMEOUT after {timeout/60:.0f} min — killed: {command}\\n"
+            print(message)
+            if handle:
+                handle.write(message)
     finally:
+        if timer:
+            timer.cancel()
         if handle:
             handle.close()
-    code = proc.wait()
     if check and code != 0:
         raise RuntimeError(f"command failed ({code}): {command}")
     return code
@@ -220,6 +235,10 @@ if RUN_QWEN_MODES:
           "--instruct \\"A middle-aged male narrator with a deep, steady, reassuring voice.\\" " + ASR_FLAG,
           timeout_min=PROVIDER_TIMEOUT_MIN, log_name="qwen_voice_design")
 
+    # Saved voice preset: build it from the reference clip, then narrate with no clip at all.
+    suite(f"preset --name qwen --tag qwen_voice_preset {ASR_FLAG}",
+          timeout_min=PROVIDER_TIMEOUT_MIN, log_name="qwen_voice_preset")
+
     # The smaller checkpoint, for the speed/VRAM comparison.
     suite(f"provider --name qwen --tag qwen_clone_0.6b --model Qwen/Qwen3-TTS-12Hz-0.6B-Base {ASR_FLAG}",
           timeout_min=PROVIDER_TIMEOUT_MIN, log_name="qwen_clone_0.6b")
@@ -248,7 +267,11 @@ def provider_python(name):
     python = os.path.join(venv, "bin", "python")
     setup = PROVIDER_SETUP.get(name, {})
     if not os.path.exists(python):
-        sh(f"{sys.executable} -m venv --system-site-packages {venv}", log_name=f"install_{name}")
+        # virtualenv rather than the stdlib venv module: Debian-based images often ship without ensurepip.
+        sh(f"{sys.executable} -m pip install -q virtualenv && "
+           f"{sys.executable} -m virtualenv -q --system-site-packages {venv}", log_name=f"install_{name}")
+    if not os.path.exists(python):
+        raise RuntimeError(f"could not create a virtual environment at {venv}")
     for command in setup.get("pre", []):
         sh(command.format(python=python, venv=venv, work=WORK, repo=REPO), log_name=f"install_{name}", timeout=30 * 60)
     requirements = os.path.join("requirements", f"tts-{name}.txt")
@@ -272,8 +295,15 @@ for name in OTHER_PROVIDERS:
         print(f"❌ could not prepare an environment for {name}: {exc}")
         continue
     extra = PROVIDER_SETUP.get(name, {}).get("args", "")
-    suite(f"provider --name {name} {extra} {ASR_FLAG}", python=python,
-          timeout_min=PROVIDER_TIMEOUT_MIN, log_name=f"provider_{name}", env=provider_env(name))
+    code = suite(f"provider --name {name} {extra} {ASR_FLAG}", python=python,
+                 timeout_min=PROVIDER_TIMEOUT_MIN, log_name=f"provider_{name}", env=provider_env(name))
+    if not os.path.exists(os.path.join(RESULTS, f"provider_{name}.json")):
+        # The run died before it could record anything (killed for time or memory, or a crash at import).
+        import json
+        with open(os.path.join(RESULTS, f"provider_{name}.json"), "w") as fh:
+            json.dump({"test": f"provider_{name}", "status": "fail", "metrics": {}, "notes": [],
+                       "error": f"run ended with exit code {code} before writing a result — see logs/provider_{name}.log "
+                                f"and logs/install_{name}.log", "log_tail": []}, fh)
     # Free disk for the next engine's weights.
     sh("rm -rf ~/.cache/huggingface/hub/models--* 2>/dev/null; df -h /kaggle/working ~ | tail -2")
 """),

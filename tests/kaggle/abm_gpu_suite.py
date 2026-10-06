@@ -18,6 +18,7 @@ mastering   Rust extension: loudness target, Rust/Python text parity, GIL releas
 make-voice  Create a real-speech narrator reference clip with a preset voice.
 provider    Synthesize the test passage with one TTS engine through the real
             pipeline on all GPUs; measure speed, VRAM, loudness and word accuracy.
+preset      Save the narrator as a voice preset, then narrate from the preset alone.
 scaling     Same passage on 1 GPU and on all GPUs; reports the speed-up.
 resume      Kill a run mid-chapter, resume it, confirm cached chunks are reused.
 book        Extract a fixture book and produce an M4B with chapter markers.
@@ -678,6 +679,44 @@ def cmd_make_voice(args) -> None:
     _guarded("make_voice", body)
 
 
+def cmd_preset(args) -> None:
+    tag = args.tag or f"preset_{args.name}"
+
+    def body():
+        import torch
+        from audiobook_factory.tts_providers import get_tts_provider, provider_info
+
+        info = provider_info(args.name)
+        if not info.supports_voice_preset:
+            _write_result(tag, "skip", notes=[f"{info.display_name} has no voice-preset support."])
+            return
+        voice_file, transcript = _default_voice()
+        preset_path = os.path.join(RESULTS_DIR, "voice", f"{args.name}_preset.pt")
+        os.makedirs(os.path.dirname(preset_path), exist_ok=True)
+        _reset_gpu_state()
+        config = _build_config(args, os.path.join(RESULTS_DIR, "work", tag))
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        provider = get_tts_provider(args.name, config, device=device,
+                                    dtype_override="float16" if device != "cpu" else "float32")
+        try:
+            described = provider.save_voice_preset(preset_path, voice_file, transcript=transcript or None)
+        finally:
+            provider.cleanup()
+        preset_path = described.get("path", preset_path) if isinstance(described, dict) else preset_path
+
+        # Narrate from the preset alone: no reference clip, no transcript.
+        args.voice_preset, args.no_voice = preset_path, True
+        config = _build_config(args, os.path.join(RESULTS_DIR, "work", tag))
+        status, metrics, error, logs, notes = _measure_run(
+            config, _paragraphs(args.paragraphs), tag, score_words=not args.no_asr)
+        metrics["preset"] = {k: v for k, v in (described or {}).items()
+                             if isinstance(v, (str, int, float, bool)) or v is None}
+        metrics["preset_bytes"] = os.path.getsize(preset_path) if os.path.exists(preset_path) else 0
+        _write_result(tag, status, metrics, error, logs, notes)
+        _reset_gpu_state()
+    _guarded(tag, body)
+
+
 def cmd_scaling(args) -> None:
     tag = args.tag or f"scaling_{args.name}"
 
@@ -933,6 +972,12 @@ def main() -> None:
     provider.add_argument("--no-asr", action="store_true")
     provider.add_argument("--keep-work-dir", default="", help=argparse.SUPPRESS)
     provider.set_defaults(handler=cmd_provider)
+
+    preset = sub.add_parser("preset")
+    _add_synthesis_args(preset)
+    preset.add_argument("--paragraphs", type=int, default=3)
+    preset.add_argument("--no-asr", action="store_true")
+    preset.set_defaults(handler=cmd_preset)
 
     scaling = sub.add_parser("scaling")
     _add_synthesis_args(scaling)
