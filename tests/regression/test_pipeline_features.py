@@ -427,3 +427,24 @@ class TestRerunBehaviour:
             cfg = _config(td)
             with pytest.raises(RuntimeError, match="pip install example-tts"):
                 GPUPoolManager.instance().get_pool("mock", lambda dev: Unloadable(cfg, device=dev))
+
+
+class TestAdaptiveBatchSize:
+
+    def test_batches_shrink_after_the_provider_reports_a_limit(self):
+        sizes: list[int] = []
+
+        class ShrinksAfterFirstBatch(MockTTSProvider):
+            def synthesize_batch(self, texts, voice_ref, *, return_bytes=True):
+                sizes.append(len(texts))
+                if len(sizes) == 1:
+                    self.batch_size_limit = 2   # as a provider does after an out-of-memory split
+                return super().synthesize_batch(texts, voice_ref, return_bytes=return_bytes)
+
+        text = "\n\n".join(f"Paragraph number {i} has a sentence of its own." for i in range(12))
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _config(td, batch_size=6)
+            _install_pool(cfg, ["cpu"], ShrinksAfterFirstBatch)
+            files, _ = _run(cfg, [_chapter(1, text)])
+            assert len(files) == 1
+        assert sizes == [6, 2, 2, 2]

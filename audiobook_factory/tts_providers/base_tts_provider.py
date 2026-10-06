@@ -197,6 +197,11 @@ class BaseTTSProvider(ABC):
 
     INFO: ClassVar[ProviderInfo | None] = None
 
+    batch_size_limit: int | None = None
+    # Set by a provider after a batch ran out of memory: the largest batch
+    # that is known to fit this device. The chapter pipeline builds later
+    # batches no larger than this.
+
     def __init__(self, config: "AudiobookConfig") -> None:
         self.config = config
 

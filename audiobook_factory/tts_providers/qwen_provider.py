@@ -2059,6 +2059,11 @@ class QwenTTSProvider(BaseTTSProvider):
         if len(texts) > 1:
             if out_of_memory:
                 middle = (len(texts) + 1) // 2
+                # Tell the pipeline: batches this size do not fit this GPU, so
+                # the next ones are built smaller instead of failing and
+                # splitting every time.
+                previous = getattr(self, "batch_size_limit", None)
+                self.batch_size_limit = middle if not previous else min(previous, middle)
                 logger.warning(
                     "[QwenTTS] CUDA out of memory on %s for a batch of %d; retrying as %d + %d.",
                     self._device, len(texts), middle, len(texts) - middle,

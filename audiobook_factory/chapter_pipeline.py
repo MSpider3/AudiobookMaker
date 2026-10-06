@@ -473,6 +473,13 @@ def _stage_b_device_worker(
     try:
         batch_size = max(1, _batch_size_for(device, provider, config))
         while not cancel_token.is_cancelled:
+            limit = getattr(provider, "batch_size_limit", None)
+            if limit and limit < batch_size:
+                logger.info(
+                    "Stage B worker on %s: batch size %d -> %d after an out-of-memory retry.",
+                    device, batch_size, limit,
+                )
+                batch_size = max(1, int(limit))
             batch: list[tuple[int, str]] = []
             while len(batch) < batch_size:
                 try:
