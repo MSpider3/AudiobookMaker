@@ -552,6 +552,7 @@ class GPUPoolManager:
             # Sequential loading adds ~30s but is reliable.
 
             failed_devices: list[str] = []
+            last_error: BaseException | None = None
 
             for device, provider in pool._device_map.items():
                 try:
@@ -573,6 +574,7 @@ class GPUPoolManager:
                         exc,
                     )
                     failed_devices.append(device)
+                    last_error = exc
 
             if failed_devices:
                 logger.warning(
@@ -587,10 +589,13 @@ class GPUPoolManager:
 
                 if not pool._devices:
                     details = ", ".join(failed_devices)
+                    # Carry the real cause: "all warmups failed" alone sends
+                    # the user hunting through the log for a missing package
+                    # or an out-of-memory error.
                     raise RuntimeError(
                         f"All provider warmups failed ({details}). Cannot synthesize audio. "
-                        "Check GPU memory and model path."
-                    )
+                        f"Last error — {type(last_error).__name__}: {last_error}"
+                    ) from last_error
 
                 logger.info(
                     "Continuing with %d of %d devices: %s",

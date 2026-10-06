@@ -395,3 +395,35 @@ class TestEta:
         assert "75.0%" in lines[0] and "0:02:00" in lines[0] and "0:00:40" in lines[0]
         tracker.update(2, 0.5)   # too soon after the last report
         assert len(lines) == 1
+
+
+class TestRerunBehaviour:
+
+    def test_finished_single_file_book_is_not_resynthesized(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _config(td, single_file_mode=True, book_title="My Book")
+            provider = _install_pool(cfg, ["cpu"]).get_provider_for_device("cpu")
+            first, _ = _run(cfg, [_chapter(1), _chapter(2)])
+            batches = provider.batch_call_count
+            second, logs = _run(cfg, [_chapter(1), _chapter(2)])
+            assert second == first and os.path.exists(second[0])
+            assert provider.batch_call_count == batches, "nothing may be synthesized again"
+            assert any("Already complete" in line for line in logs)
+
+    def test_one_shot_settings_are_not_saved_to_the_progress_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            _run(_config(td), [_chapter(1), _chapter(2)])
+            _run(_config(td, redo_chapters=[2], force_reprocess=False), [_chapter(1), _chapter(2)])
+            settings = _progress(td)["settings"]
+            assert settings["redo_chapters"] == []
+            assert settings["force_reprocess"] is False
+
+    def test_warmup_failure_reports_the_real_cause(self):
+        class Unloadable(MockTTSProvider):
+            def ensure_ready(self) -> None:
+                raise RuntimeError("the engine package is not installed: pip install example-tts")
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _config(td)
+            with pytest.raises(RuntimeError, match="pip install example-tts"):
+                GPUPoolManager.instance().get_pool("mock", lambda dev: Unloadable(cfg, device=dev))

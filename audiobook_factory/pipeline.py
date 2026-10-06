@@ -591,6 +591,9 @@ def run_pipeline(
     settings_dict = {}
     try:
         settings_dict = dict(asdict(config))
+        # One-shot instructions describe this run, not the book: saved back
+        # they would wipe or redo finished chapters on every later resume.
+        settings_dict.update(force_reprocess=False, redo_chapters=[], preview_mode=False)
     except Exception as e:
         logger.warning("Error serializing config: %s", e)
 
@@ -621,6 +624,18 @@ def run_pipeline(
         int(entry["num"]): entry.get("status", "pending") for entry in progress_data["chapters"]
         if str(entry.get("num", "")).isdigit()
     }
+
+    # A finished single-file book has no per-chapter files left (they are
+    # removed once combined); without this check a re-run would see every
+    # chapter as "completed but missing" and synthesize the whole book again.
+    if config.single_file_mode and not config.force_reprocess and not redo:
+        combined_path = _combined_book_path(config)
+        if os.path.exists(combined_path) and all(
+            status_by_num.get(num) == "completed" for num, _ in tasks
+        ):
+            log(f"[Pipeline] ⏩ Already complete: {os.path.basename(combined_path)}")
+            progress(total, total)
+            return [combined_path]
 
     # ── Shared TTS Provider / GPU Pool Setup ──────────────────────────────────
     from audiobook_factory.chunk_verifier import ChunkVerifier
@@ -1012,6 +1027,15 @@ def _ffmetadata_escape(value: str) -> str:
     return out.replace("\n", " ")
 
 
+def _combined_book_path(config: AudiobookConfig) -> str:
+    """Path of the single-file audiobook for this config."""
+    from audiobook_factory.filename_sanitizer import _sanitize_base_name
+
+    return os.path.join(
+        config.output_dir, f"{_sanitize_base_name(config.book_title)}.{config.output_format}"
+    )
+
+
 def _combine_chapters(config: AudiobookConfig, files: list[str], titles: list[str]) -> str:
     """Joins chapter files into one audiobook file with chapter markers.
 
@@ -1037,7 +1061,7 @@ def _combine_chapters(config: AudiobookConfig, files: list[str], titles: list[st
     os.makedirs(work_dir, exist_ok=True)
     list_txt = os.path.join(work_dir, "concat_list.txt")
     meta_txt = os.path.join(work_dir, "concat_meta.txt")
-    full_path = os.path.join(config.output_dir, f"{_sanitize_base_name(config.book_title)}.{fmt}")
+    full_path = _combined_book_path(config)
     if os.path.abspath(full_path) in {os.path.abspath(f) for f in files}:
         full_path = os.path.join(config.output_dir, f"{_sanitize_base_name(config.book_title)} (complete).{fmt}")
 

@@ -346,7 +346,8 @@ class TestResume:
         # A later plain run must not redo it again.
         saved = json.load(open(os.path.join(out, "generation_progress.json"), encoding="utf-8"))
         again = cli.main([os.path.join(out, "generation_progress.json"), "--local", "--dry-run"])
-        assert again == 0 and saved["settings"]["redo_chapters"] == [2]
+        # The pipeline does not persist one-shot instructions.
+        assert again == 0 and saved["settings"]["redo_chapters"] == []
         assert "redo" not in capsys.readouterr().out.split("Chapters (")[1]
 
 
