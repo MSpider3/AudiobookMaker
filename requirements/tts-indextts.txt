@@ -1,0 +1,66 @@
+# ─── AudiobookMaker — IndexTTS-2.5 / IndexTTS-2 TTS provider ─────────────────
+# Provider: audiobook_factory/tts_providers/indextts_provider.py
+# Upstream: https://github.com/index-tts/index-tts  (read at commit d9e41aac)
+# Models:   IndexTeam/IndexTTS-2.5 (default), IndexTeam/IndexTTS-2
+#
+# This file lists the runtime dependencies of upstream's inference code.
+#
+# Install in TWO steps:
+#
+#   pip install -r requirements/tts-indextts.txt
+#   pip install --no-deps --ignore-requires-python "indextts @ git+https://github.com/index-tts/index-tts.git@d9e41aac89fd00b3d71497fddb287b7f24613712"
+#
+# The upstream package is installed with --no-deps on purpose: its metadata pins
+# torch==2.8.*, torchaudio==2.8.*, numpy==2.2.6, keras==2.9.0, pandas, opencv,
+# tensorboard ... and Python <3.12, none of which inference needs. This file
+# lists what the inference path really imports. torch / torchaudio are taken
+# from the environment (Kaggle / Colab stock builds).
+#
+# Instead of the second command you can clone the repository and point the
+# provider at it:  export ABM_INDEXTTS_REPO=/path/to/index-tts
+#
+# CONFLICT: IndexTTS bundles a copy of transformers' generation code that only
+# imports under transformers 4.52.x (it fails at import under 4.57.x). It
+# cannot share an environment with qwen-tts (transformers==4.57.3) — use a
+# separate environment or notebook session for each engine. transformers
+# 4.52.1 in turn requires huggingface-hub < 1.0 and tokenizers 0.21.x.
+#
+# Licence: bilibili Model Use License Agreement (custom; see the LICENSE file
+# of the upstream repository). IndexTTS-2 additionally loads amphion/MaskGCT's
+# semantic codec, which is CC-BY-NC-4.0.
+#
+# Model weights are not installed here; the provider downloads them from
+# HuggingFace on first use (no token, not gated): about 4.3 GB for
+# IndexTTS-2.5 plus about 5.3 GB of auxiliary models fetched by upstream.
+
+# ── Hard pin (upstream's vendored GPT-2 / generation code) ───────────────────
+transformers==4.52.1
+
+# ── Model code ───────────────────────────────────────────────────────────────
+accelerate>=1.8.1
+safetensors>=0.5.2
+omegaconf>=2.3.0
+einops>=0.8.1
+munch>=4.0.0
+huggingface-hub>=0.30,<1.0  # range transformers 4.52.1 accepts
+modelscope>=1.27.0          # imported unconditionally by upstream (QwenEmotion loader)
+
+# ── Audio ────────────────────────────────────────────────────────────────────
+librosa>=0.10.2
+scipy
+matplotlib                  # imported by upstream's BigVGAN utilities
+soundfile
+
+# ── Text front end ───────────────────────────────────────────────────────────
+sentencepiece>=0.2.0        # IndexTTS-2 BPE tokenizer
+tiktoken>=0.7.0             # IndexTTS-2.5 tokenizer
+openai-whisper>=20231117    # IndexTTS-2.5 tokenizer base class (whisper.tokenizer)
+pyyaml
+fugashi[unidic-lite]>=1.2.0 # Japanese reading conversion (IndexTTS-2.5)
+WeTextProcessing>=1.0.4.1; sys_platform == "linux"   # zh / en text normalisation
+wetext>=0.0.9; sys_platform != "linux"               # same, for Windows / macOS
+
+# ── Optional ─────────────────────────────────────────────────────────────────
+# nemo_text_processing      # Spanish number / date normalisation (skipped when absent)
+# deepspeed==0.17.1         # tts_options.use_deepspeed
+# flash-attn                # tts_options.use_accel
