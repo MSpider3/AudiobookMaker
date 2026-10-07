@@ -37,6 +37,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+from audiobook_factory import SOURCE_URL
 from audiobook_factory.pipeline import AudiobookConfig, preview_tts
 from audiobook_factory.voice_preprocessor import (
     PreprocessConfig,
@@ -107,8 +108,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AudiobookMaker Backend Server",
-    description="Decoupled high-performance async task runner and model server.",
+    description=(
+        "Decoupled high-performance async task runner and model server.\n\n"
+        f"Free software under AGPL-3.0-or-later. Source code: {SOURCE_URL}"
+    ),
     version="1.0.0",
+    license_info={"name": "AGPL-3.0-or-later", "url": "https://www.gnu.org/licenses/agpl-3.0.html"},
     lifespan=lifespan,
 )
 

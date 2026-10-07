@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Rebuild the Rust extension after pulling (`cd audiobook_rust && maturin develop --release`): three of these fixes are in Rust, and a stale binary keeps the old behaviour.
 
+### ⚖️ Licence
+- **Relicensed from Apache-2.0 to AGPL-3.0-or-later.** Releases up to v1.5.0 remain available under Apache-2.0. `NOTICE` carries the copyright statement, an additional permission (AGPL section 7) to combine AudiobookMaker with the separately installed TTS engines, and third-party attributions. The web UI and the API now link to the source code.
+
 ### ⚡ Added
 - **Five new TTS engines** behind a shared provider contract (`tts_providers/base_tts_provider.py`, `registry.py`): IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish Audio S2 Pro and Higgs Audio v3. Each exposes its own controls as provider options, declares its licence and VRAM needs, and installs from `requirements/tts-<engine>.txt`. Engines pin incompatible `transformers` versions, so install one per environment.
 - **Qwen3-TTS reworked**: validated preset speakers (CustomVoice), designed voices that are designed once and then cloned for the whole book on every GPU (VoiceDesign), saved voice presets, per-chunk token budgets against runaway generation, and every upstream sampling control.

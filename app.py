@@ -87,6 +87,7 @@ from audiobook_factory.voice_preprocessor import (  # noqa: E402
 from audiobook_factory.pipeline import (  # noqa: E402
     AudiobookConfig, CancelToken, run_pipeline, preview_tts, preview_chapters,
 )
+from audiobook_factory import SOURCE_URL  # noqa: E402
 from audiobook_factory.utils import decode_done_message  # noqa: E402
 from audiobook_factory.progress_io import (  # noqa: E402
     read_progress_file, write_progress_file,
@@ -3797,6 +3798,8 @@ def build_app() -> gr.Blocks:
           <h1>📖 AudiobookMaker</h1>
           <p>Turn a book into an audiobook read by one narrator voice.</p>
           <span style="background: rgba(128,128,128,0.18); padding: 4px 12px; border-radius: 12px; font-size: 0.9em; font-weight: bold; display: inline-block; margin-top: 6px;">{html.escape(_gpu_badge())}</span>
+          <p style="font-size: 0.8em; opacity: 0.75; margin-top: 8px;">Free software under AGPL-3.0-or-later ·
+            <a href="{html.escape(SOURCE_URL)}" target="_blank" rel="noopener">source code</a></p>
         </div>
         """)
 

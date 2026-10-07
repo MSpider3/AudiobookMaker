@@ -1,7 +1,7 @@
 # 📖 AudiobookMaker
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
-![License](https://img.shields.io/badge/License-Apache%202.0-blue)
+![License](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue)
 ![UI](https://img.shields.io/badge/UI-Gradio-orange)
 ![Colab](https://img.shields.io/badge/Google%20Colab-Supported-yellow?logo=googlecolab)
 ![Kaggle](https://img.shields.io/badge/Kaggle-Supported-blue?logo=kaggle)
@@ -539,5 +539,11 @@ The voice preprocessing pipeline in this project (noise reduction, noise gate, h
 
 ## 📄 License
 
-Apache 2.0 — see [LICENSE](LICENSE) for details.
+**AGPL-3.0-or-later** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+- You may use, modify and redistribute AudiobookMaker, including commercially, as long as derived versions stay under the same licence and come with their source.
+- AudiobookMaker has a web UI and an HTTP API: if you run a modified version for others over a network, you must offer them its source (AGPL section 13).
+- The audiobooks you generate are yours; the licence of the software does not apply to them. The licence of the **TTS engine** you used does — see [TTS engines](#-tts-engines).
+- The optional TTS engines are installed separately under their own licences; `NOTICE` grants an additional permission to combine AudiobookMaker with them.
+- Releases up to v1.5.0 were published under Apache-2.0 and remain available under it.
 
