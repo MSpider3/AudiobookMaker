@@ -56,9 +56,17 @@ When it finishes, download **`/kaggle/working/abm_test_results.zip`** (Output pa
 |---|---|---|
 | Setup | clone, dependencies, Rust extension | 10–15 min |
 | CPU tests | unit suite, book extraction on every fixture format, mastering | 5 min |
-| Qwen3-TTS | cloning, preset voice, designed voice, saved preset, 1-vs-2 GPU speed-up, resume, full book → M4B | 30–45 min |
-| Other engines | IndexTTS-2.5, OmniVoice, MOSS-TTS, Fish S2 Pro, Higgs Audio v3 — each in its own environment, 3–13 GB of weights each | 15–40 min each |
+| Qwen3-TTS | cloning, preset voice, designed voice, saved preset, resume, short book → M4B, CLI | 30–45 min |
+| Two-GPU speed-up | four chapters of the long English book on 1 GPU, then on 2 | 15–25 min |
+| Whole book | the 20-page English book, every chapter → one M4B; time, memory, accuracy over the whole book | 20–35 min |
+| Languages | one passage each in French, Russian, Chinese, Japanese, Korean (Qwen) and Hindi (engines that support it) | 15–20 min |
+| API server and web UI | started as real programs; a chapter generated through each | 10 min |
+| Other engines | IndexTTS-2.5, OmniVoice, MOSS-TTS, Fish S2 Pro, Higgs Audio v3 — each in its own environment; cloning, Hindi where supported, 1-vs-2 GPU | 25–60 min each |
+| Voice similarity | how close every cloned voice is to the narrator clip | 3 min |
 | Report | `REPORT.md` + `abm_test_results.zip` | 1 min |
+
+The full run takes roughly 5–6 hours. Every block has a switch in the settings cell; turn off what you
+do not need.
 """),
         _md("## 1 · Settings"),
         _code(f"""
@@ -72,10 +80,22 @@ OTHER_PROVIDERS = ["indextts", "omnivoice", "moss", "fish", "higgs"]
 
 RUN_UNIT_TESTS   = True    # pytest suite (mock engine, CPU)
 RUN_QWEN_MODES   = True    # preset speaker, designed voice, saved voice preset
-RUN_SCALING      = True    # same text on 1 GPU and on 2 GPUs
+RUN_SCALING      = True    # four chapters of the long English book on 1 GPU and on 2 GPUs (Qwen)
 RUN_RESUME       = True    # kill a run mid-chapter and resume it
 RUN_BOOK         = True    # fixture EPUB and MOBI -> M4B with chapter markers (pipeline and cli.py)
+RUN_LONG_BOOK    = True    # the whole 20-page English book -> one M4B (Qwen)
+RUN_LANGUAGES    = True    # one passage per language, see LANGUAGES below
+RUN_API_AND_UI   = True    # start the API server and the web UI and generate through each (Qwen)
+RUN_SIMILARITY   = True    # score how close each cloned voice is to the narrator clip
 ASR_SCORING      = True    # transcribe each result with Whisper and score word accuracy
+
+# 20-page test books exist in en, fr, ru, hi, zh, ja, ko (tests/kaggle/assets/books/long_book_<code>.epub).
+LANGUAGES             = ["fr", "ru", "zh", "ja", "ko", "hi"]   # tried with Qwen; it skips what it does not support (Hindi)
+OTHER_ENGINE_LANGUAGES = ["hi"]   # tried with each other engine that supports them; add more codes to widen the test
+LANGUAGE_SECONDS      = 60        # length of the passage spoken per language
+LONG_BOOK_CHAPTERS    = 0         # chapters of the long book to narrate; 0 = all ten
+SCALING_OTHER_ENGINES = True      # also measure 1-vs-2 GPU for every other engine (adds 5-25 min each)
+SCALING_OTHER_CHUNKS  = 16        # chunks for that measurement, in batches of 4
 
 # Test inputs, read from the cloned repository (paths are relative to the repo root).
 # To test another voice, point VOICE_FILE at any 5-30 s clip of clean speech (an absolute
@@ -87,7 +107,8 @@ ASSETS_DIR       = "tests/kaggle/assets"
 VOICE_FILE       = "tests/kaggle/assets/voice/LOTM_narrator_voice.wav"
 VOICE_TRANSCRIPT = "tests/kaggle/assets/voice/LOTM_narrator_voice.txt"
 
-PROVIDER_TIMEOUT_MIN = 60  # per engine, including model download
+PROVIDER_TIMEOUT_MIN = 60  # per test, including model download
+LONG_RUN_TIMEOUT_MIN = 120 # whole-book and all-language runs
 """),
         _md("## 2 · Environment check"),
         _code("""
@@ -293,13 +314,25 @@ if RUN_QWEN_MODES:
 """),
         _code("""
 if RUN_SCALING:
-    suite("scaling --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="scaling_qwen")
+    # Several batches per GPU: with a dozen chunks one GPU takes them all in one batch and a second GPU cannot help.
+    suite("scaling --name qwen --book-chapters 4", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="scaling_qwen")
 if RUN_RESUME:
     suite("resume --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="resume_qwen")
 if RUN_BOOK:
     suite("book --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="book_qwen")
     # The headless CLI on the MOBI fixture: dry run, real run to M4B, and a re-run that must skip.
     suite("cli --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="cli_qwen")
+if RUN_LONG_BOOK:
+    # A complete book of realistic length: all ten chapters, automatic batch size, both GPUs.
+    suite(f"longbook --name qwen --max-chapters {LONG_BOOK_CHAPTERS} {ASR_FLAG}",
+          timeout_min=LONG_RUN_TIMEOUT_MIN, log_name="longbook_qwen")
+if RUN_LANGUAGES and LANGUAGES:
+    suite(f"languages --name qwen --langs {','.join(LANGUAGES)} --seconds {LANGUAGE_SECONDS} {ASR_FLAG}",
+          timeout_min=LONG_RUN_TIMEOUT_MIN, log_name="languages_qwen")
+if RUN_API_AND_UI:
+    # The server programs themselves, not their functions: start, use over HTTP, stop.
+    suite("api --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="api_qwen")
+    suite("ui --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="ui_qwen")
 
 def free_model_cache():
     \"\"\"Deletes downloaded TTS weights (keeps Whisper, which every engine's scoring reuses).\"\"\"
@@ -361,10 +394,19 @@ for name in OTHER_PROVIDERS:
             json.dump({"test": f"provider_{name}", "status": "fail", "metrics": {}, "notes": [],
                        "error": f"run ended with exit code {code} before writing a result — see logs/provider_{name}.log "
                                 f"and logs/install_{name}.log", "log_tail": []}, fh)
+    if RUN_LANGUAGES and OTHER_ENGINE_LANGUAGES:
+        suite(f"languages --name {name} --langs {','.join(OTHER_ENGINE_LANGUAGES)} --seconds {LANGUAGE_SECONDS} {extra} {ASR_FLAG}",
+              python=python, timeout_min=PROVIDER_TIMEOUT_MIN, log_name=f"languages_{name}", env=provider_env(name))
+    if SCALING_OTHER_ENGINES:
+        suite(f"scaling --name {name} --chunks {SCALING_OTHER_CHUNKS} --batch-size 4 {extra}",
+              python=python, timeout_min=PROVIDER_TIMEOUT_MIN, log_name=f"scaling_{name}", env=provider_env(name))
     free_model_cache()   # make room for the next engine's weights
 """),
         _md("## 8 · Report"),
         _code("""
+if RUN_SIMILARITY:
+    # Compares the voice of every sample above with the narrator clip.
+    suite("similarity", timeout_min=20)
 suite("report")
 
 from IPython.display import Markdown, display

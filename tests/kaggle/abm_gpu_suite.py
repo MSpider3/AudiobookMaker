@@ -23,12 +23,18 @@ scaling     Same passage on 1 GPU and on all GPUs; reports the speed-up.
 resume      Kill a run mid-chapter, resume it, confirm cached chunks are reused.
 book        Extract a fixture book and produce an M4B with chapter markers.
 cli         Drive cli.py for real: MOBI fixture -> M4B, dry run, provider listing, re-run.
+longbook    A whole twenty-page book through the pipeline: time, memory, accuracy.
+languages   One passage per language (French, Russian, Chinese, Japanese, Korean, Hindi).
+similarity  How close each cloned voice is to the narrator clip (speaker embeddings).
+api         Start the FastAPI server and run a job through it with the CLI.
+ui          Start the Gradio app and generate a chapter through it.
 report      Aggregate every result into REPORT.md and results.zip.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import platform
 import queue
@@ -59,6 +65,17 @@ _FIXTURES: str = (
 _SYNTHETIC_VOICE: str = os.path.join(_ROOT, "tests", "fixtures", "audio", "synthetic_voice_reference.wav")
 
 _MAX_WORD_ERROR_RATE: float = 0.30
+# Other languages are scored more loosely: Whisper spells numerals, kanji and
+# kana its own way, which counts as errors although the speech is right.
+_LANGUAGE_ERROR_LIMIT: float = 0.35
+_LANGUAGE_ERROR_FAIL: float = 0.60
+_SIMILARITY_MODEL: str = "microsoft/wavlm-base-plus-sv"
+# Tests whose voice is deliberately not the narrator: they show what the
+# similarity score of a different speaker looks like.
+_UNCLONED_TAGS: tuple[str, ...] = ("qwen_custom_voice", "qwen_voice_design")
+_EXCERPT_SECONDS: int = 120
+_API_PORT: int = 8000
+_UI_PORT: int = 7860
 _LOUDNESS_TOLERANCE_LU: float = 2.0
 _LOG_TAIL_LINES: int = 60
 
@@ -617,7 +634,8 @@ def _reset_gpu_state() -> None:
         print(f"(could not reset GPU state: {exc})")
 
 
-def _measure_run(config, paragraphs: tuple[str, ...], tag: str, score_words: bool = True) -> tuple[str, dict, str, list[str], list[str]]:
+def _measure_run(config, paragraphs: tuple[str, ...], tag: str, score_words: bool = True,
+                 max_error_rate: float = _MAX_WORD_ERROR_RATE) -> tuple[str, dict, str, list[str], list[str]]:
     """Runs one synthesis job and measures it. Returns (status, metrics, error, logs, notes)."""
     import torch
     from audiobook_factory.chunk_verifier import error_rate, expected_seconds
@@ -702,8 +720,8 @@ def _measure_run(config, paragraphs: tuple[str, ...], tag: str, score_words: boo
             rate = error_rate(spoken, transcript)
             metrics["word_error_rate"] = round(rate, 3)
             metrics["transcript_head"] = transcript[:240]
-            if rate > _MAX_WORD_ERROR_RATE:
-                problems.append(f"word error rate {rate:.0%} (limit {_MAX_WORD_ERROR_RATE:.0%})")
+            if rate > max_error_rate:
+                problems.append(f"word error rate {rate:.0%} (limit {max_error_rate:.0%})")
 
     try:
         with open(os.path.join(config.output_dir, "generation_progress.json"), encoding="utf-8") as fh:
@@ -838,32 +856,94 @@ def cmd_preset(args) -> None:
     _guarded(tag, body)
 
 
+def _long_books() -> list[dict]:
+    """Entries of long_books.json: the twenty-page test books, one per language."""
+    try:
+        with open(os.path.join(_FIXTURES, "long_books.json"), encoding="utf-8") as fh:
+            return list(json.load(fh)["books"])
+    except (OSError, ValueError, KeyError):
+        return []
+
+
+def _long_book(code: str) -> dict | None:
+    """The long test book for a language code ("en", "fr", ...), or None."""
+    return next((book for book in _long_books() if book.get("code") == code), None)
+
+
+def _book_chapters(entry: dict) -> list:
+    """Extracts a long test book; returns its chapters that have text."""
+    from audiobook_factory.text_extractor import extract
+
+    chapters, _cover = extract(os.path.join(_FIXTURES, entry["file"]), enable_ocr=False, log_fn=lambda *_: None)
+    chapters = [chapter for chapter in chapters if chapter.text.strip()]
+    for chapter in chapters:
+        chapter.sentences = []
+    return chapters
+
+
+def _keep_excerpt(path: str, seconds: int = _EXCERPT_SECONDS) -> None:
+    """Shortens a sample to its first *seconds*, so the archive stays small."""
+    if not os.path.exists(path):
+        return
+    shortened = f"{path}.cut{os.path.splitext(path)[1]}"
+    done = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", path, "-t", str(seconds), "-c", "copy", shortened],
+                          capture_output=True)
+    if done.returncode == 0 and os.path.exists(shortened) and os.path.getsize(shortened) > 1000:
+        os.replace(shortened, path)
+    elif os.path.exists(shortened):
+        os.remove(shortened)
+
+
 def cmd_scaling(args) -> None:
+    """Same text on one GPU and on all of them.
+
+    The text has to be several batches long. With a dozen chunks one GPU
+    takes them all in a single batch, and a batch costs about the same time
+    whatever its size, so two GPUs with half a batch each look no faster.
+    """
     tag = args.tag or f"scaling_{args.name}"
 
     def body():
         import torch
         visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        if visible < 2:
+        if visible < 2 and not args.allow_single_gpu:
             _write_result(tag, "skip", {"gpu_count": visible}, notes=["Needs two GPUs."])
             return
-        paragraphs = TEST_PARAGRAPHS * max(1, args.repeat)
+        entry = _long_book("en")
+        if args.chunks > 0 or entry is None:
+            paragraphs = _paragraphs(args.chunks or 48)
+            source = f"{len(paragraphs)} test paragraphs"
+        else:
+            chapters = _book_chapters(entry)[: max(1, args.book_chapters)]
+            paragraphs = tuple(p for chapter in chapters for p in chapter.text.split("\n\n") if p.strip())
+            source = f"first {len(chapters)} chapter(s) of {entry['file']}"
         runs = {}
         for label, gpus in (("one_gpu", 1), ("all_gpus", 0)):
             args.gpus = gpus
             config = _build_config(args, os.path.join(RESULTS_DIR, "work", f"{tag}_{label}"), verify_chunks="duration")
             status, metrics, error, _logs, _notes = _measure_run(config, paragraphs, f"{tag}_{label}", score_words=False)
             runs[label] = {"status": status, "error": error, **{
-                k: metrics.get(k) for k in ("synthesis_seconds", "audio_seconds", "speed_x_realtime", "device_share", "vram_peak_gb")
+                k: metrics.get(k) for k in ("synthesis_seconds", "audio_seconds", "speed_x_realtime", "chunks",
+                                            "device_share", "vram_peak_gb")
             }}
+            sample = os.path.join(RESULTS_DIR, "samples", f"{tag}_{label}.mp3")
+            if label == "one_gpu" and os.path.exists(sample):
+                os.remove(sample)          # same text twice; one excerpt is enough
+            else:
+                _keep_excerpt(sample)
         one, both = runs["one_gpu"].get("synthesis_seconds"), runs["all_gpus"].get("synthesis_seconds")
         speedup = round(one / both, 2) if one and both else None
         ok = all(r["status"] == "pass" for r in runs.values()) and speedup is not None
         notes = []
-        if speedup is not None and speedup < 1.4:
-            notes.append("Less than 1.4x from the second GPU — check 'device_share' and batch sizes.")
-        _write_result(tag, "pass" if ok else "fail", {"speedup": speedup, **runs},
-                      error="" if ok else "; ".join(r["error"] for r in runs.values() if r["error"]), notes=notes)
+        if speedup is not None and speedup < 1.5 and visible >= 2:
+            notes.append(
+                f"{speedup}x from {visible} GPUs. In 'device_share' of the all-GPU run, similar busy times on "
+                "both devices mean they did work side by side; then the limit is elsewhere (CPU, batch count)."
+            )
+        _write_result(tag, "pass" if ok else "fail", {
+            "speedup": speedup, "gpu_count": visible, "text": source,
+            "batch_size": args.batch_size or "automatic", **runs,
+        }, error="" if ok else "; ".join(r["error"] for r in runs.values() if r["error"]), notes=notes)
         _reset_gpu_state()
     _guarded(tag, body)
 
@@ -1041,6 +1121,571 @@ def cmd_cli(args) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Long book, languages, voice similarity
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _WarningCapture(logging.Handler):
+    """Collects the library's warnings during a run (out-of-memory retries, rejected chunks)."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.messages.append(f"{record.levelname} {record.name}: {record.getMessage()}"[:300])
+        except Exception:
+            pass
+
+
+def _peak_rss_gb() -> float | None:
+    """Highest resident memory of this process so far, in GB."""
+    try:
+        import resource
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 2)   # Linux reports KiB
+    except Exception:
+        return None
+
+
+def cmd_longbook(args) -> None:
+    """A complete twenty-page book: every chapter, one M4B, timed and scored."""
+    tag = args.tag or f"longbook_{args.name}"
+
+    def body():
+        import torch
+        from audiobook_factory.chunk_verifier import error_rate, expected_seconds
+
+        entry = _long_book(args.lang)
+        if entry is None:
+            _write_result(tag, "fail", error=f"no long test book for language code {args.lang!r} in {_FIXTURES}")
+            return
+        chapters = _book_chapters(entry)
+        if args.max_chapters > 0:
+            chapters = chapters[: args.max_chapters]
+        work = os.path.join(RESULTS_DIR, "work", tag)
+        config = _build_config(args, work, output_format="m4b", single_file_mode=True,
+                               book_title=entry["title"], author=entry["author"], language=entry["language"])
+        _reset_gpu_state()
+        shutil.rmtree(work, ignore_errors=True)
+        capture = _WarningCapture()
+        library_log = logging.getLogger("audiobook_factory")
+        library_log.addHandler(capture)
+        try:
+            files, logs, error, wall = _run_pipeline(config, chapters)
+        finally:
+            library_log.removeHandler(capture)
+        messages = [m for _, m in logs]
+        metrics: dict[str, Any] = {
+            "book": entry["file"], "language": entry["language"], "chapters": len(chapters),
+            "wall_seconds": round(wall, 1), "peak_ram_gb": _peak_rss_gb(),
+            "library_warnings": len(capture.messages), "first_warnings": capture.messages[:12],
+            "out_of_memory_retries": sum("out of memory" in m.lower() or "out-of-memory" in m.lower()
+                                         for m in capture.messages),
+            "device_share_per_chapter": [m.split("Device share:", 1)[1].strip() for m in messages if "Device share:" in m],
+        }
+        if torch.cuda.is_available():
+            metrics["vram_peak_gb"] = {
+                f"cuda:{i}": round(torch.cuda.max_memory_allocated(i) / 2**30, 2)
+                for i in range(torch.cuda.device_count())
+            }
+        start = next((stamp for stamp, m in logs if "Synthesizing" in m), None)
+        end = next((stamp for stamp, m in reversed(logs) if "of audio." in m), None)
+        if start is not None and end is not None:
+            metrics["synthesis_seconds"] = round(end - start, 1)
+        try:
+            with open(os.path.join(work, "generation_progress.json"), encoding="utf-8") as fh:
+                entries = json.load(fh)["chapters"]
+            metrics["chapters_completed"] = sum(e.get("status") == "completed" for e in entries)
+            metrics["flagged_chunks"] = sum(len(e.get("flagged_chunks", [])) for e in entries)
+        except Exception as exc:
+            metrics["progress_file_error"] = str(exc)
+        if error is not None or not files or not os.path.exists(files[0]):
+            _write_result(tag, "fail", metrics, error=str(error) if error else "no output file", log_tail=messages)
+            return
+
+        problems: list[str] = []
+        notes: list[str] = []
+        probe = json.loads(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_chapters", "-show_format", "-of", "json", files[0]],
+            capture_output=True, text=True, check=True).stdout)
+        markers = [c.get("tags", {}).get("title", "") for c in probe.get("chapters", [])]
+        audio_seconds = float(probe["format"].get("duration", 0))
+        spoken = " ".join(_spoken_text(config, tuple(c.text.split("\n\n"))) for c in chapters)
+        expected = expected_seconds(spoken, config.speed)
+        metrics.update({
+            "output_file": os.path.basename(files[0]), "output_mb": round(os.path.getsize(files[0]) / 2**20, 1),
+            "audio_minutes": round(audio_seconds / 60, 1), "expected_minutes": round(expected / 60, 1),
+            "chapter_markers": len(markers),
+        })
+        if metrics.get("synthesis_seconds"):
+            metrics["speed_x_realtime"] = round(audio_seconds / metrics["synthesis_seconds"], 2)
+        if markers != [c.title for c in chapters]:
+            problems.append(f"{len(markers)} chapter markers for {len(chapters)} chapters")
+        if metrics.get("chapters_completed") != len(chapters):
+            problems.append(f"only {metrics.get('chapters_completed')} of {len(chapters)} chapters completed")
+        if not 0.5 * expected <= audio_seconds <= 2.0 * expected:
+            problems.append(f"audio is {audio_seconds / 60:.0f} min, expected about {expected / 60:.0f} min")
+
+        _reset_gpu_state()   # make room for the ASR model
+        samples = _decode_to_mono(files[0])
+        lufs = _loudness(samples, 16000)
+        metrics["loudness_lufs"] = None if lufs is None else round(lufs, 2)
+        if lufs is not None and abs(lufs - config.lufs) > _LOUDNESS_TOLERANCE_LU:
+            problems.append(f"loudness {lufs:.1f} LUFS, target {config.lufs}")
+        if not args.no_asr:
+            try:
+                transcript = _transcribe(samples, config.language)
+            except Exception as exc:
+                transcript = None
+                notes.append(f"ASR scoring failed: {exc}")
+            if transcript is None:
+                notes.append("ASR unavailable — word accuracy not scored.")
+            else:
+                rate = error_rate(spoken, transcript)
+                metrics["word_error_rate"] = round(rate, 3)
+                limit = _MAX_WORD_ERROR_RATE if entry["code"] == "en" else _LANGUAGE_ERROR_LIMIT
+                if rate > limit:
+                    problems.append(f"word error rate {rate:.0%} over the whole book (limit {limit:.0%})")
+
+        samples_dir = os.path.join(RESULTS_DIR, "samples")
+        os.makedirs(samples_dir, exist_ok=True)
+        excerpt = os.path.join(samples_dir, f"{tag}.m4b")
+        shutil.copyfile(files[0], excerpt)
+        _keep_excerpt(excerpt, 180)
+        notes.append(f"The sample is the first 3 minutes; the whole book is {files[0]}.")
+        _write_result(tag, "pass" if not problems else "fail", metrics, error="; ".join(problems),
+                      log_tail=messages, notes=notes)
+        _reset_gpu_state()
+    _guarded(tag, body)
+
+
+def _leading_paragraphs(text: str, seconds: float) -> tuple[str, ...]:
+    """The first paragraphs of *text* that add up to about *seconds* of speech."""
+    from audiobook_factory.chunk_verifier import expected_seconds
+
+    chosen: list[str] = []
+    total = 0.0
+    for paragraph in (p.strip() for p in text.split("\n\n")):
+        if not paragraph:
+            continue
+        chosen.append(paragraph)
+        total += expected_seconds(paragraph)
+        if total >= seconds:
+            break
+    return tuple(chosen)
+
+
+def cmd_languages(args) -> None:
+    """One passage of each long test book, spoken in its own language."""
+    from audiobook_factory.tts_providers import provider_info
+
+    info = provider_info(args.name)
+    supported = {name.lower() for name in info.languages}
+    wanted = [code.strip().lower() for code in args.langs.split(",") if code.strip()]
+    wanted = wanted or [book["code"] for book in _long_books() if book["code"] != "en"]
+    for code in wanted:
+        tag = f"lang_{args.name}_{code}"
+        entry = _long_book(code)
+        if entry is None:
+            _write_result(tag, "fail", error=f"no long test book for language code {code!r} in {_FIXTURES}")
+            continue
+        if supported and entry["language"].lower() not in supported:
+            _write_result(tag, "skip", {"language": entry["language"], "engine": info.display_name},
+                          notes=[f"{info.display_name} does not list {entry['language']} as a supported language."])
+            continue
+
+        def body(entry=entry, tag=tag):
+            paragraphs = _leading_paragraphs(_book_chapters(entry)[0].text, args.seconds)
+            config = _build_config(args, os.path.join(RESULTS_DIR, "work", tag), language=entry["language"])
+            status, metrics, error, logs, notes = _measure_run(
+                config, paragraphs, tag, score_words=not args.no_asr, max_error_rate=_LANGUAGE_ERROR_LIMIT,
+            )
+            metrics.update(language=entry["language"], book=entry["file"],
+                           passage_characters=sum(len(p) for p in paragraphs))
+            rate = metrics.get("word_error_rate")
+            only_words = error.startswith("word error rate") and ";" not in error
+            if status == "fail" and only_words and rate is not None and rate <= _LANGUAGE_ERROR_FAIL:
+                # The audio has the right length and level; the transcript
+                # differs. That can be Whisper's spelling as much as the speech.
+                status = "warn"
+                notes.append("Transcript differs more than the limit. Whisper writes numerals and "
+                             "(for Japanese) kanji/kana its own way — listen to the sample before judging.")
+            _write_result(tag, status, metrics, error, logs, notes)
+            _reset_gpu_state()
+        _guarded(tag, body)
+
+
+def _speaker_embedding(model, extractor, samples, device: str):
+    """Mean speaker embedding over up to six 10-second windows spread through *samples* (16 kHz)."""
+    import numpy as np
+    import torch
+
+    window = 10 * 16000
+    if len(samples) <= window:
+        pieces = [samples]
+    else:
+        starts = np.linspace(0, len(samples) - window, num=min(6, max(2, len(samples) // window)), dtype=int)
+        pieces = [samples[start:start + window] for start in starts]
+    vectors = []
+    for piece in pieces:
+        if len(piece) < 16000:
+            continue
+        inputs = extractor(piece, sampling_rate=16000, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            vector = model(**{key: value.to(device) for key, value in inputs.items()}).embeddings[0]
+        vectors.append(torch.nn.functional.normalize(vector, dim=-1))
+    if not vectors:
+        return None
+    return torch.nn.functional.normalize(torch.stack(vectors).mean(dim=0), dim=-1)
+
+
+def cmd_similarity(_args) -> None:
+    """Scores how close each sample's voice is to the narrator clip.
+
+    Word accuracy says the right words were spoken, not who seems to speak
+    them. A speaker-verification model gives a number for that: the cosine
+    similarity between the narrator clip and each result. The preset and
+    designed Qwen voices are other speakers on purpose and show what a
+    different voice scores.
+    """
+    def body():
+        import torch
+        from transformers import AutoFeatureExtractor, WavLMForXVector
+
+        voice_file, _ = _default_voice()
+        samples_dir = os.path.join(RESULTS_DIR, "samples")
+        names = sorted(os.listdir(samples_dir)) if os.path.isdir(samples_dir) else []
+        if not names:
+            _write_result("similarity", "skip", notes=["No audio samples to compare yet."])
+            return
+        _reset_gpu_state()
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        extractor = AutoFeatureExtractor.from_pretrained(_SIMILARITY_MODEL)
+        model = WavLMForXVector.from_pretrained(_SIMILARITY_MODEL).to(device).eval()
+
+        narrator = _decode_to_mono(voice_file)
+        reference = _speaker_embedding(model, extractor, narrator, device)
+        half = len(narrator) // 2
+        first, second = (_speaker_embedding(model, extractor, part, device) for part in (narrator[:half], narrator[half:]))
+        ceiling = float(torch.dot(first, second)) if first is not None and second is not None else None
+
+        scores: dict[str, float] = {}
+        for name in names:
+            try:
+                vector = _speaker_embedding(model, extractor, _decode_to_mono(os.path.join(samples_dir, name)), device)
+            except Exception as exc:
+                print(f"(could not embed {name}: {exc})")
+                continue
+            if vector is not None:
+                scores[os.path.splitext(name)[0]] = round(float(torch.dot(reference, vector)), 3)
+        others = {tag: score for tag, score in scores.items() if tag in _UNCLONED_TAGS}
+        clones = {tag: score for tag, score in scores.items() if tag not in _UNCLONED_TAGS}
+        floor = max(others.values()) if others else None
+        weak = sorted(tag for tag, score in clones.items() if floor is not None and score <= floor + 0.02)
+        rows = [[tag, f"{score:.3f}", "other voice (reference)" if tag in others
+                 else "weak — no closer than another voice" if tag in weak else "clone"]
+                for tag, score in sorted(scores.items(), key=lambda item: -item[1])]
+        notes = [
+            "1.0 = same voice. Compare each clone with the two halves of the narrator clip "
+            f"({'n/a' if ceiling is None else f'{ceiling:.3f}'}) and with the other voices"
+            f" ({', '.join(f'{v:.3f}' for v in others.values()) or 'none in this run'}).",
+            "This is a model's opinion of timbre; it does not hear pacing or expressiveness. Listen as well.",
+        ]
+        _write_result("similarity", "warn" if weak else "pass", {
+            "model": _SIMILARITY_MODEL, "narrator_clip": os.path.basename(voice_file),
+            "same_voice_reference": None if ceiling is None else round(ceiling, 3),
+            "other_voice_scores": others, "clone_scores": clones,
+            "lowest_clone": min(clones.values()) if clones else None,
+            "table": {"headers": ["Sample", "Similarity to narrator", "Kind"], "rows": rows},
+        }, error=f"no closer to the narrator than another voice: {', '.join(weak)}" if weak else "", notes=notes)
+        del model
+        _reset_gpu_state()
+    _guarded("similarity", body)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API server and web UI, as running programs
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _start_server(command: list[str], env: dict[str, str], log_name: str):
+    """Starts a server in its own process group, logging to the results folder."""
+    log_dir = os.path.join(RESULTS_DIR, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    handle = open(os.path.join(log_dir, f"{log_name}.log"), "w", encoding="utf-8")
+    process = subprocess.Popen(command, cwd=_ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    process._abm_log = handle   # closed in _stop_server
+    return process
+
+
+def _stop_server(process) -> None:
+    """Stops a server started by :func:`_start_server`, with its children."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if process.poll() is not None:
+            break
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            continue
+    handle = getattr(process, "_abm_log", None)
+    if handle is not None:
+        handle.close()
+
+
+def _port_in_use(port: int) -> bool:
+    """True when something already listens on *port* (a server left from an earlier run)."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1.0)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _wait_for_http(url: str, process, timeout: float) -> bool:
+    """True once *url* answers 200; False if the server exits or time runs out."""
+    import requests
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            if requests.get(url, timeout=3).status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return False
+
+
+def _server_log_tail(name: str, lines: int = 40) -> list[str]:
+    try:
+        with open(os.path.join(RESULTS_DIR, "logs", f"{name}.log"), encoding="utf-8", errors="replace") as fh:
+            return fh.read().splitlines()[-lines:]
+    except OSError:
+        return []
+
+
+def cmd_api(args) -> None:
+    """Starts the real API server and sends a job through it with the CLI."""
+    tag = args.tag or f"api_{args.name}"
+
+    def body():
+        import requests
+
+        secret = "abm-test-secret"
+        base = f"http://127.0.0.1:{_API_PORT}"
+        work = os.path.join(RESULTS_DIR, "work", tag)
+        shutil.rmtree(work, ignore_errors=True)
+        if _port_in_use(_API_PORT):
+            # Otherwise the checks below would talk to that other server.
+            _write_result(tag, "fail", error=f"port {_API_PORT} is already in use — stop the other API server first")
+            return
+        _reset_gpu_state()
+        # The server only writes inside its output base; put that around the work folder.
+        env = dict(os.environ, ABM_API_SECRET=secret, ABM_API_URL=base, PYTHONUNBUFFERED="1",
+                   ABM_OUTPUT_BASE=os.path.join(RESULTS_DIR, "work"))
+        server = _start_server([sys.executable, os.path.join(_ROOT, "start_api.py")], env, f"{tag}_server")
+        metrics: dict[str, Any] = {}
+        problems: list[str] = []
+        output: list[str] = []
+        try:
+            if not _wait_for_http(f"{base}/api/v1/health", server, args.startup_timeout):
+                _write_result(tag, "fail", error="the API server did not become healthy",
+                              log_tail=_server_log_tail(f"{tag}_server"))
+                return
+            metrics["health"] = requests.get(f"{base}/api/v1/health", timeout=10).json()
+            headers = {"x-api-key": secret}
+            metrics["providers_without_key"] = requests.get(f"{base}/api/v1/providers", timeout=30).status_code
+            if metrics["providers_without_key"] != 401:
+                problems.append(f"a request without the API key got {metrics['providers_without_key']}, not 401")
+            listed = requests.get(f"{base}/api/v1/providers", headers=headers, timeout=120,
+                                  params={"include_hidden": "true"})
+            names = [p.get("name") for p in listed.json().get("providers", [])] if listed.ok else []
+            metrics["providers_listed"] = len(names)
+            if args.name not in names:
+                problems.append(f"/providers does not list {args.name!r} (status {listed.status_code})")
+            bad = requests.post(f"{base}/api/v1/generate", headers=headers, timeout=60,
+                                json={"config": {"tts_provider_name": "no-such-engine"}, "chapters": []})
+            metrics["invalid_request_status"] = bad.status_code
+            if bad.status_code < 400:
+                problems.append("an invalid generation request was accepted")
+
+            voice_file, transcript = _default_voice()
+            command = [sys.executable, os.path.join(_ROOT, "cli.py"), "--book", args.book or
+                       os.path.join(_FIXTURES, "dummy_book.epub"), "--provider", args.name,
+                       "--chapters", args.chapters, "--output-format", "mp3", "--output-dir", work,
+                       "--verify", args.verify, "--seed", str(args.seed)]
+            if args.model:
+                command += ["--tts-model-name", args.model]
+            if voice_file:
+                command += ["--voice-file", voice_file]
+            if transcript:
+                command += ["--voice-transcript", transcript]
+            started = time.monotonic()
+            run = subprocess.run(command, cwd=_ROOT, env=env, capture_output=True, text=True,
+                                 timeout=args.timeout_min * 60)
+            output = (run.stdout + run.stderr).splitlines()
+            print("\n".join(output[-40:]))
+            metrics.update(cli_exit_code=run.returncode, wall_seconds=round(time.monotonic() - started, 1))
+            if run.returncode != 0:
+                problems.append(f"cli.py (through the API) exited {run.returncode}")
+            declined = next((line.strip() for line in output if "Not using the API server" in line), "")
+            if declined:
+                problems.append(declined[:200])
+
+            listing = requests.get(f"{base}/api/v1/tasks", headers=headers, timeout=30).json().get("tasks", [])
+            metrics["tasks_on_server"] = [{k: t.get(k) for k in ("status", "progress", "chapter_count",
+                                                               "output_file_count", "error_message")} for t in listing]
+            done = [t for t in listing if t.get("status") == "completed" and t.get("output_file_count")]
+            if not done:
+                problems.append("the server has no completed task — the CLI did not run the job through the API")
+            else:
+                task_id = done[0]["task_id"]
+                detail = requests.get(f"{base}/api/v1/tasks/{task_id}", headers=headers, timeout=30).json()
+                metrics["task_log_lines"] = detail.get("log_count")
+                paths = detail.get("output_files", [])
+                download = requests.get(f"{base}/api/v1/tasks/{task_id}/files/0", headers=headers, timeout=300)
+                metrics["download_status"] = download.status_code
+                metrics["download_bytes"] = len(download.content)
+                on_disk = os.path.getsize(paths[0]) if paths and os.path.exists(paths[0]) else -1
+                if download.status_code != 200 or len(download.content) != on_disk or on_disk < 1000:
+                    problems.append(f"downloaded {len(download.content)} bytes, file on disk has {on_disk}")
+                else:
+                    samples_dir = os.path.join(RESULTS_DIR, "samples")
+                    os.makedirs(samples_dir, exist_ok=True)
+                    with open(os.path.join(samples_dir, f"{tag}{os.path.splitext(paths[0])[1]}"), "wb") as fh:
+                        fh.write(download.content)
+        finally:
+            _stop_server(server)
+        _write_result(tag, "pass" if not problems else "fail", metrics, error="; ".join(problems),
+                      log_tail=output + _server_log_tail(f"{tag}_server", 25))
+    _guarded(tag, body)
+
+
+def _walk(value):
+    """Yields every leaf of nested lists/dicts (what a Gradio endpoint returns)."""
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _walk(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _walk(item)
+    else:
+        yield value
+
+
+def cmd_ui(args) -> None:
+    """Starts the real Gradio app and generates a chapter the way a browser would."""
+    tag = args.tag or f"ui_{args.name}"
+
+    def body():
+        import inspect
+        from gradio_client import Client, handle_file
+        import app as app_module   # only for the order of its settings, not to call it
+
+        url = f"http://localhost:{_UI_PORT}/"
+        if _port_in_use(_UI_PORT):
+            _write_result(tag, "fail", error=f"port {_UI_PORT} is already in use — stop the other web UI first")
+            return
+        _reset_gpu_state()
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        env.pop("ABM_API_URL", None)
+        server = _start_server([sys.executable, args.launcher or os.path.join(_ROOT, "app.py")], env, f"{tag}_server")
+        metrics: dict[str, Any] = {}
+        problems: list[str] = []
+        try:
+            if not _wait_for_http(url, server, args.startup_timeout):
+                _write_result(tag, "fail", error="the web UI did not start", log_tail=_server_log_tail(f"{tag}_server"))
+                return
+            client = Client(url, verbose=False)
+            endpoints = client.view_api(print_info=False, return_format="dict")["named_endpoints"]
+            metrics["endpoints"] = len(endpoints)
+            for needed in ("/scan_book", "/generate", "/cancel", "/test_voice"):
+                if needed not in endpoints:
+                    problems.append(f"the UI has no {needed} action")
+
+            token = client.predict("", api_name="/page_load")
+            book = args.book or os.path.join(_FIXTURES, "dummy_book.epub")
+            scan = client.predict(handle_file(book), api_name="/scan_book")
+            listing = next((item for item in scan if isinstance(item, dict) and "choices" in item), {})
+            ticked = list(listing.get("value") or [])
+            metrics["chapters_listed"] = len(listing.get("choices") or [])
+            metrics["chapters_ticked"] = len(ticked)
+            if not ticked:
+                problems.append("scanning the book ticked no chapter")
+            else:
+                voice_file, transcript = _default_voice()
+                settings = {
+                    "book_title": f"UI Test {time.strftime('%H%M%S')}", "author": "AudiobookMaker",
+                    "language": "English", "selected_chapters": ticked[:1], "tts_provider_name": args.name,
+                    "voice_file": handle_file(voice_file), "voice_transcript": transcript,
+                    "export_lrc": False, "max_chapter_retries": 0,
+                }
+                if args.model:
+                    settings["tts_model_name"] = args.model
+                # Settings are *args of the handler; Gradio names them param_<position>.
+                fixed = [p for p in inspect.signature(app_module.on_generate).parameters.values()
+                         if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD and p.name != "request"]
+                keys = list(app_module._UI_KEYS)
+                unknown = [key for key in settings if key not in keys]
+                if unknown:
+                    raise RuntimeError(f"settings the UI does not have: {unknown}")
+                given = {f"param_{len(fixed) + keys.index(key)}": value for key, value in settings.items()}
+                kwargs: dict[str, Any] = {}
+                for parameter in endpoints["/generate"]["parameters"]:
+                    name = parameter["parameter_name"]
+                    if name in given:
+                        kwargs[name] = given[name]
+                    elif name in ("file_obj", "client_token"):
+                        continue
+                    elif parameter.get("parameter_has_default"):
+                        kwargs[name] = parameter.get("parameter_default")
+                    else:
+                        kind = str((parameter.get("python_type") or {}).get("type", ""))
+                        kwargs[name] = "" if kind.startswith("str") else False if kind.startswith("bool") else None
+                missing = sorted(set(given) - set(kwargs))
+                if missing:
+                    raise RuntimeError(f"the UI's generate action has no parameters {missing}")
+
+                started = time.monotonic()
+                job = client.submit(handle_file(book), api_name="/generate", client_token=token, **kwargs)
+                final = job.result(timeout=args.timeout_min * 60)
+                metrics["wall_seconds"] = round(time.monotonic() - started, 1)
+                leaves = [leaf for leaf in _walk(final) if isinstance(leaf, str)]
+                status = next((leaf for leaf in leaves if "Generation complete" in leaf or "Cancelled" in leaf
+                               or "failed" in leaf.lower()), "")
+                metrics["run_status"] = status[:200]
+                audio = [leaf for leaf in leaves if leaf.lower().endswith((".mp3", ".m4b", ".wav", ".flac", ".ogg"))
+                         and os.path.exists(leaf)]
+                metrics["audio_files"] = sorted({os.path.basename(path) for path in audio})
+                if not any("Generation complete" in leaf for leaf in leaves):
+                    problems.append(f"the UI did not report a complete run: {status[:160] or 'no status text'}")
+                    log_box = max(leaves, key=len, default="")
+                    metrics["ui_log_tail"] = log_box[-1500:]
+                    print(log_box[-1500:])
+                if not audio:
+                    problems.append("the UI returned no audio file")
+                else:
+                    seconds = len(_decode_to_mono(audio[0])) / 16000.0
+                    metrics["audio_seconds"] = round(seconds, 1)
+                    if seconds < 3:
+                        problems.append(f"the audio is only {seconds:.1f}s long")
+                    samples_dir = os.path.join(RESULTS_DIR, "samples")
+                    os.makedirs(samples_dir, exist_ok=True)
+                    shutil.copyfile(audio[0], os.path.join(samples_dir, f"{tag}{os.path.splitext(audio[0])[1]}"))
+        finally:
+            _stop_server(server)
+        _write_result(tag, "pass" if not problems else "fail", metrics, error="; ".join(problems),
+                      log_tail=_server_log_tail(f"{tag}_server", 40))
+    _guarded(tag, body)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Report
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1078,19 +1723,28 @@ def cmd_report(_args) -> None:
     for result in results:
         m = result.get("metrics", {})
         keys = []
-        for key in ("speed_x_realtime", "realtime_factor", "audio_seconds", "synthesis_seconds",
-                    "word_error_rate", "loudness_lufs", "device_share", "vram_peak_gb", "speedup",
-                    "chunks_reused_on_resume", "summary", "files", "failed_count"):
-            if key in m and m[key] not in (None, "", [], {}):
-                keys.append(f"{key}={m[key]}")
+        for key in ("speedup", "language", "speed_x_realtime", "audio_minutes", "audio_seconds",
+                    "synthesis_seconds", "word_error_rate", "loudness_lufs", "chapters_completed",
+                    "flagged_chunks", "out_of_memory_retries", "peak_ram_gb", "lowest_clone",
+                    "same_voice_reference", "device_share", "vram_peak_gb", "chunks_reused_on_resume",
+                    "run_status", "cli_exit_code", "summary", "files", "failed_count"):
+            value = m.get(key)
+            if key == "flagged_chunks" and isinstance(value, list):
+                value = len(value)           # the full list is in the test's own JSON
+            if value not in (None, "", [], {}) and not (key == "flagged_chunks" and value == 0):
+                keys.append(f"{key}={value}")
         problem = (result.get("error") or "").splitlines()[0][:200] if result.get("error") else ""
         lines.append(f"| {result.get('test')} | {result.get('status')} | {'; '.join(keys)} | {problem} |")
     lines.append("")
     for result in results:
-        if result.get("status") in ("fail", "warn") or result.get("notes"):
+        table = result.get("metrics", {}).get("table")
+        if result.get("status") in ("fail", "warn") or result.get("notes") or table:
             lines += [f"### {result.get('test')} — {result.get('status')}", ""]
             for note in result.get("notes", []):
                 lines.append(f"- note: {note}")
+            if isinstance(table, dict) and table.get("rows"):
+                lines += ["", "| " + " | ".join(table["headers"]) + " |", "|" + "---|" * len(table["headers"])]
+                lines += ["| " + " | ".join(str(cell) for cell in row) + " |" for row in table["rows"]]
             if result.get("error"):
                 lines += ["", "```", result["error"][:3000], "```"]
             if result.get("status") == "fail" and result.get("log_tail"):
@@ -1147,11 +1801,12 @@ def _add_synthesis_args(parser: argparse.ArgumentParser) -> None:
                         help="Provider option (repeatable).")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The command-line interface: one sub-command per test."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     for name, handler in (("env", cmd_env), ("unit", cmd_unit), ("extraction", cmd_extraction),
-                          ("mastering", cmd_mastering), ("report", cmd_report)):
+                          ("mastering", cmd_mastering), ("similarity", cmd_similarity), ("report", cmd_report)):
         sub.add_parser(name).set_defaults(handler=handler)
 
     voice = sub.add_parser("make-voice")
@@ -1175,8 +1830,36 @@ def main() -> None:
 
     scaling = sub.add_parser("scaling")
     _add_synthesis_args(scaling)
-    scaling.add_argument("--repeat", type=int, default=2)
+    scaling.add_argument("--book-chapters", type=int, default=4,
+                         help="Chapters of the long English book to narrate (several batches per GPU).")
+    scaling.add_argument("--chunks", type=int, default=0,
+                         help="Use this many short test paragraphs instead of the book.")
+    scaling.add_argument("--allow-single-gpu", action="store_true", help=argparse.SUPPRESS)
     scaling.set_defaults(handler=cmd_scaling)
+
+    longbook = sub.add_parser("longbook")
+    _add_synthesis_args(longbook)
+    longbook.add_argument("--lang", default="en", help="Language code of the long test book.")
+    longbook.add_argument("--max-chapters", type=int, default=0, help="0 = the whole book.")
+    longbook.add_argument("--no-asr", action="store_true")
+    longbook.set_defaults(handler=cmd_longbook)
+
+    languages = sub.add_parser("languages")
+    _add_synthesis_args(languages)
+    languages.add_argument("--langs", default="", help="Comma-separated language codes; default: every book but English.")
+    languages.add_argument("--seconds", type=float, default=60.0, help="Length of the passage per language.")
+    languages.add_argument("--no-asr", action="store_true")
+    languages.set_defaults(handler=cmd_languages)
+
+    for name, handler in (("api", cmd_api), ("ui", cmd_ui)):
+        server = sub.add_parser(name)
+        _add_synthesis_args(server)
+        server.add_argument("--book", default="")
+        server.add_argument("--chapters", default="1")
+        server.add_argument("--startup-timeout", type=float, default=240.0)
+        server.add_argument("--timeout-min", type=float, default=30.0)
+        server.add_argument("--launcher", default="", help=argparse.SUPPRESS)   # local dry runs only
+        server.set_defaults(handler=handler)
 
     resume = sub.add_parser("resume")
     _add_synthesis_args(resume)
@@ -1198,7 +1881,11 @@ def main() -> None:
     cli.add_argument("--timeout-min", type=float, default=45.0)
     cli.set_defaults(handler=cmd_cli)
 
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     if getattr(args, "keep_work_dir", ""):
         # Used by the resume test: the child must write into the directory the parent watches.
         original = _build_config

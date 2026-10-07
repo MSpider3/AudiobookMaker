@@ -113,8 +113,9 @@ fn soft_split_long_sentence(sentence: &str, max_len: usize) -> Vec<String> {
         // End (exclusive, in bytes) of the chunk if we split after the best delimiter.
         let mut best_split_end: Option<usize> = None;
 
-        // Priority 1: Sentence-like pauses (semicolons, colons, em-dashes)
-        for c in [';', ':', '—'] {
+        // Priority 1: Sentence-like pauses (semicolons, colons, em-dashes;
+        // ASCII and full-width forms)
+        for c in [';', ':', '—', '；', '：'] {
             if let Some(idx) = sub.rfind(c) {
                 let end = idx + c.len_utf8();
                 if best_split_end.map_or(true, |best| end > best) {
@@ -123,9 +124,16 @@ fn soft_split_long_sentence(sentence: &str, max_len: usize) -> Vec<String> {
             }
         }
 
-        // Priority 2: Commas
+        // Priority 2: Commas (ASCII, full-width and the ideographic comma)
         if best_split_end.is_none() {
-            best_split_end = sub.rfind(',').map(|idx| idx + 1);
+            for c in [',', '，', '、'] {
+                if let Some(idx) = sub.rfind(c) {
+                    let end = idx + c.len_utf8();
+                    if best_split_end.map_or(true, |best| end > best) {
+                        best_split_end = Some(end);
+                    }
+                }
+            }
         }
 
         // Priority 3: Spaces

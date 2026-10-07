@@ -116,3 +116,103 @@ class TestHarness:
         for engine in ("indextts", "fish"):
             steps = " ".join(generate_test_notebook.PROVIDER_SETUP[engine]["post"])
             assert "--no-deps" in steps and "descript-audiotools" in steps
+
+
+class TestNewStages:
+    """Scaling, long book, languages, similarity, API and UI stages of the notebook."""
+
+    def _notebook_commands(self) -> list[str]:
+        """Every harness command line the generated notebook can run."""
+        import re
+
+        notebook = generate_test_notebook.build("some-branch")
+        code = "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
+        commands = []
+        for match in re.finditer(r'suite\(\s*f?"((?:[^"\\]|\\.)*)"', code):
+            commands.append(match.group(1))
+        return commands
+
+    def test_every_notebook_command_exists_in_the_harness(self):
+        import re
+        import shlex
+
+        parser = abm_gpu_suite.build_parser()
+        commands = self._notebook_commands()
+        names = {command.split()[0] for command in commands}
+        assert {"scaling", "longbook", "languages", "api", "ui", "similarity", "report"} <= names
+        for command in commands:
+            # Fill the notebook's f-string fields with plausible values.
+            filled = re.sub(r"\{(?:ASR_FLAG|extra)\}", "", command)      # optional flags
+            filled = re.sub(r"\{[^{}]*\}", "1", filled).replace("\\\"", "\"")
+            filled = filled.replace("--name 1", "--name qwen").replace("--langs 1", "--langs fr")
+            arguments = shlex.split(filled)
+            if arguments[0] in ("provider", "preset", "scaling", "resume", "book", "cli", "longbook",
+                                "languages", "api", "ui") and "--name" not in arguments:
+                continue   # a continuation line of a longer command
+            parser.parse_args(arguments)
+
+    def test_long_books_are_found_in_the_assets(self):
+        codes = [book["code"] for book in abm_gpu_suite._long_books()]
+        assert codes == ["en", "fr", "ru", "hi", "zh", "ja", "ko"]
+        entry = abm_gpu_suite._long_book("ja")
+        assert entry["language"] == "Japanese"
+        assert os.path.exists(os.path.join(sync_assets.BOOKS_DIR, entry["file"]))
+        assert abm_gpu_suite._long_book("xx") is None
+
+    def test_language_passage_is_about_the_requested_length(self):
+        from audiobook_factory.chunk_verifier import expected_seconds
+
+        for code in ("fr", "zh", "hi"):
+            chapter = abm_gpu_suite._book_chapters(abm_gpu_suite._long_book(code))[0]
+            passage = abm_gpu_suite._leading_paragraphs(chapter.text, 60.0)
+            seconds = sum(expected_seconds(paragraph) for paragraph in passage)
+            assert 60.0 <= seconds <= 150.0, f"{code}: {seconds:.0f}s"
+            assert all(paragraph in chapter.text for paragraph in passage)
+
+    def test_unsupported_language_is_skipped_not_failed(self, tmp_path, monkeypatch):
+        # Qwen3-TTS has no Hindi; the test must say so instead of producing noise.
+        monkeypatch.setattr(abm_gpu_suite, "RESULTS_DIR", str(tmp_path))
+        args = abm_gpu_suite.build_parser().parse_args(["languages", "--name", "qwen", "--langs", "hi"])
+        abm_gpu_suite.cmd_languages(args)
+        with open(tmp_path / "lang_qwen_hi.json", encoding="utf-8") as fh:
+            result = json.load(fh)
+        assert result["status"] == "skip"
+        assert "Hindi" in result["notes"][0]
+
+    def test_scaling_text_is_several_batches_long(self):
+        # A dozen chunks fit one batch on one GPU, which is why the first
+        # scaling test showed almost no gain from the second GPU.
+        from audiobook_factory.chunk_planner import plan_chunks
+
+        chapters = abm_gpu_suite._book_chapters(abm_gpu_suite._long_book("en"))[:4]
+        text = "\n\n".join(chapter.text for chapter in chapters)
+        assert len(plan_chunks(text, None, 399, 0.3, 0.8)) >= 45
+        args = abm_gpu_suite.build_parser().parse_args(["scaling", "--name", "qwen"])
+        assert args.book_chapters == 4 and args.chunks == 0
+
+    def test_helpers(self):
+        assert list(abm_gpu_suite._walk({"a": [1, ("x", {"b": "y"})], "c": None})) == [1, "x", "y", None]
+        import socket
+
+        with socket.socket() as free:
+            free.bind(("127.0.0.1", 0))
+            port = free.getsockname()[1]
+            assert abm_gpu_suite._port_in_use(port) is False   # bound but not listening
+            free.listen(1)
+            assert abm_gpu_suite._port_in_use(port) is True
+
+    def test_report_renders_a_result_table(self, tmp_path, monkeypatch):
+        results = tmp_path / "abm_results"
+        results.mkdir()
+        (results / "similarity.json").write_text(json.dumps({
+            "test": "similarity", "status": "pass", "notes": ["1.0 = same voice."],
+            "metrics": {"lowest_clone": 0.98, "table": {"headers": ["Sample", "Similarity"],
+                                                        "rows": [["qwen_clone", "0.995"]]}},
+        }))
+        (results / "env.json").write_text(json.dumps({"test": "env", "status": "pass", "metrics": {}}))
+        monkeypatch.setattr(abm_gpu_suite, "RESULTS_DIR", str(results))
+        abm_gpu_suite.cmd_report(None)
+        report = (results / "REPORT.md").read_text(encoding="utf-8")
+        assert "| Sample | Similarity |" in report and "| qwen_clone | 0.995 |" in report
+        assert "lowest_clone=0.98" in report
+

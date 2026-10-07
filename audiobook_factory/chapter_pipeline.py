@@ -102,11 +102,15 @@ class _WorkShare:
 
     Attributes:
         workers: Stage B workers still running.
+        batches: Batches each device has finished.
+        busy_seconds: Time each device spent synthesizing.
         _busy: Workers currently synthesizing a batch.
         _lock: Mutex for the counters and for taking a batch.
     """
 
     workers: int = 1
+    batches: dict[str, int] = field(default_factory=dict, init=False)
+    busy_seconds: dict[str, float] = field(default_factory=dict, init=False)
     _busy: int = field(default=0, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
@@ -134,6 +138,12 @@ class _WorkShare:
         """Marks this worker's current batch as done (or handed back)."""
         with self._lock:
             self._busy = max(0, self._busy - 1)
+
+    def record(self, device: str, seconds: float) -> None:
+        """Notes one finished batch of *device* and how long it took."""
+        with self._lock:
+            self.batches[device] = self.batches.get(device, 0) + 1
+            self.busy_seconds[device] = self.busy_seconds.get(device, 0.0) + max(0.0, seconds)
 
     def retire(self) -> None:
         """Removes a stopping worker from the share calculation."""
@@ -560,12 +570,14 @@ def _stage_b_device_worker(
                 if chunks_completed_cb is not None:
                     chunks_completed_cb(indices)
 
+            batch_started = time.monotonic()
             try:
                 _synthesize_batch(
                     batch, provider, voice_ref, config, out_dir, master_queue,
                     cancel_token, progress_state, chapter_index, verifier,
                     chunk_completed_cb, _note_written, chunk_flagged_cb,
                 )
+                share.record(device, time.monotonic() - batch_started)
             except CancelledError:
                 logger.debug("Stage B worker on %s cancelled cleanly.", device)
                 break
@@ -877,9 +889,15 @@ def run_chapter_pipeline(
         if stage_c_exception is None and not cancel_token.is_cancelled and os.path.exists(out_wav_path) and os.path.getsize(out_wav_path) > 0:
             _chapter_succeeded = True
             if pending_count and len(active_devices) > 1:
+                # Chunks, batches and busy time per device: equal busy times
+                # mean the devices really worked side by side.
                 log_callback(
                     f"  [Ch{chapter_index}] Device share: "
-                    + ", ".join(f"{dev} {count} chunk(s)" for dev, count in device_stats.items())
+                    + ", ".join(
+                        f"{dev} {count} chunk(s) in {work_share.batches.get(dev, 0)} batch(es) "
+                        f"over {work_share.busy_seconds.get(dev, 0.0):.0f}s"
+                        for dev, count in device_stats.items()
+                    )
                 )
             if worker_errors:
                 log_callback(

@@ -37,7 +37,12 @@ VERIFY_MODES: tuple[str, ...] = ("off", "duration", "asr")
 _LATIN_CHARS_PER_SECOND: float = 15.0
 # Narration runs at roughly 150 words a minute ≈ 15 characters a second.
 _CJK_CHARS_PER_SECOND: float = 4.5
-# Han / kana / hangul carry a syllable or more each.
+# A Han character is a syllable, often a whole word.
+_KANA_CHARS_PER_SECOND: float = 8.0
+_HANGUL_CHARS_PER_SECOND: float = 5.5
+# Kana are single short morae and a hangul block is one syllable: both are
+# said faster than a Han character, so Japanese and Korean text is shorter
+# in audio than the same number of Chinese characters.
 
 _MIN_RATIO: float = 0.4
 # Audio shorter than this fraction of the expected length is truncated.
@@ -53,7 +58,10 @@ _ASR_SAMPLE_RATE: int = 16000
 _CJK_PATTERN = re.compile(
     "[぀-ヿ㐀-䶿一-鿿가-힯豈-﫿]"
 )
-_NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
+# Whisper writes Mandarin in traditional or simplified characters as it
+# pleases; a prompt in simplified characters settles it, so a correct reading
+# of a simplified-Chinese book is not scored as all wrong.
+_ASR_INITIAL_PROMPTS: dict[str, str] = {"zh": "以下是普通话的句子，使用简体中文。"}
 
 _WHISPER_LANGUAGE_CODES: dict[str, str] = {
     "english": "en", "chinese": "zh", "japanese": "ja", "korean": "ko",
@@ -84,9 +92,23 @@ class ChunkVerdict:
 
 def expected_seconds(text: str, speed: float = 1.0) -> float:
     """Estimates how long *text* takes to narrate, in seconds."""
-    cjk = len(_CJK_PATTERN.findall(text))
-    other = sum(1 for ch in text if not ch.isspace()) - cjk
-    seconds = cjk / _CJK_CHARS_PER_SECOND + max(0, other) / (_LATIN_CHARS_PER_SECOND * 0.85)
+    han = kana = hangul = other = 0
+    for char in text:
+        if char.isspace():
+            continue
+        code = ord(char)
+        if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:
+            kana += 1
+        elif 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F:
+            hangul += 1
+        elif _CJK_PATTERN.match(char):
+            han += 1
+        else:
+            other += 1
+    seconds = (
+        han / _CJK_CHARS_PER_SECOND + kana / _KANA_CHARS_PER_SECOND
+        + hangul / _HANGUL_CHARS_PER_SECOND + other / (_LATIN_CHARS_PER_SECOND * 0.85)
+    )
     return seconds / max(0.25, float(speed or 1.0))
 
 
@@ -97,7 +119,12 @@ def _normalize_for_compare(text: str) -> list[str]:
     spacing, so each character is a token.
     """
     text = unicodedata.normalize("NFKC", text).lower()
-    text = _NON_WORD.sub(" ", text).replace("_", " ")
+    # Letters, digits and combining marks are kept. The marks matter: \w does
+    # not match them, and dropping them cuts every Devanagari, Thai or Arabic
+    # word into loose consonants.
+    text = "".join(
+        char if char.isspace() or unicodedata.category(char)[0] in "LMN" else " " for char in text
+    )
     tokens: list[str] = []
     for word in text.split():
         if _CJK_PATTERN.search(word):
@@ -283,6 +310,7 @@ class ChunkVerifier:
                 # window makes Whisper repeat or invent the text that follows.
                 segments, _ = self._asr.transcribe(
                     samples, language=language, beam_size=1, condition_on_previous_text=False,
+                    initial_prompt=_ASR_INITIAL_PROMPTS.get(language or ""),
                 )
                 return " ".join(segment.text for segment in segments).strip()
             generate_kwargs = {"language": language} if language else {}

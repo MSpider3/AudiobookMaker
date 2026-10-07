@@ -1931,10 +1931,17 @@ def _get_wav_duration(path: str) -> float:
         return f.frames / f.samplerate
 
 def _chunk(text: str, max_len: int) -> list[str]:
-    """Split a long string at sentence boundaries to stay under max_len."""
-    if len(text) <= max_len:
+    """Split a long string at sentence boundaries to stay under max_len.
+
+    ``max_len`` counts Latin characters; the limit is lowered for scripts
+    that take longer to say per character (Chinese, Japanese, Korean).
+    """
+    from audiobook_factory.chunk_planner import char_limit
+
+    limit = char_limit(text, max_len)
+    if len(text) <= limit:
         return [text]
-    return smart_sentence_splitter(text, max_len)
+    return smart_sentence_splitter(text, limit)
 
 
 class _ImmediateQueue(queue.Queue):

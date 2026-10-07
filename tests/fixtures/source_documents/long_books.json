@@ -1,0 +1,158 @@
+{
+ "books": [
+  {
+   "file": "long_book_en.epub",
+   "language": "English",
+   "code": "en",
+   "title": "The Fog Lady of Marrowby Point",
+   "author": "Edmund Hallowell Reyes",
+   "chapters": [
+    "Chapter 1: The Bird in the Wall",
+    "Chapter 2: A Key Shaped Like a Feather",
+    "Chapter 3: What Grandpa Remembered",
+    "Chapter 4: An Offer Declined",
+    "Chapter 5: The Marigold",
+    "Chapter 6: Mr. Pettigrew Is Not Convinced",
+    "Chapter 7: The Fog Lady Wakes",
+    "Chapter 8: The Whole Village Listens",
+    "Chapter 9: The Meeting in the Hall",
+    "Chapter 10: The Light Stays On"
+   ],
+   "paragraphs": 90,
+   "words": 6393,
+   "characters": 26291
+  },
+  {
+   "file": "long_book_fr.epub",
+   "language": "French",
+   "code": "fr",
+   "title": "Le Phare de Kerléan",
+   "author": "Hélène Vauquelin",
+   "chapters": [
+    "Chapitre 1 : Le bateau de 8 h 15",
+    "Chapitre 2 : La maison du gardien",
+    "Chapitre 3 : L'horloge muette",
+    "Chapitre 4 : Une pièce d'argent",
+    "Chapitre 5 : La malle du grenier",
+    "Chapitre 6 : L'aveu du passeur",
+    "Chapitre 7 : Une offre en euros",
+    "Chapitre 8 : La lame d'acier",
+    "Chapitre 9 : Le battement retrouvé",
+    "Chapitre 10 : Quatre heures vingt-cinq"
+   ],
+   "paragraphs": 110,
+   "words": 6489,
+   "characters": 28581
+  },
+  {
+   "file": "long_book_ru.epub",
+   "language": "Russian",
+   "code": "ru",
+   "title": "Часы на Липовой",
+   "author": "Андрей Верховцев",
+   "chapters": [
+    "Глава 1. Автобус до Заречья",
+    "Глава 2. Мастерская",
+    "Глава 3. Девочка с рыжей косой",
+    "Глава 4. Заметка в «Заречской правде»",
+    "Глава 5. Ящик с письмами",
+    "Глава 6. Совет в мастерской",
+    "Глава 7. Ярмарка на площади",
+    "Глава 8. Подъём на каланчу",
+    "Глава 9. Тайник за циферблатом",
+    "Глава 10. Двести лет спустя"
+   ],
+   "paragraphs": 120,
+   "words": 4544,
+   "characters": 21810
+  },
+  {
+   "file": "long_book_hi.epub",
+   "language": "Hindi",
+   "code": "hi",
+   "title": "रुकी हुई घड़ी",
+   "author": "मीनाक्षी सहाय",
+   "chapters": [
+    "अध्याय 1: बरसात की पहली सुबह",
+    "अध्याय 2: नीले रंग की साड़ी वाली औरत",
+    "अध्याय 3: घड़ी के भीतर का काग़ज़",
+    "अध्याय 4: दो दोस्तों की कहानी",
+    "अध्याय 5: नदी वाला पुल",
+    "अध्याय 6: जंग लगा हुआ डिब्बा",
+    "अध्याय 7: चार बजकर दस मिनट",
+    "अध्याय 8: धैर्य का पाठ",
+    "अध्याय 9: आख़िरी पुर्ज़ा",
+    "अध्याय 10: समय का नया सिरा"
+   ],
+   "paragraphs": 77,
+   "words": 6479,
+   "characters": 23015
+  },
+  {
+   "file": "long_book_zh.epub",
+   "language": "Chinese",
+   "code": "zh",
+   "title": "慢时光钟铺",
+   "author": "林知远",
+   "chapters": [
+    "第一章 雾起钟楼",
+    "第二章 慢时光",
+    "第三章 新同学",
+    "第四章 一百零八级台阶",
+    "第五章 铁盒里的信",
+    "第六章 老榕树下的井",
+    "第七章 蜜饯铺的老奶奶",
+    "第八章 说谎的气压计",
+    "第九章 最慢的钟",
+    "第十章 钟声回来的夜晚"
+   ],
+   "paragraphs": 120,
+   "words": 120,
+   "characters": 9747
+  },
+  {
+   "file": "long_book_ja.epub",
+   "language": "Japanese",
+   "code": "ja",
+   "title": "時計塔の針",
+   "author": "柏木 澄江",
+   "chapters": [
+    "第一章 海辺の駅",
+    "第二章 古い鍵と手紙",
+    "第三章 塔の少年",
+    "第四章 五十八段の階段",
+    "第五章 一枚の写真",
+    "第六章 金色の削りくず",
+    "第七章 堤防の老人",
+    "第八章 止めておく時間",
+    "第九章 二十七枚の歯",
+    "第十章 春の鐘"
+   ],
+   "paragraphs": 140,
+   "words": 143,
+   "characters": 12275
+  },
+  {
+   "file": "long_book_ko.epub",
+   "language": "Korean",
+   "code": "ko",
+   "title": "가는날 시계방",
+   "author": "한서윤",
+   "chapters": [
+    "제1장 모래내 가는 길",
+    "제2장 멈춰 선 시계탑",
+    "제3장 한밤의 중얼거림",
+    "제4장 잠긴 문과 약속",
+    "제5장 서랍 속의 편지",
+    "제6장 오래된 이야기",
+    "제7장 아흔아홉 계단",
+    "제8장 태풍이 오던 밤",
+    "제9장 마지막 톱니바퀴",
+    "제10장 다시 가는 시간"
+   ],
+   "paragraphs": 130,
+   "words": 3841,
+   "characters": 10837
+  }
+ ]
+}

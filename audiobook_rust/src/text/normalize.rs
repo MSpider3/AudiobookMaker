@@ -291,6 +291,11 @@ fn strip_noise(text: &str) -> String {
         text = text.replace(entity, ch);
     }
 
+    // A dash that opens a line of dialogue (French, Russian, Spanish ...)
+    // is not a pause inside a sentence: drop it instead of reading ", ".
+    let re_dialogue_dash = Regex::new("(?m)(^[ \\t]*|[.!?\u{2026}\u{00bb}\"\u{201d},;:][ \\t\u{00a0}]+)\u{2014}[ \\t\u{00a0}]*").unwrap();
+    let text = re_dialogue_dash.replace_all(&text, "$1").into_owned();
+
     // Smart quotes & other characters mapping
     let mut cleaned = String::with_capacity(text.len());
     for c in text.chars() {

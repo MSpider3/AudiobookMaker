@@ -65,9 +65,12 @@ def extracted() -> dict[str, list[ExtractedChapter]]:
 
 
 def test_expected_file_covers_every_document():
+    # The long_book_* files are described by long_books.json and checked in
+    # test_long_books.py; this file covers the small format fixtures.
     documents = {
         name for name in os.listdir(_FIXTURES)
         if name.rsplit(".", 1)[-1] in ("epub", "pdf", "docx", "odt", "txt", "mobi")
+        and not name.startswith("long_book_")
     }
     assert documents == set(EXPECTED), "expected_chapters.json and the fixture directory disagree"
     for name in (

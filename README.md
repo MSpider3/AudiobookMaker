@@ -152,7 +152,7 @@ pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | f
 
 ### Testing a branch on Kaggle
 
-`AudiobookMaker_Kaggle_Test.ipynb` clones a branch, runs the unit suite, extracts every fixture book, and synthesizes a test passage with every engine on both GPUs — each in its own environment — measuring speed, VRAM, loudness and word accuracy. It writes `abm_test_results.zip` with a report, logs and audio samples. Regenerate it for another branch with `python tests/kaggle/generate_test_notebook.py --branch <name>`.
+`AudiobookMaker_Kaggle_Test.ipynb` clones a branch, runs the unit suite, extracts every fixture book, and synthesizes a test passage with every engine on both GPUs — each in its own environment — measuring speed, VRAM, loudness and word accuracy. It also measures the two-GPU speed-up, narrates a whole twenty-page book, speaks a passage in French, Russian, Chinese, Japanese, Korean and Hindi, scores how close each cloned voice is to the narrator clip, and generates a chapter through the API server and through the web UI. The long books (`tests/kaggle/assets/books/long_book_<code>.epub`, one per language) are original text written for these tests. A full run takes five to six hours; every block has a switch in the settings cell. It writes `abm_test_results.zip` with a report, logs and audio samples. Regenerate it for another branch with `python tests/kaggle/generate_test_notebook.py --branch <name>`.
 
 ---
 

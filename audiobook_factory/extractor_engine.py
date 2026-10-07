@@ -487,6 +487,12 @@ class TextNormalizer:
     _SOFT_WRAP = re.compile(r"(?<![.!?:;\"'\u2019\u201d])\n(?=[a-z])")
     _HYPHEN_WR = re.compile(r"-\n(\S)")
 
+    # A dash that opens a line of dialogue (French, Russian, Spanish ...) is
+    # not a pause inside a sentence: it is dropped instead of read as ", ".
+    _DIALOGUE_DASH = re.compile(
+        "(^[ \\t]*|[.!?\u2026\u00bb\"\u201d,;:][ \\t\u00a0]+)\u2014[ \\t\u00a0]*", re.MULTILINE
+    )
+
     # Smart-quote / typography normalisation
     _SMART_Q   = str.maketrans({
         "\u201c": '"', "\u201d": '"',
@@ -694,6 +700,7 @@ class TextNormalizer:
         for entity, char in self._ENTITIES:
             text = text.replace(entity, char)
 
+        text = self._DIALOGUE_DASH.sub(r"\1", text)      # dialogue dashes are not pauses
         text = text.translate(self._SMART_Q)            # normalise smart quotes
         text = self._MULTI_BL.sub("\n\n", text)         # collapse blank lines
         return text
