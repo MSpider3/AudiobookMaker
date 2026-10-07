@@ -46,6 +46,9 @@ packs everything it finds into one archive you can hand back for diagnosis.
 3. *(Optional)* Add-ons → **Secrets** → add `HF_TOKEN` (a HuggingFace read token) and attach it to
    this notebook. Only needed for gated models; everything else runs without it.
 
+Nothing needs uploading: the narrator voice and the test books are in the repository under
+`tests/kaggle/assets/` and are read from the clone.
+
 Then **Run All**. Each test writes its own result, so one failure never stops the rest.
 When it finishes, download **`/kaggle/working/abm_test_results.zip`** (Output panel) and send it back.
 
@@ -74,9 +77,12 @@ RUN_RESUME       = True    # kill a run mid-chapter and resume it
 RUN_BOOK         = True    # fixture EPUB and MOBI -> M4B with chapter markers (pipeline and cli.py)
 ASR_SCORING      = True    # transcribe each result with Whisper and score word accuracy
 
-# Optional: your own narrator clip (5-30 s of clean speech) and its exact transcript.
-# Leave empty to let the notebook create a reference clip with a Qwen preset voice.
-VOICE_FILE       = ""
+# Test inputs, read from the cloned repository (paths are relative to the repo root).
+# To test another voice, point VOICE_FILE at any 5-30 s clip of clean speech (an absolute
+# path such as /kaggle/input/... also works) and give its exact words in VOICE_TRANSCRIPT,
+# or leave VOICE_TRANSCRIPT empty to read them from a .txt file next to the clip.
+ASSETS_DIR       = "tests/kaggle/assets"
+VOICE_FILE       = "tests/kaggle/assets/voice/LOTM_narrator_voice.wav"
 VOICE_TRANSCRIPT = ""
 
 PROVIDER_TIMEOUT_MIN = 60  # per engine, including model download
@@ -115,7 +121,9 @@ import shutil
 WORK = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.getcwd()
 REPO = os.path.join(WORK, "AudiobookMaker")
 RESULTS = os.path.join(WORK, "abm_results")
-VENVS = os.path.join(WORK, "abm_venvs")
+# Per-engine environments are several GB each; /kaggle/working is capped at ~20 GB and is
+# saved as notebook output, so they live on the scratch disk instead.
+VENVS = "/tmp/abm_venvs"
 
 os.chdir(WORK)
 shutil.rmtree(REPO, ignore_errors=True)          # always test the latest push
@@ -129,9 +137,26 @@ os.environ["ABM_RESULTS_DIR"] = RESULTS
 os.environ["ABM_SKIP_GPU_WARMUP"] = "1"
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-if VOICE_FILE:
-    os.environ["ABM_VOICE_FILE"] = VOICE_FILE
+def in_repo(path):
+    \"\"\"Resolves a settings path against the cloned repository.\"\"\"
+    return path if os.path.isabs(path) else os.path.join(REPO, path)
+
+ASSETS_PATH = in_repo(ASSETS_DIR)
+VOICE_PATH = in_repo(VOICE_FILE) if VOICE_FILE else ""
+os.environ["ABM_ASSETS_DIR"] = ASSETS_PATH
+HAVE_VOICE = bool(VOICE_PATH) and os.path.exists(VOICE_PATH)
+if HAVE_VOICE:
+    os.environ["ABM_VOICE_FILE"] = VOICE_PATH
     os.environ["ABM_VOICE_TRANSCRIPT"] = VOICE_TRANSCRIPT
+    sidecar = os.path.splitext(VOICE_PATH)[0] + ".txt"
+    words = VOICE_TRANSCRIPT or (open(sidecar, encoding="utf-8").read().strip() if os.path.exists(sidecar) else "")
+    print(f"Narrator voice : {VOICE_PATH}")
+    print(f"Transcript     : {words[:110]}{'…' if len(words) > 110 else ''}" if words
+          else "Transcript     : none — engines that need one will transcribe the clip themselves")
+else:
+    print(f"⚠️ Narrator voice not found at {VOICE_PATH or '(not set)'} — a clip will be made with a Qwen preset voice.")
+books = os.path.join(ASSETS_PATH, "books")
+print("Test books     :", ", ".join(sorted(os.listdir(books))) if os.path.isdir(books) else f"missing ({books})")
 """),
         _md("## 4 · Install dependencies and build the Rust extension"),
         _code("""
@@ -211,11 +236,11 @@ suite("mastering", timeout_min=10)
         _md("""
 ## 6 · Qwen3-TTS (default engine)
 
-First a real-speech narrator clip is made with a Qwen preset voice (skipped if you supplied `VOICE_FILE`).
-Every cloning test after that — for every engine — uses the same clip, so results are comparable.
+Every cloning test — for every engine — uses the narrator clip from the settings cell, so results are
+comparable. (If that clip is missing, one is made first with a Qwen preset voice.)
 """),
         _code("""
-if not VOICE_FILE:
+if not HAVE_VOICE:
     suite("make-voice", timeout_min=20)
 
 # Voice cloning through the full pipeline on all GPUs, with ASR chunk verification switched on.
@@ -252,6 +277,13 @@ if RUN_BOOK:
     suite("book --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="book_qwen")
     # The headless CLI on the MOBI fixture: dry run, real run to M4B, and a re-run that must skip.
     suite("cli --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="cli_qwen")
+
+def free_model_cache():
+    \"\"\"Deletes downloaded TTS weights (keeps Whisper, which every engine's scoring reuses).\"\"\"
+    sh("find ~/.cache/huggingface/hub -maxdepth 1 -name 'models--*' ! -iname '*whisper*' -exec rm -rf {} + 2>/dev/null; "
+       "df -h ~ /kaggle/working 2>/dev/null | tail -2")
+
+free_model_cache()   # the Qwen checkpoints are not needed by the other engines
 """),
         _md("""
 ## 7 · Other engines
@@ -306,8 +338,7 @@ for name in OTHER_PROVIDERS:
             json.dump({"test": f"provider_{name}", "status": "fail", "metrics": {}, "notes": [],
                        "error": f"run ended with exit code {code} before writing a result — see logs/provider_{name}.log "
                                 f"and logs/install_{name}.log", "log_tail": []}, fh)
-    # Free disk for the next engine's weights.
-    sh("rm -rf ~/.cache/huggingface/hub/models--* 2>/dev/null; df -h /kaggle/working ~ | tail -2")
+    free_model_cache()   # make room for the next engine's weights
 """),
         _md("## 8 · Report"),
         _code("""

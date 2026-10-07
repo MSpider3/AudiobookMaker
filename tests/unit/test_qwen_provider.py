@@ -1267,3 +1267,63 @@ class TestFileLock:
                 with qp._file_lock(lock_path, timeout=0.3):
                     pass
         assert not os.path.exists(lock_path + ".excl")
+
+
+class TestTransformersCompatibilityShim:
+    """`check_model_inputs` changed shape across transformers patch releases.
+
+    qwen-tts writes ``@check_model_inputs()``. Only the bare-decorator shape
+    (4.57.1) needs the shim; applying it to the factory shape of 4.57.3 — the
+    version qwen-tts pins — replaced the decorated ``forward`` with the
+    factory's inner function and broke every decode on Kaggle.
+    """
+
+    @staticmethod
+    def _bare(func):                                             # transformers 4.57.1
+        def wrapper(self, *args, **kwargs):
+            return ("wrapped", func(self, *args, **kwargs))
+        return wrapper
+
+    @staticmethod
+    def _factory(tie_last_hidden_states=True):                   # transformers 4.57.3
+        def wrapped_fn(func):
+            def wrapper(self, *args, **kwargs):
+                return ("wrapped", func(self, *args, **kwargs))
+            return wrapper
+        return wrapped_fn
+
+    @staticmethod
+    def _hybrid(func=None, *, tie_last_hidden_states=True):      # transformers 4.57.6+
+        def wrapped_fn(inner):
+            def wrapper(self, *args, **kwargs):
+                return ("wrapped", inner(self, *args, **kwargs))
+            return wrapper
+        return wrapped_fn(func) if func is not None else wrapped_fn
+
+    def test_only_the_bare_decorator_needs_the_shim(self):
+        assert qp._needs_check_model_inputs_shim(self._bare) is True
+        assert qp._needs_check_model_inputs_shim(self._factory) is False
+        assert qp._needs_check_model_inputs_shim(self._hybrid) is False
+
+    @pytest.mark.parametrize("shape", ["_bare", "_factory", "_hybrid"])
+    def test_decorated_forward_still_takes_keyword_arguments(self, shape, monkeypatch):
+        import transformers.utils.generic as generic
+
+        monkeypatch.setattr(generic, "check_model_inputs", getattr(self, shape))
+        qp._patch_check_model_inputs()
+
+        class Model:
+            @generic.check_model_inputs()          # exactly how qwen-tts writes it
+            def forward(self, input_ids=None, inputs_embeds=None):
+                return inputs_embeds
+
+        assert Model().forward(inputs_embeds="embeds") == ("wrapped", "embeds")
+
+    def test_import_sink_is_never_closed(self):
+        import logging
+
+        sink = qp._NULL_SINK
+        handler = logging.StreamHandler(sink)       # what a library does while output is redirected
+        record = logging.LogRecord("x", logging.WARNING, __file__, 1, "still writable", None, None)
+        handler.emit(record)                         # must not raise "I/O operation on closed file"
+        assert not hasattr(sink, "close") and sink.write("text") == 4

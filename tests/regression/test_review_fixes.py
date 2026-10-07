@@ -26,7 +26,7 @@ if _ROOT not in sys.path:
 
 from audiobook_factory import text_processing
 from audiobook_factory.extractor_engine import TextNormalizer, _SKIP_TOC_TITLE
-from audiobook_factory.gpu_pool import GPUPoolManager
+from audiobook_factory.gpu_pool import GPUPoolManager, ProviderPool
 from audiobook_factory.pipeline import AudiobookConfig, CancelToken, run_pipeline
 from audiobook_factory.text_extractor import ExtractedChapter, read_text_file
 from audiobook_factory.utils import decode_done_message, encode_done_message
@@ -67,7 +67,10 @@ def _run(cfg: AudiobookConfig, chapters: list[ExtractedChapter], cancel: CancelT
 
 
 def _mock_providers(cfg: AudiobookConfig, provider_cls=MockTTSProvider) -> list[MockTTSProvider]:
-    pool = GPUPoolManager.instance().get_pool("mock", lambda dev: provider_cls(cfg, device=dev))
+    # One explicit device: these tests count batches and chunks, which must
+    # not depend on how many GPUs the machine running them happens to have.
+    pool = ProviderPool(lambda dev: provider_cls(cfg, device=dev), ["cpu"], "mock")
+    GPUPoolManager.instance()._pools["mock"] = pool
     return [pool.get_provider_for_device(dev) for dev in pool.devices]
 
 

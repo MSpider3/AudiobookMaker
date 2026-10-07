@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -612,13 +613,57 @@ def _is_out_of_memory(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
+class _NullSink:
+    """A write-only stream that discards everything and can never be closed."""
+
+    def write(self, text: str) -> int:
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+_NULL_SINK = _NullSink()
+
+
+def _needs_check_model_inputs_shim(decorator: Any) -> bool:
+    """True when ``check_model_inputs`` is a bare decorator that cannot be called without arguments.
+
+    transformers changed this helper's shape between patch releases:
+
+    * 4.57.1            ``check_model_inputs(func)``                     — bare decorator
+    * 4.57.3 (pinned)   ``check_model_inputs(tie_last_hidden_states=True)`` — decorator factory
+    * 4.57.6 and later  ``check_model_inputs(func=None, *, ...)``        — both forms
+
+    qwen-tts writes ``@check_model_inputs()``, which only the first shape
+    rejects. Patching the other two is not just unnecessary but harmful: a
+    factory made to return itself hands back its inner function in place of
+    the decorated ``forward``, and every decode then fails with
+    "wrapped_fn() got an unexpected keyword argument 'inputs_embeds'".
+    """
+    try:
+        parameters = list(inspect.signature(decorator).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if not parameters:
+        return False
+    first = parameters[0]
+    return (
+        first.name == "func"
+        and first.default is inspect.Parameter.empty
+        and first.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+
+
 def _patch_check_model_inputs() -> None:
     """Lets qwen-tts import on transformers builds whose ``check_model_inputs`` is a bare decorator.
 
-    qwen-tts writes ``@check_model_inputs()``. That call form fails with a
-    TypeError on transformers versions other than the one it pins (seen with
-    4.57.1 and 5.x), so a call without arguments is made to return the
-    decorator itself.
+    Applied only where :func:`_needs_check_model_inputs_shim` says the
+    ``@check_model_inputs()`` call form would raise; a call without arguments
+    is then made to return the decorator itself.
     """
     try:
         import transformers.utils.generic as generic
@@ -626,6 +671,8 @@ def _patch_check_model_inputs() -> None:
         return
     original = getattr(generic, "check_model_inputs", None)
     if original is None or getattr(original, "_is_patched_for_qwen", False):
+        return
+    if not _needs_check_model_inputs_shim(original):
         return
 
     def _patched_check(*args: Any, **kwargs: Any) -> Any:
@@ -650,8 +697,11 @@ def _import_qwen_tts() -> Any:
             return module.Qwen3TTSModel
         _patch_check_model_inputs()
         try:
-            with open(os.devnull, "w") as sink, \
-                    contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            # Only stdout, and into a sink that is never closed: libraries
+            # imported here create logging handlers bound to the current
+            # stderr, and a handler left holding a closed file turns every
+            # later log record into "I/O operation on closed file".
+            with contextlib.redirect_stdout(_NULL_SINK):
                 from qwen_tts import Qwen3TTSModel  # type: ignore
         except ImportError as exc:
             raise RuntimeError(

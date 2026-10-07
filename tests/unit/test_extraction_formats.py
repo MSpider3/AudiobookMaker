@@ -648,3 +648,23 @@ class TestPdfNoiseStep:
     ])
     def test_looks_like_matter(self, text, expected):
         assert looks_like_matter(text) is expected
+
+
+class TestDoclingInlineSpacing:
+    """Docling joins inline runs with a space: ``*word* ,`` must not become ``word ,``."""
+
+    @pytest.mark.parametrize("markdown,expected", [
+        ("under the heading *Unreliable* , and underlined the second.",
+         "under the heading Unreliable, and underlined the second."),
+        ("two lists, *Reliable* and **Unreliable** , and ( *twice* ) more.",
+         "two lists, Reliable and Unreliable, and (twice) more."),
+        ('He said " *No* ." Was it *true* ?', 'He said "No." Was it true?'),
+        ('" *Stop* " he said, and *left* "at once".', '"Stop" he said, and left "at once".'),
+        ("A sum: 2 * 3 , then go.", "A sum: 2 * 3 , then go."),
+        ('Plain text, with "quotes" and (brackets) stays.', 'Plain text, with "quotes" and (brackets) stays.'),
+    ])
+    def test_spaces_around_emphasis_are_repaired(self, markdown, expected):
+        from audiobook_factory.extractor_engine import TextNormalizer
+
+        normalizer = TextNormalizer()
+        assert normalizer.normalize(normalizer.strip_markdown_structure(markdown), "T", []) == expected

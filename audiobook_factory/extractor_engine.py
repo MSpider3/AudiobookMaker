@@ -613,6 +613,18 @@ class TextNormalizer:
         text = text.rstrip()
         return text + "." if text[-1:].isalnum() else text
 
+    # A closing emphasis marker, then a space, then closing punctuation.
+    _MD_EMPH_THEN_PUNCT   = re.compile(r"(?<=\S)([*_]{1,3})[ \t]+(?=[,.;:!?\u2026)\]])")
+    # An opening bracket, then a space, then an opening emphasis marker.
+    _MD_BRACKET_THEN_EMPH = re.compile(r"(?<=[(\[])[ \t]+(?=[*_]{1,3}\S)")
+    # The same around quotes, but only where the quote's role is unambiguous:
+    # an opening quote starts a line or follows a space; a closing quote is
+    # followed by a space, punctuation or the end of the line.
+    _MD_OPEN_QUOTE_THEN_EMPH  = re.compile(
+        r"((?:^|(?<=\s))[\"'\u201c\u2018])[ \t]+(?=[*_]{1,3}\S)", re.MULTILINE)
+    _MD_EMPH_THEN_CLOSE_QUOTE = re.compile(
+        r"(?<=\S)([*_]{1,3})[ \t]+(?=[\"'\u201d\u2019](?:[\s,.;:!?)\]]|$))", re.MULTILINE)
+
     def strip_markdown_structure(self, text: str) -> str:
         """Flattens Markdown structure that a TTS voice would read aloud.
 
@@ -637,6 +649,13 @@ class TextNormalizer:
         """
         text = self._IMG_TAG.sub("", text)
         text = self._FOOTNOTE_LINK.sub("", text)
+        # Docling joins inline runs with a space, so italic or bold text
+        # followed by punctuation arrives as "*word* ," and would be narrated
+        # (and subtitled) as "word ," once the markers are stripped.
+        text = self._MD_EMPH_THEN_PUNCT.sub(r"\1", text)
+        text = self._MD_BRACKET_THEN_EMPH.sub("", text)
+        text = self._MD_OPEN_QUOTE_THEN_EMPH.sub(r"\1", text)
+        text = self._MD_EMPH_THEN_CLOSE_QUOTE.sub(r"\1", text)
         out: list[str] = []
         for line in text.split("\n"):
             if self._MD_FENCE.match(line) or self._MD_TABLE_RULE.match(line):

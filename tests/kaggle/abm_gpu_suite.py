@@ -48,7 +48,13 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 RESULTS_DIR: str = os.path.abspath(os.environ.get("ABM_RESULTS_DIR", os.path.join(_ROOT, "kaggle_results")))
-_FIXTURES: str = os.path.join(_ROOT, "tests", "fixtures", "source_documents")
+ASSETS_DIR: str = os.path.abspath(os.environ.get("ABM_ASSETS_DIR", os.path.join(_ROOT, "tests", "kaggle", "assets")))
+# Narrator clip and books the tests read; see tests/kaggle/assets/README.md.
+_ASSET_BOOKS: str = os.path.join(ASSETS_DIR, "books")
+_FIXTURES: str = (
+    _ASSET_BOOKS if os.path.isdir(_ASSET_BOOKS)
+    else os.path.join(_ROOT, "tests", "fixtures", "source_documents")
+)
 _SYNTHETIC_VOICE: str = os.path.join(_ROOT, "tests", "fixtures", "audio", "synthetic_voice_reference.wav")
 
 _MAX_WORD_ERROR_RATE: float = 0.30
@@ -208,6 +214,9 @@ def cmd_env(_args) -> None:
         branch = subprocess.run(["git", "-C", _ROOT, "rev-parse", "--abbrev-ref", "HEAD"],
                                 capture_output=True, text=True).stdout.strip()
         gpus = _gpu_summary()
+        voice_file, voice_transcript = _default_voice()
+        hf_home = os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface"))
+        probe = hf_home if os.path.isdir(hf_home) else os.path.expanduser("~")
         from audiobook_factory.tts_providers import list_providers
         providers = {
             info.name: {"display": info.display_name, "license": info.license,
@@ -222,6 +231,10 @@ def cmd_env(_args) -> None:
             "python": platform.python_version(), "platform": platform.platform(),
             "branch": branch, "commit": commit, "gpus": gpus, "gpu_count": len(gpus),
             "ram_gb": ram_gb, "disk_free_gb": round(disk.free / 2**30, 1),
+            "model_cache_free_gb": round(shutil.disk_usage(probe).free / 2**30, 1),
+            "narrator_voice": os.path.relpath(voice_file, _ROOT) if voice_file.startswith(_ROOT) else voice_file,
+            "narrator_transcript_words": len(voice_transcript.split()),
+            "books_dir": os.path.relpath(_FIXTURES, _ROOT),
             "ffmpeg": ffmpeg[0] if ffmpeg else "missing", "rust_extension": rust,
             "versions": versions, "providers": providers,
         }, notes=notes)
@@ -232,17 +245,27 @@ def cmd_unit(_args) -> None:
     def body():
         junit = os.path.join(RESULTS_DIR, "pytest_junit.xml")
         os.makedirs(RESULTS_DIR, exist_ok=True)
-        env = dict(os.environ, ABM_SKIP_GPU_WARMUP="1")
+        # The unit suite tests logic with the mock engine; it is pinned to CPU
+        # (tests/conftest.py does the same) so GPU count cannot change results.
+        env = dict(os.environ, ABM_SKIP_GPU_WARMUP="1", CUDA_VISIBLE_DEVICES="")
         started = time.time()
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", "tests", "--ignore=tests/kaggle", "-q",
-             "-p", "no:cacheprovider", f"--junitxml={junit}"],
+             "-p", "no:cacheprovider", "--tb=short", "-rfE", f"--junitxml={junit}"],
             cwd=_ROOT, env=env, capture_output=True, text=True, timeout=3600,
         )
         lines = (proc.stdout + proc.stderr).splitlines()
         with open(os.path.join(RESULTS_DIR, "pytest_output.txt"), "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
         failed = [line for line in lines if line.startswith(("FAILED", "ERROR"))]
+        if failed:
+            print("\nFailed tests:")
+            for line in failed[:60]:
+                print("  " + line[:300])
+            errors = [line for line in lines if line.startswith("E  ")]
+            print("\nFirst error lines:")
+            for line in errors[:40]:
+                print("  " + line[:300])
         _write_result(
             "unit", "pass" if proc.returncode == 0 else "fail",
             {"summary": lines[-1] if lines else "", "seconds": round(time.time() - started, 1),
@@ -416,16 +439,37 @@ def _parse_options(pairs: list[str] | None) -> dict:
     return options
 
 
+def _sidecar_transcript(voice_file: str) -> str:
+    sidecar = os.path.splitext(voice_file)[0] + ".txt"
+    if os.path.exists(sidecar):
+        with open(sidecar, encoding="utf-8") as fh:
+            return fh.read().strip()
+    return ""
+
+
+def _asset_voice() -> str:
+    """The narrator clip committed in the assets folder, or ""."""
+    voice_dir = os.path.join(ASSETS_DIR, "voice")
+    if os.path.isdir(voice_dir):
+        clips = sorted(name for name in os.listdir(voice_dir) if name.lower().endswith((".wav", ".flac")))
+        if clips:
+            return os.path.join(voice_dir, clips[0])
+    return ""
+
+
 def _default_voice() -> tuple[str, str]:
-    """Returns (voice_file, transcript) — the generated real-speech clip when it exists."""
+    """Returns (voice_file, transcript) used as the narrator reference.
+
+    Order: ``$ABM_VOICE_FILE``, the clip in the assets folder, a clip made by
+    the ``make-voice`` command, and last the synthetic tone fixture (which is
+    not speech and only keeps the plumbing testable).
+    """
     explicit = os.environ.get("ABM_VOICE_FILE", "").strip()
     if explicit and os.path.exists(explicit):
-        transcript = os.environ.get("ABM_VOICE_TRANSCRIPT", "").strip()
-        sidecar = os.path.splitext(explicit)[0] + ".txt"
-        if not transcript and os.path.exists(sidecar):
-            with open(sidecar, encoding="utf-8") as fh:
-                transcript = fh.read().strip()
-        return explicit, transcript
+        return explicit, os.environ.get("ABM_VOICE_TRANSCRIPT", "").strip() or _sidecar_transcript(explicit)
+    asset = _asset_voice()
+    if asset:
+        return asset, _sidecar_transcript(asset)
     generated = os.path.join(RESULTS_DIR, "voice", "reference.wav")
     if os.path.exists(generated):
         with open(os.path.splitext(generated)[0] + ".txt", encoding="utf-8") as fh:
@@ -505,10 +549,13 @@ def _reset_gpu_state() -> None:
         import gc
         import torch
         gc.collect()
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
             torch.cuda.empty_cache()
             for index in range(torch.cuda.device_count()):
-                torch.cuda.reset_peak_memory_stats(index)
+                try:
+                    torch.cuda.reset_peak_memory_stats(index)
+                except Exception:
+                    pass  # a device nothing has touched yet has no stats to reset
     except Exception as exc:
         print(f"(could not reset GPU state: {exc})")
 
@@ -635,6 +682,24 @@ def _paragraphs(count: int) -> tuple[str, ...]:
     return (TEST_PARAGRAPHS * repeats)[:count]
 
 
+def _device_and_dtype() -> tuple[str, str | None]:
+    """The first GPU and the precision the pipeline itself would pick for it.
+
+    Uses the same pre-flight recommendation as ``run_pipeline``. Forcing
+    float16 here made Qwen3-TTS sample from NaN logits on a T4 ("probability
+    tensor contains either inf, nan or element < 0").
+    """
+    import torch
+    if not torch.cuda.is_available():
+        return "cpu", "float32"
+    try:
+        from audiobook_factory.preflight import run_preflight_checks
+        return "cuda:0", run_preflight_checks(voice_ref=None, check_voice_ref=False).recommended_dtype
+    except Exception as exc:
+        print(f"(pre-flight dtype check failed: {exc}; letting the engine choose)")
+        return "cuda:0", None
+
+
 def cmd_provider(args) -> None:
     tag = args.tag or f"provider_{args.name}"
 
@@ -660,9 +725,8 @@ def cmd_make_voice(args) -> None:
             tts_provider_name="qwen", tts_model_name=args.model,
             tts_timbre=args.timbre, language=args.language, seed=7,
         )
-        import torch
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        provider = get_tts_provider("qwen", config, device=device, dtype_override="float16" if device != "cpu" else "float32")
+        device, dtype = _device_and_dtype()
+        provider = get_tts_provider("qwen", config, device=device, dtype_override=dtype)
         started = time.monotonic()
         try:
             provider.synthesize(VOICE_SAMPLE_TEXT, b"", wav_path)
@@ -696,9 +760,8 @@ def cmd_preset(args) -> None:
         os.makedirs(os.path.dirname(preset_path), exist_ok=True)
         _reset_gpu_state()
         config = _build_config(args, os.path.join(RESULTS_DIR, "work", tag))
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        provider = get_tts_provider(args.name, config, device=device,
-                                    dtype_override="float16" if device != "cpu" else "float32")
+        device, dtype = _device_and_dtype()
+        provider = get_tts_provider(args.name, config, device=device, dtype_override=dtype)
         try:
             described = provider.save_voice_preset(preset_path, voice_file, transcript=transcript or None)
         finally:
