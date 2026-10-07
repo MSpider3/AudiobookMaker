@@ -409,6 +409,8 @@ true_peak: float = -1.5   # max true peak dBTP
 ```
 Or adjust these in the UI (LUFS slider in Book tab, True Peak in Advanced tab).
 
+When a chapter cannot reach the loudness target under the true-peak ceiling with gain alone, the peaks in the way are turned down by a look-ahead limiter (`audiobook_factory/loudness.py`, mirrored in `audiobook_rust/src/audio/master.rs`).
+
 ### Add a new output format
 Edit `audiobook_factory/ffmpeg_utils.py` — add a new entry to `get_format_settings()`.
 

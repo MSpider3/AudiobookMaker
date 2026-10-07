@@ -654,7 +654,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     transcript = voice.add_mutually_exclusive_group()
     transcript.add_argument("--voice-transcript", metavar="TEXT", default=None,
-                            help="What is said in the reference clip.")
+                            help="What is said in the reference clip (the words themselves; "
+                                 "a path to a text file is read as --voice-transcript-file).")
     transcript.add_argument("--voice-transcript-file", metavar="PATH", default=None,
                             help="Text file holding the reference clip's transcript.")
     voice.add_argument("--voice-preset", metavar="PATH", default=None,

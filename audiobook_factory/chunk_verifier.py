@@ -279,7 +279,11 @@ class ChunkVerifier:
             if self._asr is None:
                 return ""
             if self._asr_backend == "faster-whisper":
-                segments, _ = self._asr.transcribe(samples, language=language, beam_size=1)
+                # No carry-over between 30 s windows: with it, one misheard
+                # window makes Whisper repeat or invent the text that follows.
+                segments, _ = self._asr.transcribe(
+                    samples, language=language, beam_size=1, condition_on_previous_text=False,
+                )
                 return " ".join(segment.text for segment in segments).strip()
             generate_kwargs = {"language": language} if language else {}
             result = self._asr(

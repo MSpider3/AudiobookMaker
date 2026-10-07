@@ -950,7 +950,11 @@ class FishSpeechProvider(BaseTTSProvider):
             if key.trim_codec:
                 freed = self._trim_codec_buffers(codec)
                 logger.debug("[Fish] Dropped %.1f GiB of codec masks.", freed / _BYTES_PER_GIB)
-            codec = codec.to(device=self._device, dtype=getattr(torch, key.codec_precision))
+            # Upstream builds the codec under inference_mode, so its weights are
+            # inference tensors: converting them outside that mode leaves them
+            # unusable ("Inference tensors do not track version counter").
+            with torch.inference_mode():
+                codec = codec.to(device=self._device, dtype=getattr(torch, key.codec_precision))
             codec.eval()
             self._codec = codec
             gc.collect()
@@ -1576,7 +1580,8 @@ class FishSpeechProvider(BaseTTSProvider):
             "[Fish] The codec produced NaN/inf in reduced precision on %s; switching "
             "the codec to float32.", self._device,
         )
-        self._codec = self._codec.float()
+        with torch.inference_mode():  # see _load: the weights are inference tensors
+            self._codec = self._codec.float()
         audio = self._inference.decode_to_audio(codes.to(self._device), self._codec)
         return audio.detach().float().cpu()
 

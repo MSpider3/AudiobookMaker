@@ -32,6 +32,7 @@ import json
 import os
 import platform
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -172,10 +173,35 @@ def _transcribe(samples, language: str = "English") -> str | None:
     verifier = ChunkVerifier("asr", language=language, asr_model=os.environ.get(
         "ABM_ASR_MODEL", "openai/whisper-large-v3-turbo"))
     try:
-        text = verifier._transcribe(samples, 16000)
+        # Whisper works on 30 s windows; fed a whole chapter it can repeat or
+        # invent text across window borders, which reads as a high error rate.
+        parts = [verifier._transcribe(window, 16000) for window in _speech_windows(samples, 16000)]
+        text = " ".join(part for part in parts if part).strip()
         return text if (text or verifier._asr is not None) else None
     finally:
         verifier.close()
+
+
+def _speech_windows(samples, rate: int, max_seconds: float = 24.0, min_seconds: float = 8.0) -> list:
+    """Cuts *samples* into windows of at most *max_seconds*, each cut at the quietest point."""
+    import numpy as np
+
+    frame = max(1, int(rate * 0.02))
+    frames = len(samples) // frame
+    if frames * frame <= max_seconds * rate:
+        return [samples]
+    energy = np.sqrt(np.mean(np.square(samples[:frames * frame].reshape(frames, frame)), axis=1))
+    # Quietness over 0.3 s, so a cut lands inside a pause and not between two syllables.
+    span = 15
+    smoothed = np.convolve(energy, np.ones(span) / span, mode="same")
+    windows, start = [], 0
+    low, high = int(min_seconds / 0.02), int(max_seconds / 0.02)
+    while frames - start > high:
+        cut = start + low + int(np.argmin(smoothed[start + low:start + high]))
+        windows.append(samples[start * frame:cut * frame])
+        start = cut
+    windows.append(samples[start * frame:])
+    return [window for window in windows if len(window) >= rate // 4]
 
 
 def _spoken_text(config, paragraphs: tuple[str, ...]) -> str:
@@ -227,7 +253,9 @@ def cmd_env(_args) -> None:
         notes = []
         if len(gpus) < 2:
             notes.append(f"{len(gpus)} GPU(s) visible — pick 'GPU T4 x2' in Session options to test multi-GPU.")
-        _write_result("env", "pass" if gpus else "warn", {
+        transcript_problem = _transcript_problem(voice_file, voice_transcript)
+        status = "fail" if transcript_problem else ("pass" if gpus else "warn")
+        _write_result("env", status, {
             "python": platform.python_version(), "platform": platform.platform(),
             "branch": branch, "commit": commit, "gpus": gpus, "gpu_count": len(gpus),
             "ram_gb": ram_gb, "disk_free_gb": round(disk.free / 2**30, 1),
@@ -237,7 +265,7 @@ def cmd_env(_args) -> None:
             "books_dir": os.path.relpath(_FIXTURES, _ROOT),
             "ffmpeg": ffmpeg[0] if ffmpeg else "missing", "rust_extension": rust,
             "versions": versions, "providers": providers,
-        }, notes=notes)
+        }, error=transcript_problem, notes=notes)
     _guarded("env", body)
 
 
@@ -439,6 +467,34 @@ def _parse_options(pairs: list[str] | None) -> dict:
     return options
 
 
+def _transcript_text(value: str) -> str:
+    """The transcript itself: *value*, or the contents of the text file it names."""
+    value = (value or "").strip()
+    if value and "\n" not in value and len(value) < 1024:
+        for candidate in (value, os.path.join(_ROOT, value)):
+            if os.path.isfile(candidate):
+                with open(candidate, encoding="utf-8-sig", errors="replace") as fh:
+                    return fh.read().strip()
+    return value
+
+
+def _transcript_problem(voice_file: str, transcript: str) -> str:
+    """Why *transcript* cannot be what is said in *voice_file*, or ""."""
+    if not transcript or not transcript.isascii():
+        return ""
+    try:
+        import soundfile as sf
+        info = sf.info(voice_file)
+        seconds = info.frames / float(info.samplerate)
+    except Exception:
+        return ""
+    words = len(transcript.split())
+    if seconds >= 1.0 and not 0.5 <= words / seconds <= 6.0:
+        return (f"the narrator transcript has {words} word(s) for a {seconds:.0f}-second clip; it must be "
+                "the exact words spoken in the clip (or a path to a .txt file holding them)")
+    return ""
+
+
 def _sidecar_transcript(voice_file: str) -> str:
     sidecar = os.path.splitext(voice_file)[0] + ".txt"
     if os.path.exists(sidecar):
@@ -466,7 +522,8 @@ def _default_voice() -> tuple[str, str]:
     """
     explicit = os.environ.get("ABM_VOICE_FILE", "").strip()
     if explicit and os.path.exists(explicit):
-        return explicit, os.environ.get("ABM_VOICE_TRANSCRIPT", "").strip() or _sidecar_transcript(explicit)
+        given = _transcript_text(os.environ.get("ABM_VOICE_TRANSCRIPT", ""))
+        return explicit, given or _sidecar_transcript(explicit)
     asset = _asset_voice()
     if asset:
         return asset, _sidecar_transcript(asset)
@@ -849,12 +906,8 @@ def cmd_resume(args) -> None:
         files, logs, error, wall = _run_pipeline(config, [chapter])
         messages = [m for _, m in logs]
         cached_line = next((m for m in messages if "cached" in m and "pending" in m), "")
-        cached = 0
-        if "(" in cached_line:
-            try:
-                cached = int(cached_line.split("(", 1)[1].split(" cached", 1)[0])
-            except ValueError:
-                cached = 0
+        match = re.search(r"\((\d+) cached", cached_line)
+        cached = int(match.group(1)) if match else 0
         ok = error is None and bool(files) and cached >= 1
         _write_result(tag, "pass" if ok else "fail", {
             "chunks_on_disk_when_killed": seen, "chunks_reused_on_resume": cached,
@@ -1051,15 +1104,23 @@ def cmd_report(_args) -> None:
         json.dump({"counts": counts, "results": results}, fh, ensure_ascii=False, indent=2, default=str)
 
     zip_path = os.path.join(os.path.dirname(RESULTS_DIR), "abm_test_results.zip")
+    archived = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for folder, _dirs, files in os.walk(RESULTS_DIR):
-            if os.sep + "work" in folder:
-                continue  # intermediate pipeline output; the samples folder has the audio
-            for name in files:
+        for folder, dirs, files in os.walk(RESULTS_DIR):
+            if folder == RESULTS_DIR:
+                # Intermediate pipeline output; the samples folder has the audio.
+                # Compared by name inside the results folder: the folder itself
+                # may live under a path such as /kaggle/working.
+                dirs[:] = [name for name in dirs if name != "work"]
+            for name in sorted(files):
                 full = os.path.join(folder, name)
                 archive.write(full, os.path.relpath(full, os.path.dirname(RESULTS_DIR)))
+                archived += 1
+    size_mb = os.path.getsize(zip_path) / 2**20
     print("\n".join(lines))
-    print(f"\nReport: {report_path}\nArchive to send back: {zip_path}")
+    print(f"\nReport: {report_path}\nArchive to send back: {zip_path} ({archived} files, {size_mb:.1f} MB)")
+    if archived < 2:
+        raise SystemExit(f"The results archive is empty ({archived} file) — nothing was collected.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

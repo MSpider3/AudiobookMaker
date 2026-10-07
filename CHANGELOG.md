@@ -27,6 +27,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Multi-GPU**: all GPUs pull length-sorted batches from one shared queue per chapter; a GPU that fails hands its batch to the others. Batch size no longer shrinks after the first batch and adapts after an out-of-memory retry.
 - **Progress file** is written once per batch instead of once per chunk; chapter numbers are stable across subset runs and status is matched by title.
 - **Mastering** normalises loudness once; Rust functions release the GIL.
+- **Chapters now reach the loudness target (`loudness.py`, `audiobook_rust/src/audio/master.rs`)**: narration has a few peaks far above its average level, so one static gain stopped 2-5 LU short of the LUFS target on every engine tested (-20 to -22 instead of -18). The full gain is now applied and those peaks go through a look-ahead limiter (1 ms gain curve, held over a pitch period, smoothed so it cannot click). Chapters that already fit are untouched; the limiter never takes more than 9 dB.
+- **Short chapters use every GPU (`chapter_pipeline.py`)**: a device takes at most an even share of the chunks still queued, where the first device used to take a whole batch — all of a short chapter — and the second T4 sat idle. An idle device also waits while another is mid-batch, so work handed back by a failed device is picked up instead of lost.
 - **Reference-voice preprocessing** rewritten: loudness (LUFS) target applied last, edge-only silence trim with fades, peak-relative soft gate, pause-learned noise profile, downsample to 24 kHz mono, and a report with warnings.
 - **Config schema 7**: `voice_preset`, `tts_options`, `redo_chapters`, `batch_size`, `pack_sentences`, `normalize_speech_text`, `verify_*`.
 
@@ -34,6 +36,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **VibeVoice provider** — it could never synthesize (it called a method the model does not have). Saved configs naming it fall back to Qwen3-TTS.
 
 ### 🐛 Fixed
+- **Fish Audio S2 Pro failed on every chunk in reduced precision (`fish_provider.py`)**: upstream builds its codec under `torch.inference_mode`; converting it to the model's precision outside that mode left the weights unusable ("Inference tensors do not track version counter"). Seen on a T4, where the codec runs in bfloat16.
+- **IndexTTS could not load (`requirements/tts-indextts.txt`, `indextts_provider.py`)**: upstream's bundled DAC code imports `audiotools` while the model loads; `descript-audiotools` and what it imports are now part of the install steps.
+- **Transcript given as a file path (`pipeline.py`)**: a path to a `.txt` file in the voice-transcript field was taken as the words spoken in the clip, which made cloning engines cut chunks short, ramble or go silent. The file is now read, and a transcript whose length cannot match the clip is reported before synthesis starts.
+- **ASR chunk verification (`chunk_verifier.py`)**: Whisper no longer carries context between its 30-second windows, which made one misheard window spoil the rest of a transcript.
 - **Loudness normalisation never boosted quiet audio (`audiobook_rust/src/audio/master.rs`)**: the true peak (a linear amplitude) was added to a dB gain, so any chapter needing a boost was turned *down* ~1.5 dB instead of reaching the LUFS target.
 - **Real errors hidden behind `sub_future` `UnboundLocalError` (`pipeline.py`)**: any failure, cancel or empty chapter before the subtitle stage reported "cannot access local variable 'sub_future'" and was marked failed.
 - **Cancellation (`pipeline.py`)**: `asyncio.CancelledError` from the chapter pipeline is now handled; a cancelled chapter stays `pending` instead of `failed`.

@@ -95,7 +95,8 @@ _REQUIREMENTS_FILE: str = "requirements/tts-indextts.txt"
 # requirements file.
 _INSTALL_COMMAND: str = (
     f"pip install -r {_REQUIREMENTS_FILE} && "
-    f'pip install --no-deps --ignore-requires-python "indextts @ git+{_UPSTREAM_GIT_URL}@{_UPSTREAM_COMMIT}"'
+    "pip install --no-deps --ignore-requires-python descript-audiotools "
+    f'"indextts @ git+{_UPSTREAM_GIT_URL}@{_UPSTREAM_COMMIT}"'
 )
 
 # ── Audio / generation constants ─────────────────────────────────────────────

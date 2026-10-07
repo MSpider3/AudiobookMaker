@@ -107,12 +107,16 @@ class _FakeCodec(torch.nn.Module):
         super().__init__()
         self.recorder = recorder
         self.weight = torch.nn.Parameter(torch.zeros(2))
+        self.projection = torch.nn.Linear(2, 2)
         self.pre_module = WindowLimitedTransformer()
 
     # modded_dac.DAC.encode(audio_data, audio_lengths=None, n_quantizers=None, **kwargs)
     def encode(self, audio_data, audio_lengths=None, n_quantizers=None, **kwargs):
         assert audio_data.ndim == 3 and audio_data.shape[:2] == (1, 1)
         assert audio_data.dtype == self.weight.dtype
+        # A real forward through the weights: it raises when they were
+        # converted outside the inference mode they were built in.
+        self.projection(audio_data.new_zeros(1, 2))
         self.recorder.encode_calls += 1
         frames = int(math.ceil(int(audio_lengths[0]) / _FRAME_LENGTH))
         indices = torch.arange(frames).repeat(1, _NUM_CODEBOOKS, 1) % 1024
@@ -154,12 +158,15 @@ def _build_fake_upstream(recorder: _Recorder) -> dict[str, types.ModuleType]:
     ):
         raise AssertionError("not called by the fake generate_long")
 
-    # inference.py:418
+    # inference.py:417-418 - upstream builds the codec under inference_mode,
+    # so its weights are inference tensors.
+    @torch.inference_mode()
     def load_codec_model(codec_checkpoint_path, device, precision=torch.bfloat16):
         recorder.codec_loads.append((str(codec_checkpoint_path), device, precision))
         return _FakeCodec(recorder).to(device=device, dtype=precision)
 
-    # inference.py:462
+    # inference.py:461-462
+    @torch.inference_mode()
     def decode_to_audio(codes, codec):
         recorder.decode_calls += 1
         assert codes.ndim == 2 and codes.shape[0] == _NUM_CODEBOOKS
@@ -599,6 +606,26 @@ class TestLoading:
 
 
 # ── Synthesis ────────────────────────────────────────────────────────────────
+
+
+class TestCodecBuiltInInferenceMode:
+    """Upstream's ``load_codec_model`` runs under ``torch.inference_mode``."""
+
+    def test_reduced_precision_codec_still_encodes_the_reference(self, upstream):
+        # On a GPU the codec is converted to the model's precision after
+        # loading. Done outside inference mode, that left the weights unusable:
+        # "Inference tensors do not track version counter" on every chunk.
+        provider = _provider(dtype_override="bfloat16")
+        provider.ensure_ready()
+        assert next(provider._codec.parameters()).dtype == torch.bfloat16
+        wav, duration = provider.synthesize("Hello there.", _wav_bytes(), return_bytes=True)
+        assert duration > 0 and wav[:4] == b"RIFF"
+        assert upstream.encode_calls == 1
+
+    def test_codec_weights_stay_inference_tensors(self, upstream):
+        provider = _provider(dtype_override="bfloat16")
+        provider.ensure_ready()
+        assert all(parameter.is_inference() for parameter in provider._codec.parameters())
 
 
 class TestSynthesis:

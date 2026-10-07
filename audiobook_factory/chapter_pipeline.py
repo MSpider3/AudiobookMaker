@@ -25,6 +25,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from typing import Callable, TYPE_CHECKING
 
 import gc
@@ -46,6 +47,8 @@ _MINIMUM_CHUNK_WAV_BYTES: int = 1000
 _SEQUENTIAL_BATCH_SIZE: int = 4
 # Batch size for providers that synthesize one text at a time anyway: small
 # enough that progress, cancellation and the chunk cache stay current.
+_IDLE_WORKER_POLL_SECONDS: float = 0.1
+# How often a device with nothing to do re-checks the queue while another works.
 _FATAL_VERDICT_SCORE: float = 10.0
 # ChunkVerdict.score at or above this means the chunk has no usable audio.
 
@@ -84,6 +87,64 @@ class _SynthResult:
     chunk_index: int
     audio: bytes | str
     duration: float
+
+
+@dataclass
+class _WorkShare:
+    """Splits the chunk queue between Stage B workers.
+
+    Without it the first device to start takes a whole batch, which on a
+    short chapter is every chunk, and the other GPUs sit idle. Each grab is
+    capped at an even share of what is queued among the devices that are
+    free to take it, and a worker that finds the queue empty waits while
+    another one is mid-batch, because that batch comes back to the queue if
+    its device fails.
+
+    Attributes:
+        workers: Stage B workers still running.
+        _busy: Workers currently synthesizing a batch.
+        _lock: Mutex for the counters and for taking a batch.
+    """
+
+    workers: int = 1
+    _busy: int = field(default=0, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+
+    def take(self, work_queue: queue.Queue, batch_size: int) -> list[tuple[int, str]]:
+        """Takes up to *batch_size* items, but no more than an even share.
+
+        The share is counted among the workers that are not busy: a device
+        that is free while the others are mid-batch takes full batches.
+        """
+        with self._lock:
+            free_workers = max(1, self.workers - self._busy)
+            fair_share = -(-work_queue.qsize() // free_workers)
+            wanted = max(1, min(int(batch_size), fair_share))
+            batch: list[tuple[int, str]] = []
+            while len(batch) < wanted:
+                try:
+                    batch.append(work_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if batch:
+                self._busy += 1
+            return batch
+
+    def finish(self) -> None:
+        """Marks this worker's current batch as done (or handed back)."""
+        with self._lock:
+            self._busy = max(0, self._busy - 1)
+
+    def retire(self) -> None:
+        """Removes a stopping worker from the share calculation."""
+        with self._lock:
+            self.workers = max(0, self.workers - 1)
+
+    @property
+    def others_busy(self) -> bool:
+        """True while any worker holds a batch that could still be returned."""
+        with self._lock:
+            return self._busy > 0
 
 
 @dataclass
@@ -221,20 +282,15 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
                 logger.warning("Failed to read partial %s during final mastering: %s", p, exc)
         if segments:
             raw = np.concatenate(segments)
-            # Apply EBU R128 loudness normalization & true peak limiting in pure-Python
+            # EBU R128 loudness normalisation with a peak limiter, in pure Python.
             try:
-                import pyloudnorm as pyln
-                meter = pyln.Meter(int(sr))
-                input_loudness = meter.integrated_loudness(raw)
-                if not np.isneginf(input_loudness) and not np.isnan(input_loudness):
-                    target_lufs = float(config.lufs)
-                    gain_db = target_lufs - input_loudness
-                    target_tp_linear = 10.0 ** (float(config.true_peak) / 20.0)
-                    gain_linear = 10.0 ** (gain_db / 20.0)
-                    peak = float(np.max(np.abs(raw)))
-                    if peak > 0 and (peak * gain_linear) > target_tp_linear:
-                        gain_linear = target_tp_linear / peak
-                    raw = raw * gain_linear
+                from audiobook_factory.loudness import normalize_loudness
+
+                if raw.ndim > 1:
+                    raw = raw.mean(axis=1)
+                raw, _result = normalize_loudness(
+                    raw, int(sr), float(config.lufs), float(config.true_peak)
+                )
             except Exception as norm_err:
                 normalized = False
                 logger.warning("pyloudnorm mastering normalization fallback error: %s", norm_err)
@@ -442,14 +498,16 @@ def _stage_b_device_worker(
     chunks_completed_cb: Callable[[list[int]], None] | None = None,
     chunk_flagged_cb: Callable[[int, str], None] | None = None,
     device_stats: dict[str, int] | None = None,
+    share: _WorkShare | None = None,
 ) -> None:
     """Dedicated synthesis thread for one GPU device.
 
-    Pulls batches from the shared ``work_queue`` until it is empty. If a
-    batch fails, its unfinished chunks go back on the queue for the other
-    devices and this worker stops; the chapter only fails if chunks are still
-    missing once every worker has stopped. Always puts exactly one ``None``
-    sentinel on ``master_queue`` when it exits.
+    Pulls batches from the shared ``work_queue`` until it is empty and no
+    other device is still working. If a batch fails, its unfinished chunks go
+    back on the queue for the other devices and this worker stops; the
+    chapter only fails if chunks are still missing once every worker has
+    stopped. Always puts exactly one ``None`` sentinel on ``master_queue``
+    when it exits.
 
     Args:
         device: The device string this thread owns ("cuda:0", "cuda:1").
@@ -469,7 +527,11 @@ def _stage_b_device_worker(
         chunk_flagged_cb: Optional callback for chunks that failed verification.
         device_stats: Optional dict receiving the number of chunks this
             device synthesized, keyed by device.
+        share: Work-splitting state shared by every worker of the chapter.
     """
+    share = share if share is not None else _WorkShare()
+    retired = False
+    holding = False  # True while this worker has a batch the others may need back
     try:
         batch_size = max(1, _batch_size_for(device, provider, config))
         while not cancel_token.is_cancelled:
@@ -480,14 +542,14 @@ def _stage_b_device_worker(
                     device, batch_size, limit,
                 )
                 batch_size = max(1, int(limit))
-            batch: list[tuple[int, str]] = []
-            while len(batch) < batch_size:
-                try:
-                    batch.append(work_queue.get_nowait())
-                except queue.Empty:
-                    break
+            batch = share.take(work_queue, batch_size)
             if not batch:
+                if share.others_busy:
+                    # A device that fails hands its batch back; stay for it.
+                    time.sleep(_IDLE_WORKER_POLL_SECONDS)
+                    continue
                 break
+            holding = True
 
             written: set[int] = set()
 
@@ -512,15 +574,27 @@ def _stage_b_device_worker(
                 logger.error(
                     "Stage B worker on %s failed (%s: %s); returning %d chunk(s) to the queue.",
                     device, type(exc).__name__, exc, len(unfinished),
+                    exc_info=True,
                 )
                 worker_errors.append(exc)
+                # Leave the share before handing the work back, so the other
+                # devices divide it among themselves.
+                share.retire()
+                retired = True
                 for item in unfinished:
                     work_queue.put(item)
                 break
+            share.finish()
+            holding = False
     except Exception as exc:
         logger.exception("Stage B worker on %s crashed", device)
         worker_errors.append(exc)
     finally:
+        # Whatever ended this worker, the others must not wait on it.
+        if not retired:
+            share.retire()
+        if holding:
+            share.finish()
         # Stage C waits for one sentinel per worker.
         master_queue.put(None)
 
@@ -655,6 +729,7 @@ def run_chapter_pipeline(
     stage_b_threads: list[threading.Thread] = []
     worker_errors: list[BaseException] = []
     device_stats: dict[str, int] = {device: 0 for device in active_devices}
+    work_share = _WorkShare(workers=stage_b_thread_count)
 
     durations_res: list[float] = [0.0] * total_chunks
     stage_c_exception: BaseException | None = None
@@ -689,6 +764,7 @@ def run_chapter_pipeline(
                     chunks_completed_cb,
                     chunk_flagged_cb,
                     device_stats,
+                    work_share,
                 ),
                 name=f"StageB-{device}-Ch{chapter_index}",
                 daemon=False,

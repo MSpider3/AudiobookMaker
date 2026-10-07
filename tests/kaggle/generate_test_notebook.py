@@ -79,11 +79,13 @@ ASR_SCORING      = True    # transcribe each result with Whisper and score word 
 
 # Test inputs, read from the cloned repository (paths are relative to the repo root).
 # To test another voice, point VOICE_FILE at any 5-30 s clip of clean speech (an absolute
-# path such as /kaggle/input/... also works) and give its exact words in VOICE_TRANSCRIPT,
-# or leave VOICE_TRANSCRIPT empty to read them from a .txt file next to the clip.
+# path such as /kaggle/input/... also works). VOICE_TRANSCRIPT is what is said in the clip:
+# either the words themselves or the path of a .txt file holding them. Leave it empty to
+# use the .txt file next to the clip. It must match the clip word for word — engines that
+# clone from a transcript cut off, ramble or go silent when it does not.
 ASSETS_DIR       = "tests/kaggle/assets"
 VOICE_FILE       = "tests/kaggle/assets/voice/LOTM_narrator_voice.wav"
-VOICE_TRANSCRIPT = ""
+VOICE_TRANSCRIPT = "tests/kaggle/assets/voice/LOTM_narrator_voice.txt"
 
 PROVIDER_TIMEOUT_MIN = 60  # per engine, including model download
 """),
@@ -137,6 +139,11 @@ os.environ["ABM_RESULTS_DIR"] = RESULTS
 os.environ["ABM_SKIP_GPU_WARMUP"] = "1"
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Progress bars redraw in a terminal but print a new line each time here
+# (one engine wrote 5,900 of them), burying the lines that matter.
+os.environ["TQDM_DISABLE"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
 def in_repo(path):
     \"\"\"Resolves a settings path against the cloned repository.\"\"\"
     return path if os.path.isabs(path) else os.path.join(REPO, path)
@@ -146,13 +153,29 @@ VOICE_PATH = in_repo(VOICE_FILE) if VOICE_FILE else ""
 os.environ["ABM_ASSETS_DIR"] = ASSETS_PATH
 HAVE_VOICE = bool(VOICE_PATH) and os.path.exists(VOICE_PATH)
 if HAVE_VOICE:
-    os.environ["ABM_VOICE_FILE"] = VOICE_PATH
-    os.environ["ABM_VOICE_TRANSCRIPT"] = VOICE_TRANSCRIPT
+    words = VOICE_TRANSCRIPT.strip()
+    if words and "\\n" not in words and os.path.isfile(in_repo(words)):
+        with open(in_repo(words), encoding="utf-8-sig") as fh:   # a path to the transcript, not the words
+            words = fh.read().strip()
     sidecar = os.path.splitext(VOICE_PATH)[0] + ".txt"
-    words = VOICE_TRANSCRIPT or (open(sidecar, encoding="utf-8").read().strip() if os.path.exists(sidecar) else "")
+    if not words and os.path.exists(sidecar):
+        with open(sidecar, encoding="utf-8-sig") as fh:
+            words = fh.read().strip()
+    os.environ["ABM_VOICE_FILE"] = VOICE_PATH
+    os.environ["ABM_VOICE_TRANSCRIPT"] = words
     print(f"Narrator voice : {VOICE_PATH}")
-    print(f"Transcript     : {words[:110]}{'…' if len(words) > 110 else ''}" if words
+    print(f"Transcript     : {len(words.split())} words — {words[:110]}{'…' if len(words) > 110 else ''}" if words
           else "Transcript     : none — engines that need one will transcribe the clip themselves")
+    try:
+        import soundfile
+        clip = soundfile.info(VOICE_PATH)
+        clip_seconds = clip.frames / clip.samplerate
+    except Exception:
+        clip_seconds = 0
+    if words and words.isascii() and clip_seconds >= 1 and not 0.5 <= len(words.split()) / clip_seconds <= 6:
+        raise RuntimeError(
+            f"VOICE_TRANSCRIPT has {len(words.split())} word(s) for a {clip_seconds:.0f}-second clip, so it cannot be "
+            "what is said in it. Give the exact words, or the path of a .txt file that holds them.")
 else:
     print(f"⚠️ Narrator voice not found at {VOICE_PATH or '(not set)'} — a clip will be made with a Qwen preset voice.")
 books = os.path.join(ASSETS_PATH, "books")
@@ -347,7 +370,18 @@ suite("report")
 from IPython.display import Markdown, display
 with open(os.path.join(RESULTS, "REPORT.md"), encoding="utf-8") as fh:
     display(Markdown(fh.read()))
-print("\\n📦 Download and send back:", os.path.join(WORK, "abm_test_results.zip"))
+
+import zipfile
+archive_path = os.path.join(WORK, "abm_test_results.zip")
+with zipfile.ZipFile(archive_path) as archive:
+    names = archive.namelist()
+    broken = archive.testzip()
+print(f"\\n📦 {archive_path}: {len(names)} files, {os.path.getsize(archive_path) / 2**20:.1f} MB")
+for folder in ("logs", "samples"):
+    print(f"   {folder}/: {sum(1 for n in names if f'/{folder}/' in n)} files")
+if broken or len(names) < 3:
+    raise RuntimeError(f"The results archive is incomplete (first bad file: {broken}); send the notebook itself instead.")
+print("Download it from the Output panel (or the file browser on the right) and send it back.")
 """),
         _md("""
 ### Listening to the results
@@ -386,7 +420,7 @@ PROVIDER_SETUP: dict[str, dict] = {
         # file carries the ones it really needs (transformers 4.52.1 among them,
         # which is why this engine cannot share Qwen's environment).
         "post": [
-            "{python} -m pip install -q --no-deps --ignore-requires-python "
+            "{python} -m pip install -q --no-deps --ignore-requires-python descript-audiotools "
             "\"indextts @ git+https://github.com/index-tts/index-tts.git@d9e41aac89fd00b3d71497fddb287b7f24613712\"",
         ],
         "env": {"USE_MODELSCOPE": "false"},

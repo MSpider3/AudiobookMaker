@@ -8,13 +8,15 @@
 # Install in TWO steps:
 #
 #   pip install -r requirements/tts-indextts.txt
-#   pip install --no-deps --ignore-requires-python "indextts @ git+https://github.com/index-tts/index-tts.git@d9e41aac89fd00b3d71497fddb287b7f24613712"
+#   pip install --no-deps --ignore-requires-python descript-audiotools "indextts @ git+https://github.com/index-tts/index-tts.git@d9e41aac89fd00b3d71497fddb287b7f24613712"
 #
 # The upstream package is installed with --no-deps on purpose: its metadata pins
-# torch==2.8.*, torchaudio==2.8.*, numpy==2.2.6, keras==2.9.0, pandas, opencv,
-# tensorboard ... and Python <3.12, none of which inference needs. This file
-# lists what the inference path really imports. torch / torchaudio are taken
-# from the environment (Kaggle / Colab stock builds).
+# torch==2.8.*, torchaudio==2.8.*, numpy==2.2.6, keras==2.9.0, pandas, opencv
+# ... and Python <3.12, none of which inference needs. descript-audiotools
+# (imported by upstream's bundled DAC code while the model loads) goes in the
+# same --no-deps step because it pins protobuf<3.20. This file lists what the
+# inference path really imports. torch / torchaudio are taken from the
+# environment (Kaggle / Colab stock builds).
 #
 # Instead of the second command you can clone the repository and point the
 # provider at it:  export ABM_INDEXTTS_REPO=/path/to/index-tts
@@ -50,6 +52,16 @@ librosa>=0.10.2
 scipy
 matplotlib                  # imported by upstream's BigVGAN utilities
 soundfile
+
+# ── Imported by descript-audiotools (installed with --no-deps, see above) ─────
+argbind>=0.3.7
+flatten-dict
+julius
+ffmpy
+importlib-resources
+randomname
+tensorboard
+rich
 
 # ── Text front end ───────────────────────────────────────────────────────────
 sentencepiece>=0.2.0        # IndexTTS-2 BPE tokenizer

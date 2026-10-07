@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -308,6 +309,26 @@ class TestInfo:
 
 
 # ── Loading ──────────────────────────────────────────────────────────────────
+
+class TestInstallInstructions:
+    """Upstream is installed with --no-deps, so everything it imports must be named."""
+
+    def test_install_command_includes_audiotools(self):
+        # Upstream's bundled DAC code imports audiotools while the model
+        # loads (not at package import), which a first GPU run tripped over.
+        assert "--no-deps" in mod._INSTALL_COMMAND
+        assert "descript-audiotools" in mod._INSTALL_COMMAND
+
+    def test_requirements_cover_what_audiotools_imports(self):
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        with open(os.path.join(root, mod._REQUIREMENTS_FILE), encoding="utf-8") as fh:
+            lines = [line.split("#", 1)[0].strip() for line in fh]
+        names = {re.split(r"[<>=!~;\[ ]", line, maxsplit=1)[0].lower() for line in lines if line}
+        assert {"argbind", "flatten-dict", "julius", "ffmpy", "importlib-resources",
+                "randomname", "tensorboard", "rich"} <= names
+        # Installed with --no-deps instead: it pins protobuf<3.20.
+        assert "descript-audiotools" not in names
+
 
 class TestLoading:
 

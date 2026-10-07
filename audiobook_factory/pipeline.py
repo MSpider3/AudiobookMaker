@@ -118,6 +118,13 @@ _SUMMARY_MAX_FLAGGED_PER_CHAPTER: int = 5
 
 _VALID_VERIFY_MODES: tuple[str, ...] = ("off", "duration", "asr")
 
+# A transcript this short may be a file path typed where the words belong.
+_MAX_PATH_LIKE_TRANSCRIPT_CHARS: int = 1024
+# Narration runs at two to three words a second; outside this range the
+# transcript cannot be what is said in the reference clip.
+_MIN_TRANSCRIPT_WORDS_PER_SECOND: float = 0.5
+_MAX_TRANSCRIPT_WORDS_PER_SECOND: float = 6.0
+
 
 def _mark_chapter_completed(progress_path: str, chapter_num: int, output_wav_path: str) -> None:
     """Validates chapter output WAV and marks chapter completed in progress JSON.
@@ -502,6 +509,72 @@ def preview_chapters(
 # Main orchestrator
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _transcript_from_file(value: str) -> str | None:
+    """Returns the text of *value* when it names a readable text file, else None.
+
+    A transcript field holds the words spoken in the reference clip, but a
+    path to a ``.txt`` file is an easy thing to put there instead. Taken
+    literally the path becomes the "words" of the clip, and cloning engines
+    then cut chunks short, ramble or go silent.
+    """
+    candidate = value.strip()
+    if not candidate or "\n" in candidate or len(candidate) > _MAX_PATH_LIKE_TRANSCRIPT_CHARS:
+        return None
+    path = os.path.expanduser(candidate)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def _clip_seconds(path: str) -> float | None:
+    """Duration of an audio file, or None when it cannot be read."""
+    try:
+        info = sf.info(path)
+        return info.frames / float(info.samplerate) if info.samplerate else None
+    except Exception:
+        return None
+
+
+def _resolve_voice_transcript(config: AudiobookConfig, log: Callable[[str], None]) -> None:
+    """Normalises ``config.voice_transcript`` and warns when it cannot be right.
+
+    A transcript that is really a path to a text file is replaced by that
+    file's contents. A transcript whose length does not fit the clip (far too
+    few or too many words for its duration) is reported: prompt-based cloning
+    aligns the clip with these words, so a wrong transcript ruins every chunk.
+    """
+    transcript = (getattr(config, "voice_transcript", "") or "").strip()
+    if not transcript:
+        return
+    from_file = _transcript_from_file(transcript)
+    if from_file is not None:
+        log(
+            f"[Pipeline] The voice transcript is a file path; using the text inside "
+            f"{os.path.basename(transcript)} ({len(from_file.split())} words)."
+        )
+        config.voice_transcript = transcript = from_file
+        if not transcript:
+            return
+
+    seconds = _clip_seconds(config.voice_file) if config.voice_file else None
+    words = transcript.split()
+    # Word counts only mean something for scripts that put spaces between words.
+    if not seconds or seconds < 1.0 or not transcript.isascii():
+        return
+    rate = len(words) / seconds
+    if rate < _MIN_TRANSCRIPT_WORDS_PER_SECOND or rate > _MAX_TRANSCRIPT_WORDS_PER_SECOND:
+        log(
+            f"[Pipeline] ⚠ The voice transcript has {len(words)} word(s) for a "
+            f"{seconds:.0f}-second clip. It must be the exact words spoken in the clip; "
+            "a transcript that does not match makes cloned speech cut off, ramble or go silent. "
+            "Fix it, or clear it to let the engine work without one."
+        )
+
+
 def run_pipeline(
     config:      AudiobookConfig,
     chapters:    list[ExtractedChapter],
@@ -557,6 +630,8 @@ def run_pipeline(
     # Providers that change speed themselves get config.speed; for the rest
     # the finished chapter is time-stretched while it is encoded.
     post_speed = 1.0 if engine.supports_speed else _clamp_speed(config.speed)
+
+    _resolve_voice_transcript(config, log)
 
     log(f"[Pipeline] Starting — {total} chapter(s)")
     log(f"[Pipeline] Output  : {config.output_dir}")

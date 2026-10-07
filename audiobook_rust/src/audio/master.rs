@@ -134,6 +134,214 @@ fn write_mp3_file(path: &str, samples: &[f32], sample_rate: u32, bitrate_kbps: u
     Ok(())
 }
 
+// ── Loudness normalisation with a look-ahead peak limiter ───────────────────
+//
+// Same algorithm and constants as audiobook_factory/loudness.py (the
+// pure-Python path); keep the two in step.
+
+/// One limiter gain value per millisecond.
+const LIMITER_BLOCK_SECONDS: f64 = 0.001;
+/// Sliding minimum over +/- this many blocks.
+const LIMITER_HOLD_BLOCKS: usize = 8;
+/// Box filter over +/- this many blocks, applied `LIMITER_SMOOTH_PASSES` times.
+const LIMITER_SMOOTH_BLOCKS: usize = 3;
+const LIMITER_SMOOTH_PASSES: usize = 2;
+/// The limiter controls sample peaks; inter-sample peaks sit a little higher.
+const LIMITER_MARGIN_DB: f64 = 0.3;
+/// Below this shortfall the gain is simply capped: not worth limiting.
+const LIMITER_MIN_SHORTFALL_DB: f64 = 0.5;
+/// Never push peaks further than this into the limiter.
+const MAX_LIMITER_REDUCTION_DB: f64 = 9.0;
+/// Limiting removes a little loudness; correct once if it is more than this.
+const LOUDNESS_RETRY_THRESHOLD_LU: f64 = 0.1;
+/// Samples handed to the loudness meter per call while measuring a limited signal.
+const MEASURE_CHUNK_SAMPLES: usize = 1 << 16;
+
+fn db_to_linear(db: f64) -> f64 {
+    10.0f64.powf(db / 20.0)
+}
+
+fn limiter_block_len(sample_rate: u32) -> usize {
+    ((sample_rate as f64 * LIMITER_BLOCK_SECONDS).round() as usize).max(1)
+}
+
+/// Peak absolute value of each limiter block.
+fn block_peaks(samples: &[f32], block: usize) -> Vec<f32> {
+    samples
+        .par_chunks(block)
+        .map(|chunk| chunk.iter().fold(0.0f32, |peak, s| peak.max(s.abs())))
+        .collect()
+}
+
+/// Block gain curve that keeps `block_peaks * gain` at or below `ceiling`.
+/// Returns None when nothing is above the ceiling.
+fn limiter_curve(peaks: &[f32], gain: f64, ceiling: f64) -> Option<Vec<f64>> {
+    let blocks = peaks.len();
+    let required: Vec<f64> = peaks
+        .iter()
+        .map(|&p| (ceiling / (p as f64 * gain).max(1e-12)).min(1.0))
+        .collect();
+    if required.iter().all(|&r| r >= 1.0) {
+        return None;
+    }
+
+    // Hold: centred sliding minimum, edges repeated.
+    let hold = LIMITER_HOLD_BLOCKS;
+    let mut curve = vec![1.0f64; blocks];
+    for (i, slot) in curve.iter_mut().enumerate() {
+        let lo = i.saturating_sub(hold);
+        let hi = (i + hold).min(blocks - 1);
+        *slot = required[lo..=hi].iter().cloned().fold(f64::INFINITY, f64::min);
+    }
+
+    // Smooth: box filter with repeated edges, so the gain never steps.
+    let smooth = LIMITER_SMOOTH_BLOCKS as isize;
+    let width = (2 * smooth + 1) as f64;
+    for _ in 0..LIMITER_SMOOTH_PASSES {
+        let source = curve.clone();
+        for (i, slot) in curve.iter_mut().enumerate() {
+            let mut total = 0.0;
+            for offset in -smooth..=smooth {
+                let index = (i as isize + offset).clamp(0, blocks as isize - 1) as usize;
+                total += source[index];
+            }
+            *slot = total / width;
+        }
+    }
+    Some(curve)
+}
+
+/// Gain for sample `index`: the block curve interpolated between block centres.
+#[inline]
+fn curve_gain_at(curve: &[f64], block: usize, index: usize) -> f64 {
+    let position = (index as f64 + 0.5) / block as f64 - 0.5;
+    if position <= 0.0 {
+        return curve[0];
+    }
+    let left = position.floor() as usize;
+    if left + 1 >= curve.len() {
+        return curve[curve.len() - 1];
+    }
+    let fraction = position - left as f64;
+    curve[left] + (curve[left + 1] - curve[left]) * fraction
+}
+
+/// Integrated loudness of `samples * gain * curve` without storing the result.
+fn limited_loudness(
+    samples: &[f32],
+    sample_rate: u32,
+    gain: f64,
+    curve: Option<&[f64]>,
+    block: usize,
+) -> Result<f64, String> {
+    let mut meter = EbuR128::new(1, sample_rate, Mode::I)
+        .map_err(|e| format!("Failed to create EBU R128 state: {:?}", e))?;
+    let mut buffer = vec![0.0f32; MEASURE_CHUNK_SAMPLES];
+    for (chunk_index, chunk) in samples.chunks(MEASURE_CHUNK_SAMPLES).enumerate() {
+        let offset = chunk_index * MEASURE_CHUNK_SAMPLES;
+        for (i, (out, &sample)) in buffer.iter_mut().zip(chunk.iter()).enumerate() {
+            let limit = curve.map_or(1.0, |c| curve_gain_at(c, block, offset + i));
+            *out = (sample as f64 * gain * limit) as f32;
+        }
+        meter
+            .add_frames_f32(&buffer[..chunk.len()])
+            .map_err(|e| format!("EBU R128 analysis failed: {:?}", e))?;
+    }
+    meter
+        .loudness_global()
+        .map_err(|e| format!("EBU R128 global loudness check failed: {:?}", e))
+}
+
+/// Applies `gain` and the limiter `curve` in place.
+fn apply_gain(samples: &mut [f32], gain: f64, curve: Option<&[f64]>, block: usize) {
+    match curve {
+        None => {
+            let gain = gain as f32;
+            samples.par_iter_mut().for_each(|s| *s *= gain);
+        }
+        Some(curve) => {
+            samples.par_iter_mut().enumerate().for_each(|(i, s)| {
+                *s = (*s as f64 * gain * curve_gain_at(curve, block, i)) as f32;
+            });
+        }
+    }
+}
+
+/// Brings `samples` to `target_lufs` without exceeding `target_tp_db`.
+///
+/// A static gain is used when the peaks allow it. Otherwise the full gain is
+/// applied and the peaks that would cross the ceiling are limited, instead of
+/// leaving the chapter quieter than asked.
+fn normalize_loudness(
+    samples: &mut [f32],
+    sample_rate: u32,
+    target_lufs: f64,
+    target_tp_db: f64,
+) -> Result<(), String> {
+    let mut ebu = EbuR128::new(1, sample_rate, Mode::I | Mode::TRUE_PEAK)
+        .map_err(|e| format!("Failed to create EBU R128 state: {:?}", e))?;
+    ebu.add_frames_f32(samples)
+        .map_err(|e| format!("EBU R128 analysis failed: {:?}", e))?;
+    let global_lufs = ebu.loudness_global()
+        .map_err(|e| format!("EBU R128 global loudness check failed: {:?}", e))?;
+    if !(global_lufs.is_normal() && global_lufs > -100.0) {
+        return Ok(()); // silence: nothing to normalise
+    }
+
+    // ebur128 reports true peak as a linear amplitude, not dBTP.
+    let peak_linear = ebu.true_peak(0)
+        .map_err(|e| format!("EBU R128 true peak check failed: {:?}", e))?;
+    let peak_db = 20.0 * peak_linear.max(1e-10).log10();
+
+    let mut gain_db = target_lufs - global_lufs;
+    let headroom_db = target_tp_db - peak_db;
+    let shortfall_db = gain_db - headroom_db;
+    if shortfall_db <= LIMITER_MIN_SHORTFALL_DB {
+        apply_gain(samples, db_to_linear(gain_db.min(headroom_db)), None, 1);
+        return Ok(());
+    }
+
+    let max_gain_db = headroom_db + MAX_LIMITER_REDUCTION_DB;
+    let reached = gain_db <= max_gain_db;
+    gain_db = gain_db.min(max_gain_db);
+    let ceiling = db_to_linear(target_tp_db - LIMITER_MARGIN_DB);
+    let block = limiter_block_len(sample_rate);
+    let peaks = block_peaks(samples, block);
+
+    let mut curve = limiter_curve(&peaks, db_to_linear(gain_db), ceiling);
+    let mut output_lufs =
+        limited_loudness(samples, sample_rate, db_to_linear(gain_db), curve.as_deref(), block)?;
+    let missing = target_lufs - output_lufs;
+    if reached && output_lufs.is_normal() && missing > LOUDNESS_RETRY_THRESHOLD_LU {
+        // The limiter took a little loudness away; ask for that much more.
+        gain_db = (gain_db + missing).min(max_gain_db);
+        curve = limiter_curve(&peaks, db_to_linear(gain_db), ceiling);
+        output_lufs =
+            limited_loudness(samples, sample_rate, db_to_linear(gain_db), curve.as_deref(), block)?;
+    }
+    apply_gain(samples, db_to_linear(gain_db), curve.as_deref(), block);
+
+    // Inter-sample peaks can still sit above the ceiling; trim if they do.
+    let mut check = EbuR128::new(1, sample_rate, Mode::TRUE_PEAK)
+        .map_err(|e| format!("Failed to create EBU R128 state: {:?}", e))?;
+    check.add_frames_f32(samples)
+        .map_err(|e| format!("EBU R128 analysis failed: {:?}", e))?;
+    let limited_peak = check.true_peak(0)
+        .map_err(|e| format!("EBU R128 true peak check failed: {:?}", e))?;
+    let over_db = 20.0 * limited_peak.max(1e-10).log10() - target_tp_db;
+    if over_db > 0.0 {
+        apply_gain(samples, db_to_linear(-over_db), None, 1);
+        output_lufs -= over_db;
+    }
+    if !reached {
+        println!(
+            "[Master Rust] Peaks are {:.1} dB above what a {:.1} LUFS target allows; mastered to {:.1} LUFS to avoid audible limiting.",
+            shortfall_db, target_lufs, output_lufs
+        );
+    }
+    Ok(())
+}
+
 /// Master a list of chunk WAV files into a single, loudness-normalized destination file.
 /// Performs fast parallel decoding of WAV files under CPU (via rayon).
 pub fn master_audio_rust(
@@ -192,43 +400,7 @@ pub fn master_audio_rust(
         }
     }
 
-    // Measure integrated loudness (EBU R128)
-    let mut ebu = EbuR128::new(1, sample_rate, Mode::I | Mode::TRUE_PEAK)
-        .map_err(|e| format!("Failed to create EBU R128 state: {:?}", e))?;
-        
-    ebu.add_frames_f32(&concatenated)
-        .map_err(|e| format!("EBU R128 analysis failed: {:?}", e))?;
-        
-    let global_lufs = ebu.loudness_global()
-        .map_err(|e| format!("EBU R128 global loudness check failed: {:?}", e))?;
-
-    // Perform loudness normalization via linear gain scale
-    if global_lufs.is_normal() && global_lufs > -100.0 {
-        let gain_db = target_lufs - global_lufs;
-        let mut gain = 10.0f32.powf((gain_db / 20.0) as f32);
-        
-        // Scan for True Peak to avoid clipping.
-        // ebur128 reports true peak as a linear amplitude, not dBTP.
-        let peak_linear = ebu.true_peak(0)
-            .map_err(|e| format!("EBU R128 true peak check failed: {:?}", e))?;
-        let peak_db = 20.0 * peak_linear.max(1e-10).log10();
-
-        let peak_after_gain_db = peak_db + gain_db;
-        if peak_after_gain_db > target_tp_db {
-            // Cap gain so we do not exceed hard true_peak target
-            let safe_gain_db = target_tp_db - peak_db;
-            gain = 10.0f32.powf((safe_gain_db / 20.0) as f32);
-            println!(
-                "[Master Rust] Loudnorm required gain ({:.2} dB) truncated to safe gain ({:.2} dB) to respect True Peak target ({:.2} dBTP)",
-                gain_db, safe_gain_db, target_tp_db
-            );
-        }
-        
-        // Apply gain in-place
-        for sample in concatenated.iter_mut() {
-            *sample *= gain;
-        }
-    }
+    normalize_loudness(&mut concatenated, sample_rate, target_lufs, target_tp_db)?;
 
     // Write final output file based on file extension
     let is_mp3 = out_path.to_ascii_lowercase().ends_with(".mp3");
