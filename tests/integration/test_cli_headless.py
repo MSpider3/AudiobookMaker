@@ -66,3 +66,58 @@ class TestCliHeadless:
         assert "\r" in output
         assert "[1/5]" in output
         assert "chunk 2/10" in output
+
+
+class TestCliProcess:
+    """Runs cli.py as a real process: the exit status is what scripts and
+    notebooks act on."""
+
+    @staticmethod
+    def _run(*argv, cwd=None):
+        import subprocess
+
+        env = dict(os.environ, ABM_SKIP_GPU_WARMUP="1", ABM_API_URL="http://127.0.0.1:9")
+        return subprocess.run(
+            [sys.executable, os.path.join(_ROOT, "cli.py"), *argv],
+            cwd=cwd or _ROOT, env=env, capture_output=True, text=True, timeout=300,
+        )
+
+    def test_missing_config_exits_1(self, tmp_path):
+        result = self._run(str(tmp_path / "missing.json"))
+        assert result.returncode == 1
+        assert "Config JSON not found" in result.stdout
+        assert "Traceback" not in result.stdout + result.stderr
+
+    def test_no_arguments_is_a_usage_error(self):
+        result = self._run()
+        assert result.returncode == 2
+        assert "--book" in result.stderr
+
+    def test_list_providers_exits_0(self):
+        from audiobook_factory.tts_providers.registry import provider_names
+
+        result = self._run("--list-providers")
+        assert result.returncode == 0, result.stderr[-500:]
+        for name in provider_names():
+            assert name in result.stdout
+
+    def test_book_run_with_mock_provider_exits_0(self, tmp_path):
+        book = tmp_path / "tiny.txt"
+        book.write_text(
+            "The ferry left at dawn and nobody waved from the shore. "
+            "By noon the island was a line on the water.",
+            encoding="utf-8",
+        )
+        voice = os.path.join(_ROOT, "tests", "fixtures", "audio", "synthetic_voice_reference.wav")
+        out = tmp_path / "out"
+        # Run from another directory: nothing may depend on the working directory.
+        result = self._run(
+            "--book", str(book), "--provider", "mock", "--voice-file", voice,
+            "--output-dir", str(out), "--local", cwd=str(tmp_path),
+        )
+        assert result.returncode == 0, result.stdout[-1500:] + result.stderr[-1500:]
+        assert [f for f in os.listdir(out) if f.endswith(".mp3")]
+        with open(out / "generation_progress.json", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        assert [c["status"] for c in saved["chapters"]] == ["completed"]
+        assert saved["book_title"] == "tiny"

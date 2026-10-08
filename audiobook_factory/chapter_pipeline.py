@@ -1,24 +1,32 @@
 """
 audiobook_factory/chapter_pipeline.py
 ======================================
-Three-stage overlapped pipeline for high-performance audiobook synthesis.
+Per-chapter synthesis pipeline.
 
-Stage A: Text preparation and static contiguous chunk distribution (CPU thread)
-Stage B: Dedicated per-GPU synthesis worker threads with batch execution
-Stage C: Streaming partial mastering and async disk I/O concatenation (CPU thread)
+Stage A: plans the chapter's chunks and fills one shared work queue, longest
+         chunk first.
+Stage B: one worker thread per GPU pulls batches off that queue, synthesizes
+         them, verifies each chunk and writes it to the chunk cache.
+Stage C: reassembles chunks in reading order, inserts pauses and masters the
+         chapter to a loudness-normalised WAV.
+
+The queue is shared rather than split per device, so the GPUs balance
+themselves: a faster card simply takes more batches, and if one card fails
+its batch goes back on the queue for the others.
 """
 from __future__ import annotations
 
 from asyncio import CancelledError
 import atexit
 import concurrent.futures
+import dataclasses
 from dataclasses import dataclass, field
-import io
 import logging
 import os
 import queue
 import threading
-from typing import Callable, Any, TYPE_CHECKING, List
+import time
+from typing import Callable, TYPE_CHECKING
 
 import gc
 import torch
@@ -26,17 +34,23 @@ from audiobook_factory.gpu_pool import GPUDetector, ProviderPool
 from audiobook_factory.pipeline import AudiobookConfig, CancelToken, _cleanup_chunk_files, _chunk, _check_rust
 
 if TYPE_CHECKING:
+    from audiobook_factory.chunk_verifier import ChunkVerifier
     from audiobook_factory.tts_providers.base_tts_provider import BaseTTSProvider
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["run_chapter_pipeline", "_validate_chunk_file"]
 
-_MAX_IN_MEMORY_CHUNK_SECONDS: float = 30.0
 _PARTIAL_FLUSH_CHUNK_COUNT: int = 20
-_ACQUIRE_POLL_TIMEOUT_SEC: float = 0.5
 _MINIMUM_CHUNK_WAV_BYTES: int = 1000
 # Minimum valid WAV file size. Files smaller than this are corrupted.
+_SEQUENTIAL_BATCH_SIZE: int = 4
+# Batch size for providers that synthesize one text at a time anyway: small
+# enough that progress, cancellation and the chunk cache stay current.
+_IDLE_WORKER_POLL_SECONDS: float = 0.1
+# How often a device with nothing to do re-checks the queue while another works.
+_FATAL_VERDICT_SCORE: float = 10.0
+# ChunkVerdict.score at or above this means the chunk has no usable audio.
 
 
 def _validate_chunk_file(path: str) -> bool:
@@ -76,8 +90,71 @@ class _SynthResult:
 
 
 @dataclass
-class _StageError:
-    exception: BaseException
+class _WorkShare:
+    """Splits the chunk queue between Stage B workers.
+
+    Without it the first device to start takes a whole batch, which on a
+    short chapter is every chunk, and the other GPUs sit idle. Each grab is
+    capped at an even share of what is queued among the devices that are
+    free to take it, and a worker that finds the queue empty waits while
+    another one is mid-batch, because that batch comes back to the queue if
+    its device fails.
+
+    Attributes:
+        workers: Stage B workers still running.
+        batches: Batches each device has finished.
+        busy_seconds: Time each device spent synthesizing.
+        _busy: Workers currently synthesizing a batch.
+        _lock: Mutex for the counters and for taking a batch.
+    """
+
+    workers: int = 1
+    batches: dict[str, int] = field(default_factory=dict, init=False)
+    busy_seconds: dict[str, float] = field(default_factory=dict, init=False)
+    _busy: int = field(default=0, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+
+    def take(self, work_queue: queue.Queue, batch_size: int) -> list[tuple[int, str]]:
+        """Takes up to *batch_size* items, but no more than an even share.
+
+        The share is counted among the workers that are not busy: a device
+        that is free while the others are mid-batch takes full batches.
+        """
+        with self._lock:
+            free_workers = max(1, self.workers - self._busy)
+            fair_share = -(-work_queue.qsize() // free_workers)
+            wanted = max(1, min(int(batch_size), fair_share))
+            batch: list[tuple[int, str]] = []
+            while len(batch) < wanted:
+                try:
+                    batch.append(work_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if batch:
+                self._busy += 1
+            return batch
+
+    def finish(self) -> None:
+        """Marks this worker's current batch as done (or handed back)."""
+        with self._lock:
+            self._busy = max(0, self._busy - 1)
+
+    def record(self, device: str, seconds: float) -> None:
+        """Notes one finished batch of *device* and how long it took."""
+        with self._lock:
+            self.batches[device] = self.batches.get(device, 0) + 1
+            self.busy_seconds[device] = self.busy_seconds.get(device, 0.0) + max(0.0, seconds)
+
+    def retire(self) -> None:
+        """Removes a stopping worker from the share calculation."""
+        with self._lock:
+            self.workers = max(0, self.workers - 1)
+
+    @property
+    def others_busy(self) -> bool:
+        """True while any worker holds a batch that could still be returned."""
+        with self._lock:
+            return self._busy > 0
 
 
 @dataclass
@@ -114,24 +191,51 @@ class _ProgressState:
                     logger.warning("Progress callback failed: %s", exc)
 
 
-def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConfig) -> None:
-    """Concatenates chunk WAV files with pause padding into an intermediate partial WAV file without loudnorm."""
-    valid_paths = [p for p in chunk_paths if p and os.path.exists(p) and os.path.getsize(p) >= 100]
-    if not valid_paths:
+def _concat_partial(
+    chunk_paths: list[str],
+    out_path: str,
+    config: AudiobookConfig,
+    pauses: list[float] | None = None,
+) -> None:
+    """Concatenates chunk WAV files with pause padding into an intermediate partial WAV file without loudnorm.
+
+    Args:
+        chunk_paths: Chunk WAV files in reading order.
+        out_path: Destination WAV.
+        config: AudiobookConfig; ``config.pause`` is the default silence.
+        pauses: Seconds of silence after each chunk, aligned with
+            ``chunk_paths``. Defaults to ``config.pause`` for every chunk.
+    """
+    if pauses is None or len(pauses) != len(chunk_paths):
+        pauses = [float(config.pause)] * len(chunk_paths)
+    valid = [
+        (p, pause) for p, pause in zip(chunk_paths, pauses)
+        if p and os.path.exists(p) and os.path.getsize(p) >= 100
+    ]
+    if not valid:
         return
+    valid_paths = [p for p, _ in valid]
+    valid_pauses = [pause for _, pause in valid]
     import numpy as np
     import soundfile as sf
 
-    sr = int(config.sample_rate)
-    pause_len = int(config.pause * sr)
-    pause_samples = np.zeros(pause_len, dtype=np.float32)
-    fade_len = min(int(0.005 * sr), 120)  # 5ms micro-fade to eliminate digital clicks/pops
+    # The provider decides the rate of its chunks; config.sample_rate is the
+    # *output* rate and is applied when the chapter is encoded. Stamping the
+    # partial with config.sample_rate would change pitch and speed whenever
+    # the two differ.
+    sr = 0
+    fade_len = 0
 
     segments = []
     for i, p in enumerate(valid_paths):
         try:
             data, chunk_sr = sf.read(p, dtype="float32")
+            if data.ndim > 1:
+                data = data.mean(axis=1)
             if len(data) > 0:
+                if sr == 0:
+                    sr = int(chunk_sr)
+                    fade_len = min(int(0.005 * sr), 120)  # 5ms micro-fade to eliminate digital clicks/pops
                 # Apply 5ms micro fade-in and fade-out to prevent boundary clicks/pops
                 if len(data) > 2 * fade_len and fade_len > 0:
                     fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
@@ -140,7 +244,7 @@ def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConf
                     data[:fade_len] *= fade_in
                     data[-fade_len:] *= fade_out
                 segments.append(data)
-                segments.append(pause_samples)
+                segments.append(np.zeros(int(max(0.0, valid_pauses[i]) * sr), dtype=np.float32))
         except Exception as exc:
             logger.warning("Failed to read chunk %s during partial concat: %s", p, exc)
     if segments:
@@ -148,11 +252,18 @@ def _concat_partial(chunk_paths: list[str], out_path: str, config: AudiobookConf
         sf.write(out_path, raw, sr)
 
 
-def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConfig) -> None:
-    """Final mastering pass applying loudness normalization (LUFS/true_peak)."""
+def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConfig) -> bool:
+    """Final mastering pass applying loudness normalization (LUFS/true_peak).
+
+    Returns:
+        True when the written WAV is loudness-normalised. False when
+        normalisation was unavailable and the audio was written as-is, so the
+        caller can normalise while encoding instead.
+    """
     valid_paths = [p for p in partial_paths if p and os.path.exists(p) and os.path.getsize(p) >= 100]
     if not valid_paths:
-        return
+        return False
+    normalized = True
     if _check_rust():
         import audiobook_rust
 
@@ -171,6 +282,7 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
         import soundfile as sf
 
         segments = []
+        sr = int(config.sample_rate)
         for p in valid_paths:
             try:
                 data, sr = sf.read(p, dtype="float32")
@@ -180,28 +292,131 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
                 logger.warning("Failed to read partial %s during final mastering: %s", p, exc)
         if segments:
             raw = np.concatenate(segments)
-            # Apply EBU R128 loudness normalization & true peak limiting in pure-Python
+            # EBU R128 loudness normalisation with a peak limiter, in pure Python.
             try:
-                import pyloudnorm as pyln
-                meter = pyln.Meter(int(config.sample_rate))
-                input_loudness = meter.integrated_loudness(raw)
-                if not np.isneginf(input_loudness) and not np.isnan(input_loudness):
-                    target_lufs = float(config.lufs)
-                    gain_db = target_lufs - input_loudness
-                    target_tp_linear = 10.0 ** (float(config.true_peak) / 20.0)
-                    gain_linear = 10.0 ** (gain_db / 20.0)
-                    peak = float(np.max(np.abs(raw)))
-                    if peak > 0 and (peak * gain_linear) > target_tp_linear:
-                        gain_linear = target_tp_linear / peak
-                    raw = raw * gain_linear
+                from audiobook_factory.loudness import normalize_loudness
+
+                if raw.ndim > 1:
+                    raw = raw.mean(axis=1)
+                raw, _result = normalize_loudness(
+                    raw, int(sr), float(config.lufs), float(config.true_peak)
+                )
             except Exception as norm_err:
+                normalized = False
                 logger.warning("pyloudnorm mastering normalization fallback error: %s", norm_err)
 
-            sf.write(out_path, raw, config.sample_rate)
+            sf.write(out_path, raw, int(sr))
+    return normalized
 
 
-def _flush_accumulated_batch(
-    accumulated: list[tuple[int, list[str]]],
+def _batch_size_for(device: str, provider: BaseTTSProvider, config: AudiobookConfig) -> int:
+    """Chooses how many chunks a device synthesizes per provider call.
+
+    Measured once per chapter, right after the previous chapter released its
+    memory, so PyTorch's own allocator cache cannot shrink later batches.
+    """
+    explicit = int(getattr(config, "batch_size", 0) or 0)
+    if explicit > 0:
+        return explicit
+    info = provider.info() if hasattr(provider, "info") else None
+    if info is not None and not info.supports_batch:
+        return _SEQUENTIAL_BATCH_SIZE
+    return GPUDetector.suggest_batch_size(
+        device, config.max_len, getattr(config, "vram_headroom_gb", 2.0)
+    )
+
+
+def _as_wav_bytes(audio: bytes | str, chunk_index: int) -> bytes:
+    """Returns a provider result as WAV bytes, whether it handed back bytes or a path."""
+    if isinstance(audio, (bytes, bytearray)):
+        data = bytes(audio)
+    elif isinstance(audio, str):
+        with open(audio, "rb") as fh:
+            data = fh.read()
+    else:
+        raise RuntimeError(f"Unexpected audio type for chunk {chunk_index}: {type(audio).__name__}")
+    if len(data) < 100:
+        raise RuntimeError(
+            f"Chunk {chunk_index} audio synthesis returned empty data ({len(data)} bytes)"
+        )
+    return data
+
+
+def _write_chunk_atomically(path: str, data: bytes) -> None:
+    """Writes a chunk WAV so that a file on disk is always a complete chunk.
+
+    The chunk cache treats an existing file as finished work, so a crash
+    mid-write must never leave a truncated file under the final name.
+    """
+    tmp_path = f"{path}.part"
+    with open(tmp_path, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp_path, path)
+
+
+def _verify_and_repair(
+    provider: BaseTTSProvider,
+    verifier: "ChunkVerifier",
+    chunk_index: int,
+    text: str,
+    audio: bytes,
+    duration: float,
+    voice_ref: bytes,
+    config: AudiobookConfig,
+    cancel_token: CancelToken,
+) -> tuple[bytes, float, str | None]:
+    """Checks one chunk and re-synthesizes it while it fails.
+
+    Returns:
+        ``(audio, duration, flag)``. ``flag`` is None when the chunk passed
+        (possibly after a retry), otherwise the reason the best attempt was
+        still rejected.
+
+    Raises:
+        RuntimeError: If every attempt produced no usable audio at all.
+    """
+    verdict = verifier.check(text, audio, duration)
+    if verdict.ok:
+        return audio, duration, None
+
+    best = (verdict.score, audio, duration, verdict.reason)
+    retries = max(0, int(getattr(config, "verify_max_retries", 2)))
+    for attempt in range(1, retries + 1):
+        if cancel_token.is_cancelled:
+            break
+        logger.info(
+            "[verify] Chunk %d rejected (%s); re-synthesizing (%d/%d).",
+            chunk_index, best[3], attempt, retries,
+        )
+        try:
+            seed = int(getattr(config, "seed", -1) if getattr(config, "seed", -1) is not None else -1)
+            if seed >= 0:
+                # A fixed seed would reproduce the same bad take.
+                provider.config = dataclasses.replace(config, seed=seed + attempt)
+            new_audio, new_duration = provider.synthesize(text, voice_ref, return_bytes=True)
+            new_audio = _as_wav_bytes(new_audio, chunk_index)
+        except CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[verify] Re-synthesis of chunk %d failed: %s", chunk_index, exc)
+            continue
+        finally:
+            provider.config = config
+        new_verdict = verifier.check(text, new_audio, new_duration)
+        if new_verdict.ok:
+            return new_audio, new_duration, None
+        if new_verdict.score < best[0]:
+            best = (new_verdict.score, new_audio, new_duration, new_verdict.reason)
+
+    if best[0] >= _FATAL_VERDICT_SCORE:
+        raise RuntimeError(
+            f"Chunk {chunk_index} has no usable audio after {retries + 1} attempt(s): {best[3]}"
+        )
+    return best[1], best[2], best[3]
+
+
+def _synthesize_batch(
+    batch: list[tuple[int, str]],
     provider: BaseTTSProvider,
     voice_ref: bytes,
     config: AudiobookConfig,
@@ -210,87 +425,76 @@ def _flush_accumulated_batch(
     cancel_token: CancelToken,
     progress_state: _ProgressState,
     chapter_index: int,
+    verifier: "ChunkVerifier | None" = None,
     chunk_completed_cb: Callable[[int], None] | None = None,
+    chunks_completed_cb: Callable[[list[int]], None] | None = None,
+    chunk_flagged_cb: Callable[[int, str], None] | None = None,
 ) -> None:
-    """Synthesizes a batch of accumulated chunks in a single forward pass.
+    """Synthesizes one batch, verifies it and hands each chunk to Stage C.
 
-    Processes all accumulated (chunk_index, sentences) pairs together,
-    using provider.synthesize_batch() for batched GPU tensor execution.
-    Puts one _SynthResult per chunk into master_queue.
-
-    Thread-safe for master_queue writes. Not thread-safe for provider — 
-    caller must ensure exclusive provider ownership.
+    Not thread-safe for the provider — the caller owns it exclusively.
 
     Args:
-        accumulated: List of (chunk_index, sentences) to process as a batch.
+        batch: ``(chunk_index, text)`` pairs to synthesize together.
         provider: Provider instance exclusively owned by the calling thread.
         voice_ref: Voice reference WAV bytes.
         config: AudiobookConfig.
-        out_dir: Chapter temp directory for chunk spill file storage.
+        out_dir: Chapter temp directory holding the chunk cache.
         master_queue: Output queue to Stage C.
         cancel_token: Cancellation token.
-        progress_state: Shared progress counter for progress_callback.
-        chapter_index: Zero-based chapter index used for filename scoping.
-        chunk_completed_cb: Optional callback invoked after each chunk is synthesized.
+        progress_state: Shared progress counter.
+        chapter_index: Chapter number used in chunk filenames.
+        verifier: Optional chunk verifier.
+        chunk_completed_cb: Optional per-chunk callback (legacy).
+        chunks_completed_cb: Optional callback receiving every chunk index
+            finished by this batch, called once.
+        chunk_flagged_cb: Optional callback for chunks kept despite failing
+            verification.
+
+    Raises:
+        Exception: Anything the provider raises; the caller decides what to
+            do with the unfinished chunks.
     """
-    texts = [" ".join(sentences) for (_, sentences) in accumulated]
-
-    logger.debug(
-        "[flush_batch] voice_ref type=%s len=%s device=%s batch_size=%d",
-        type(voice_ref).__name__,
-        len(voice_ref) if isinstance(voice_ref, bytes) else "N/A",
-        getattr(provider, "device", "unknown"),
-        len(accumulated),
-    )
-
-    try:
-        results: list[tuple[bytes | str, float]] = provider.synthesize_batch(
-            texts=texts,
-            voice_ref=voice_ref,
-            return_bytes=True,
+    texts = [text for _, text in batch]
+    results = provider.synthesize_batch(texts=texts, voice_ref=voice_ref, return_bytes=True)
+    if len(results) != len(batch):
+        raise RuntimeError(
+            f"{provider.get_name()} returned {len(results)} results for a batch of {len(batch)}."
         )
-    except CancelledError:
-        master_queue.put(None)
-        raise
-    except Exception as exc:
-        master_queue.put(_StageError(exc))
-        return
 
-    for (chunk_index, _), (audio_bytes, duration) in zip(accumulated, results):
-        path = os.path.join(out_dir, f"chunk_ch_{chapter_index}_{chunk_index}.wav")
-        if isinstance(audio_bytes, bytes):
-            if len(audio_bytes) < 100:
-                master_queue.put(_StageError(RuntimeError(f"Chunk {chunk_index} audio synthesis returned empty data ({len(audio_bytes)} bytes)")))
-                continue
+    finished: list[int] = []
+    try:
+        for (chunk_index, text), (audio, duration) in zip(batch, results):
+            data = _as_wav_bytes(audio, chunk_index)
+            if verifier is not None and verifier.enabled:
+                data, duration, flag = _verify_and_repair(
+                    provider, verifier, chunk_index, text, data, duration,
+                    voice_ref, config, cancel_token,
+                )
+                if flag and chunk_flagged_cb is not None:
+                    chunk_flagged_cb(chunk_index, flag)
+            path = os.path.join(out_dir, f"chunk_ch_{chapter_index}_{chunk_index}.wav")
+            _write_chunk_atomically(path, data)
+            master_queue.put(_SynthResult(chunk_index, audio=path, duration=duration))
+            finished.append(chunk_index)
+            progress_state.increment()
+            if chunk_completed_cb is not None:
+                try:
+                    chunk_completed_cb(chunk_index)
+                except Exception as cb_exc:
+                    logger.warning("chunk_completed_cb failed for chunk %d: %s", chunk_index, cb_exc)
+    finally:
+        if finished and chunks_completed_cb is not None:
             try:
-                with open(path, "wb") as fh:
-                    fh.write(audio_bytes)
-                result = _SynthResult(chunk_index, audio=path, duration=duration)
-            except OSError as exc:
-                master_queue.put(_StageError(exc))
-                continue
-        elif isinstance(audio_bytes, str):
-            if not os.path.exists(audio_bytes) or os.path.getsize(audio_bytes) < 100:
-                master_queue.put(_StageError(RuntimeError(f"Chunk {chunk_index} audio file invalid or empty")))
-                continue
-            result = _SynthResult(chunk_index, audio=audio_bytes, duration=duration)
-        else:
-            master_queue.put(_StageError(RuntimeError(f"Unexpected audio type: {type(audio_bytes)}")))
-            continue
-
-        master_queue.put(result)
-        progress_state.increment()
-        if chunk_completed_cb is not None:
-            try:
-                chunk_completed_cb(chunk_index)
+                chunks_completed_cb(finished)
             except Exception as cb_exc:
-                logger.warning("chunk_completed_cb failed for chunk %d: %s", chunk_index, cb_exc)
+                logger.warning("chunks_completed_cb failed: %s", cb_exc)
 
 
 def _stage_b_device_worker(
     device: str,
     provider: BaseTTSProvider,
-    device_synth_queue: queue.Queue,
+    work_queue: queue.Queue,
     master_queue: queue.Queue,
     voice_ref: bytes,
     config: AudiobookConfig,
@@ -298,80 +502,113 @@ def _stage_b_device_worker(
     cancel_token: CancelToken,
     progress_state: _ProgressState,
     chapter_index: int,
+    worker_errors: list[BaseException],
+    verifier: "ChunkVerifier | None" = None,
     chunk_completed_cb: Callable[[int], None] | None = None,
+    chunks_completed_cb: Callable[[list[int]], None] | None = None,
+    chunk_flagged_cb: Callable[[int, str], None] | None = None,
+    device_stats: dict[str, int] | None = None,
+    share: _WorkShare | None = None,
 ) -> None:
     """Dedicated synthesis thread for one GPU device.
 
-    Consumes all chunks assigned to `device` from `device_synth_queue`,
-    synthesizes audio using `provider` (already bound to `device`), and
-    puts _SynthResult or _StageError items into `master_queue`.
-
-    Sentinel behavior: on receiving None from device_synth_queue, flushes any
-    remaining accumulated batch, puts one None into master_queue, and returns.
+    Pulls batches from the shared ``work_queue`` until it is empty and no
+    other device is still working. If a batch fails, its unfinished chunks go
+    back on the queue for the other devices and this worker stops; the
+    chapter only fails if chunks are still missing once every worker has
+    stopped. Always puts exactly one ``None`` sentinel on ``master_queue``
+    when it exits.
 
     Args:
-        device: The CUDA device string this thread owns ("cuda:0", "cuda:1").
+        device: The device string this thread owns ("cuda:0", "cuda:1").
         provider: The BaseTTSProvider instance bound to this device.
-        device_synth_queue: This device's exclusive input chunk queue.
+        work_queue: Shared queue of ``(chunk_index, text)`` items.
         master_queue: Shared output queue to Stage C.
         voice_ref: Voice reference WAV bytes.
         config: AudiobookConfig for batch size and model settings.
         out_dir: Chapter temp directory for chunk file storage.
         cancel_token: Cooperative cancellation token.
         progress_state: Shared mutable counter for progress_callback tracking.
-        chapter_index: Zero-based chapter index.
-        chunk_completed_cb: Optional callback for progress JSON chunk update.
+        chapter_index: Chapter number.
+        worker_errors: Shared list collecting the error of each failed worker.
+        verifier: Optional chunk verifier.
+        chunk_completed_cb: Optional per-chunk callback.
+        chunks_completed_cb: Optional per-batch callback.
+        chunk_flagged_cb: Optional callback for chunks that failed verification.
+        device_stats: Optional dict receiving the number of chunks this
+            device synthesized, keyed by device.
+        share: Work-splitting state shared by every worker of the chapter.
     """
-    accumulated: list[tuple[int, list[str]]] = []
-
+    share = share if share is not None else _WorkShare()
+    retired = False
+    holding = False  # True while this worker has a batch the others may need back
     try:
-        while True:
-            try:
-                item = device_synth_queue.get(timeout=_ACQUIRE_POLL_TIMEOUT_SEC)
-            except queue.Empty:
-                if cancel_token.is_cancelled:
-                    if accumulated:
-                        for chunk_idx, _ in accumulated:
-                            master_queue.put(_StageError(CancelledError(f"Chunk {chunk_idx} cancelled")))
-                        accumulated.clear()
-                    master_queue.put(None)
-                    return
-                continue
-
-            if item is None:
-                # Flush any remaining accumulated batch before exiting
-                if accumulated:
-                    _flush_accumulated_batch(
-                        accumulated, provider, voice_ref, config,
-                        out_dir, master_queue, cancel_token, progress_state, chapter_index,
-                        chunk_completed_cb
-                    )
-                master_queue.put(None)
-                return
-
-            if cancel_token.is_cancelled:
-                if accumulated:
-                    for chunk_idx, _ in accumulated:
-                        master_queue.put(_StageError(CancelledError(f"Chunk {chunk_idx} cancelled")))
-                    accumulated.clear()
-                master_queue.put(None)
-                return
-
-            accumulated.append(item)
-
-            batch_size = GPUDetector.suggest_batch_size(
-                device, config.max_len, getattr(config, "vram_headroom_gb", 2.0)
-            )
-            if len(accumulated) >= batch_size:
-                _flush_accumulated_batch(
-                    accumulated, provider, voice_ref, config,
-                    out_dir, master_queue, cancel_token, progress_state, chapter_index,
-                    chunk_completed_cb
+        batch_size = max(1, _batch_size_for(device, provider, config))
+        while not cancel_token.is_cancelled:
+            limit = getattr(provider, "batch_size_limit", None)
+            if limit and limit < batch_size:
+                logger.info(
+                    "Stage B worker on %s: batch size %d -> %d after an out-of-memory retry.",
+                    device, batch_size, limit,
                 )
-                accumulated.clear()
-    except CancelledError:
-        logger.debug("Stage B worker on %s cancelled cleanly.", device)
-        return
+                batch_size = max(1, int(limit))
+            batch = share.take(work_queue, batch_size)
+            if not batch:
+                if share.others_busy:
+                    # A device that fails hands its batch back; stay for it.
+                    time.sleep(_IDLE_WORKER_POLL_SECONDS)
+                    continue
+                break
+            holding = True
+
+            written: set[int] = set()
+
+            def _note_written(indices: list[int]) -> None:
+                written.update(indices)
+                if device_stats is not None:
+                    device_stats[device] = device_stats.get(device, 0) + len(indices)
+                if chunks_completed_cb is not None:
+                    chunks_completed_cb(indices)
+
+            batch_started = time.monotonic()
+            try:
+                _synthesize_batch(
+                    batch, provider, voice_ref, config, out_dir, master_queue,
+                    cancel_token, progress_state, chapter_index, verifier,
+                    chunk_completed_cb, _note_written, chunk_flagged_cb,
+                )
+                share.record(device, time.monotonic() - batch_started)
+            except CancelledError:
+                logger.debug("Stage B worker on %s cancelled cleanly.", device)
+                break
+            except Exception as exc:
+                unfinished = [item for item in batch if item[0] not in written]
+                logger.error(
+                    "Stage B worker on %s failed (%s: %s); returning %d chunk(s) to the queue.",
+                    device, type(exc).__name__, exc, len(unfinished),
+                    exc_info=True,
+                )
+                worker_errors.append(exc)
+                # Leave the share before handing the work back, so the other
+                # devices divide it among themselves.
+                share.retire()
+                retired = True
+                for item in unfinished:
+                    work_queue.put(item)
+                break
+            share.finish()
+            holding = False
+    except Exception as exc:
+        logger.exception("Stage B worker on %s crashed", device)
+        worker_errors.append(exc)
+    finally:
+        # Whatever ended this worker, the others must not wait on it.
+        if not retired:
+            share.retire()
+        if holding:
+            share.finish()
+        # Stage C waits for one sentinel per worker.
+        master_queue.put(None)
 
 
 def run_chapter_pipeline(
@@ -385,34 +622,49 @@ def run_chapter_pipeline(
     cancel_token: CancelToken,
     log_callback: Callable[[str], None],
     progress_callback: Callable[[int, int], None] | None = None,
-    pinned_device: str | None = None,
+    pinned_device: str | tuple[str, ...] | None = None,
     completed_chunks: list[int] | None = None,
     chunk_completed_cb: Callable[[int], None] | None = None,
+    *,
+    chunk_pauses: list[float] | None = None,
+    verifier: "ChunkVerifier | None" = None,
+    chunks_completed_cb: Callable[[list[int]], None] | None = None,
+    chunk_flagged_cb: Callable[[int, str], None] | None = None,
+    master_info: dict | None = None,
 ) -> list[float]:
-    """Synthesizes, masters, and writes one chapter using a 3-stage pipeline.
-
-    Runs concurrent threads:
-      Stage A: text preparation & static contiguous chunk distribution → device_synth_queues
-      Stage B: dedicated per-GPU synthesis worker threads → master_queue
-      Stage C: streaming partial mastering & async disk I/O → final WAV output
+    """Synthesizes, masters, and writes one chapter.
 
     Args:
-        sentences: Pre-split sentence list for this chapter.
+        sentences: The chapter's chunk texts in reading order. An entry
+            longer than ``config.max_len`` is split further.
         voice_ref: Preprocessed voice reference audio bytes.
         out_wav_path: Full path where the final mastered WAV must be written.
         out_dir: Directory for temporary chunk files.
-        chapter_index: Zero-based chapter index used for device affinity and logging.
+        chapter_index: Chapter number used for chunk filenames and logging.
         config: AudiobookConfig for this generation job.
         pool: The ProviderPool to acquire GPU providers from.
         cancel_token: CancelToken for cooperative cancellation.
         log_callback: Log callback for logging output.
         progress_callback: Optional progress callback receiving (chunks_done, total_chunks).
-        pinned_device: Optional CUDA device string to lock all Stage B work to a single GPU.
-        completed_chunks: Optional list of already-completed chunk indices for resume.
-        chunk_completed_cb: Optional callback invoked after each chunk synthesis succeeds.
+        pinned_device: Device string to lock all synthesis to a single GPU, or a
+            tuple of device strings to share the chapter among those GPUs only.
+            None uses every GPU of the pool.
+        completed_chunks: Chunk indices that may be reused from the cache
+            (each must still be a valid file). ``None`` reuses every valid
+            chunk file found in ``out_dir``; ``[]`` reuses nothing.
+        chunk_completed_cb: Optional callback invoked after each chunk succeeds.
+        chunk_pauses: Seconds of silence after each entry of ``sentences``.
+            Defaults to ``config.pause`` for all.
+        verifier: Optional ChunkVerifier applied to every synthesized chunk.
+        chunks_completed_cb: Optional callback invoked once per batch with
+            the chunk indices it finished.
+        chunk_flagged_cb: Optional callback for chunks kept despite failing
+            verification, receiving (chunk_index, reason).
+        master_info: Optional dict; ``master_info["normalized"]`` is set to
+            whether the written WAV is loudness-normalised.
 
     Returns:
-        List of float durations in seconds, one per synthesized sentence/chunk.
+        List of float durations in seconds, one per chunk.
 
     Raises:
         CancelledError: If cancel_token.is_cancelled becomes True.
@@ -423,98 +675,78 @@ def run_chapter_pipeline(
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # ── Pre-compute chunk list upfront ────────────────────────────────────────
-    all_chunks: list[list[str]] = []
-    for sent in sentences:
-        for chunk in _chunk(sent, config.max_len):
-            all_chunks.append([chunk])
+    # ── Stage A: plan chunks ──────────────────────────────────────────────────
+    all_chunks: list[str] = []
+    pauses: list[float] = []
+    for position, sent in enumerate(sentences):
+        pieces = [piece for piece in _chunk(sent, config.max_len) if piece and piece.strip()]
+        trailing = float(config.pause)
+        if chunk_pauses is not None and position < len(chunk_pauses):
+            trailing = float(chunk_pauses[position])
+        for piece_index, piece in enumerate(pieces):
+            all_chunks.append(piece)
+            pauses.append(trailing if piece_index == len(pieces) - 1 else float(config.pause))
 
     total_chunks = len(all_chunks)
     if total_chunks == 0:
         log_callback(f"  [Ch{chapter_index}] No text chunks to synthesize.")
         return []
 
-    # ── Queues & Progress State ───────────────────────────────────────────────
-    master_queue: queue.Queue[_SynthResult | _StageError | None] = queue.Queue()
+    master_queue: queue.Queue[_SynthResult | None] = queue.Queue()
     progress_state = _ProgressState(total=total_chunks, callback=progress_callback)
 
-    # ── Pre-filter Cached Chunks vs Pending Chunks ─────────────────────────────
+    # ── Reuse chunks already in the cache ─────────────────────────────────────
     cached_results: dict[int, _SynthResult] = {}
-    pending_items: list[tuple[int, list[str]]] = []
+    pending_items: list[tuple[int, str]] = []
+    reusable = None if completed_chunks is None else set(completed_chunks)
+    resume = getattr(config, "resume_incomplete_chunks", True) and reusable != set()
 
-    if getattr(config, "resume_incomplete_chunks", True) and completed_chunks:
-        import soundfile
-        for idx, chunk_list in enumerate(all_chunks):
+    for idx, chunk_text in enumerate(all_chunks):
+        if resume and (reusable is None or idx in reusable):
             chunk_path = os.path.join(out_dir, f"chunk_ch_{chapter_index}_{idx}.wav")
-            if idx in completed_chunks and _validate_chunk_file(chunk_path):
+            if os.path.exists(chunk_path) and _validate_chunk_file(chunk_path):
                 try:
+                    import soundfile
                     info = soundfile.info(chunk_path)
                     cached_results[idx] = _SynthResult(idx, audio=chunk_path, duration=info.duration)
                     progress_state.increment()
                     continue
                 except Exception as exc:
                     logger.warning("Failed to read cached chunk %s: %s — re-synthesizing.", chunk_path, exc)
-            pending_items.append((idx, chunk_list))
-    else:
-        pending_items = list(enumerate(all_chunks))
+        pending_items.append((idx, chunk_text))
 
     cached_count = len(cached_results)
     pending_count = len(pending_items)
 
+    # Longest first: batches are then made of similar-length chunks (little
+    # padding, no short chunk waiting on a long one), and the heaviest batch
+    # runs first so an out-of-memory condition shows up immediately.
+    work_queue: queue.Queue[tuple[int, str]] = queue.Queue()
+    for item in sorted(pending_items, key=lambda entry: len(entry[1]), reverse=True):
+        work_queue.put(item)
+
     # ── Determine active devices & Stage B worker count ───────────────────────
-    if pinned_device is not None:
+    if pinned_device is None:
+        active_devices = pool.devices
+    elif isinstance(pinned_device, str):
         active_devices = [pinned_device]
     else:
-        active_devices = pool.devices
+        # parallel_mode="auto": some of the GPUs, the rest work on other chapters.
+        active_devices = list(pinned_device)
 
     stage_b_thread_count = len(active_devices)
 
     log_callback(
         f"  [Ch{chapter_index}] Synthesizing {total_chunks} chunk(s) "
-        f"({cached_count} cached, {pending_count} pending) via 3-stage pipeline "
-        f"({stage_b_thread_count} Stage B worker(s) on {', '.join(active_devices)})..."
+        f"({cached_count} cached, {pending_count} pending) "
+        f"on {stage_b_thread_count} device(s): {', '.join(active_devices)}..."
     )
 
-    device_synth_queues: dict[str, queue.Queue[tuple[int, list[str]] | None]] = {
-        dev: queue.Queue() for dev in active_devices
-    }
-
-    # ── Stage A: Text Preparation & Static Contiguous Distribution ────────────
-    def _stage_a_worker():
-        try:
-            total = len(pending_items)
-            num_devs = len(active_devices)
-
-            if pinned_device is not None:
-                # Path A: All pending chunks go to pinned_device
-                for item in pending_items:
-                    if cancel_token.is_cancelled:
-                        break
-                    device_synth_queues[pinned_device].put(item)
-            else:
-                # Path B: Static contiguous split across all active devices
-                counts = [(total + num_devs - 1 - i) // num_devs for i in range(num_devs)]
-                offset = 0
-                for i, dev in enumerate(active_devices):
-                    if cancel_token.is_cancelled:
-                        break
-                    chunk_slice = pending_items[offset : offset + counts[i]]
-                    for item in chunk_slice:
-                        if cancel_token.is_cancelled:
-                            break
-                        device_synth_queues[dev].put(item)
-                    offset += counts[i]
-        except Exception as exc:
-            logger.error("Stage A error on chapter %d: %s", chapter_index, exc)
-        finally:
-            for dev in active_devices:
-                device_synth_queues[dev].put(None)
-
-    thread_a = threading.Thread(target=_stage_a_worker, name=f"StageA-Ch{chapter_index}", daemon=False)
-
-    # ── Stage B & Provider Pre-acquisition ───────────────────────────────────
     device_providers: dict[str, BaseTTSProvider] = {}
     stage_b_threads: list[threading.Thread] = []
+    worker_errors: list[BaseException] = []
+    device_stats: dict[str, int] = {device: 0 for device in active_devices}
+    work_share = _WorkShare(workers=stage_b_thread_count)
 
     durations_res: list[float] = [0.0] * total_chunks
     stage_c_exception: BaseException | None = None
@@ -523,6 +755,10 @@ def run_chapter_pipeline(
     try:
         for device in active_devices:
             provider = pool.acquire(cancel_token=cancel_token, preferred_device=device)
+            # Pools outlive a single run, so a pooled provider still carries
+            # the config of whichever job created it. It is exclusively ours
+            # until release(), so point it at this job's settings.
+            provider.config = config
             device_providers[device] = provider
 
         for device in active_devices:
@@ -531,7 +767,7 @@ def run_chapter_pipeline(
                 args=(
                     device,
                     device_providers[device],
-                    device_synth_queues[device],
+                    work_queue,
                     master_queue,
                     voice_ref,
                     config,
@@ -539,7 +775,13 @@ def run_chapter_pipeline(
                     cancel_token,
                     progress_state,
                     chapter_index,
+                    worker_errors,
+                    verifier,
                     chunk_completed_cb,
+                    chunks_completed_cb,
+                    chunk_flagged_cb,
+                    device_stats,
+                    work_share,
                 ),
                 name=f"StageB-{device}-Ch{chapter_index}",
                 daemon=False,
@@ -553,35 +795,34 @@ def run_chapter_pipeline(
             stage_b_active_count = stage_b_thread_count
             next_expected_index = 0
             accumulated_audio_paths: list[str] = []
+            accumulated_pauses: list[float] = []
             partial_files: list[str] = []
-            temp_files_to_clean: list[str] = []
             pending_flushes: list[concurrent.futures.Future] = []
-            _pipeline_failed = False
-            pipeline_exc: BaseException | None = None
 
-            try:
-                # Drain pre-populated contiguous cached chunks upfront
+            def _flush_partial() -> None:
+                p_path = os.path.join(out_dir, f"partial_{chapter_index}_{len(partial_files)}.wav")
+                future = _disk_io_executor.submit(
+                    _concat_partial, list(accumulated_audio_paths), p_path, config,
+                    list(accumulated_pauses),
+                )
+                pending_flushes.append(future)
+                partial_files.append(p_path)
+                accumulated_audio_paths.clear()
+                accumulated_pauses.clear()
+
+            def _drain_in_order() -> None:
+                nonlocal next_expected_index
                 while next_expected_index in received_chunks:
                     res = received_chunks.pop(next_expected_index)
                     durations_res[res.chunk_index] = res.duration
-                    if isinstance(res.audio, bytes):
-                        chunk_tmp = os.path.join(out_dir, f"partial_chunk_{chapter_index}_{res.chunk_index}.wav")
-                        with open(chunk_tmp, "wb") as f_tmp:
-                            f_tmp.write(res.audio)
-                        accumulated_audio_paths.append(chunk_tmp)
-                        temp_files_to_clean.append(chunk_tmp)
-                    else:
-                        accumulated_audio_paths.append(res.audio)
-
+                    accumulated_audio_paths.append(res.audio)
+                    accumulated_pauses.append(pauses[res.chunk_index])
                     if len(accumulated_audio_paths) >= _PARTIAL_FLUSH_CHUNK_COUNT:
-                        p_path = os.path.join(out_dir, f"partial_{chapter_index}_{len(partial_files)}.wav")
-                        paths_to_flush = list(accumulated_audio_paths)
-                        future = _disk_io_executor.submit(_concat_partial, paths_to_flush, p_path, config)
-                        pending_flushes.append(future)
-                        partial_files.append(p_path)
-                        accumulated_audio_paths.clear()
-
+                        _flush_partial()
                     next_expected_index += 1
+
+            try:
+                _drain_in_order()
 
                 while stage_b_active_count > 0:
                     if cancel_token.is_cancelled:
@@ -594,47 +835,29 @@ def run_chapter_pipeline(
                     if item is None:
                         stage_b_active_count -= 1
                         continue
-                    elif isinstance(item, _StageError):
-                        _pipeline_failed = True
-                        if pipeline_exc is None:
-                            pipeline_exc = item.exception
-                        continue
-                    elif isinstance(item, _SynthResult):
-                        received_chunks[item.chunk_index] = item
-                        if isinstance(item.audio, str):
-                            temp_files_to_clean.append(item.audio)
+                    received_chunks[item.chunk_index] = item
+                    _drain_in_order()
 
-                        while next_expected_index in received_chunks:
-                            res = received_chunks.pop(next_expected_index)
-                            durations_res[res.chunk_index] = res.duration
+                if not cancel_token.is_cancelled:
+                    # Workers may have exited between our last get() and their sentinel.
+                    while True:
+                        try:
+                            item = master_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if item is not None:
+                            received_chunks[item.chunk_index] = item
+                    _drain_in_order()
 
-                            if isinstance(res.audio, bytes):
-                                chunk_tmp = os.path.join(out_dir, f"partial_chunk_{chapter_index}_{res.chunk_index}.wav")
-                                with open(chunk_tmp, "wb") as f_tmp:
-                                    f_tmp.write(res.audio)
-                                accumulated_audio_paths.append(chunk_tmp)
-                                temp_files_to_clean.append(chunk_tmp)
-                            else:
-                                accumulated_audio_paths.append(res.audio)
+                    if next_expected_index < total_chunks:
+                        cause = f": {worker_errors[-1]}" if worker_errors else ""
+                        raise RuntimeError(
+                            f"Stage B failure — only {next_expected_index} of {total_chunks} "
+                            f"chunks were synthesized for chapter {chapter_index}{cause}"
+                        )
 
-                            if len(accumulated_audio_paths) >= _PARTIAL_FLUSH_CHUNK_COUNT:
-                                p_path = os.path.join(out_dir, f"partial_{chapter_index}_{len(partial_files)}.wav")
-                                paths_to_flush = list(accumulated_audio_paths)
-                                future = _disk_io_executor.submit(_concat_partial, paths_to_flush, p_path, config)
-                                pending_flushes.append(future)
-                                partial_files.append(p_path)
-                                accumulated_audio_paths.clear()
-
-                            next_expected_index += 1
-
-                # Flush remaining accumulated paths to final partial file
-                if accumulated_audio_paths and not cancel_token.is_cancelled and not _pipeline_failed:
-                    p_path = os.path.join(out_dir, f"partial_{chapter_index}_{len(partial_files)}.wav")
-                    paths_to_flush = list(accumulated_audio_paths)
-                    future = _disk_io_executor.submit(_concat_partial, paths_to_flush, p_path, config)
-                    pending_flushes.append(future)
-                    partial_files.append(p_path)
-                    accumulated_audio_paths.clear()
+                    if accumulated_audio_paths:
+                        _flush_partial()
 
                 # Await all async partial WAV writes before final mastering pass
                 for f in pending_flushes:
@@ -643,39 +866,49 @@ def run_chapter_pipeline(
                     except Exception as exc:
                         raise RuntimeError(f"Async partial WAV write failed: {exc}") from exc
 
-                # Final master concatenation into out_wav_path with LUFS & dBTP normalization
-                if partial_files and not cancel_token.is_cancelled and not _pipeline_failed:
-                    _master_final(partial_files, out_wav_path, config)
+                if partial_files and not cancel_token.is_cancelled:
+                    normalized = _master_final(partial_files, out_wav_path, config)
+                    if master_info is not None:
+                        master_info["normalized"] = normalized
 
-                if not os.path.exists(out_wav_path) or os.path.getsize(out_wav_path) < 100:
-                    if not cancel_token.is_cancelled and not _pipeline_failed:
+                    if not os.path.exists(out_wav_path) or os.path.getsize(out_wav_path) < 100:
                         raise RuntimeError(f"Mastered chapter audio file was not created or empty at {out_wav_path}")
 
             except Exception as exc:
                 stage_c_exception = exc
             finally:
                 _cleanup_chunk_files(partial_files)
-                _cleanup_chunk_files(temp_files_to_clean)
-
-                if _pipeline_failed and pipeline_exc:
-                    stage_c_exception = RuntimeError(f"Stage B failure: {pipeline_exc}")
 
         thread_c = threading.Thread(target=_stage_c_worker, name=f"StageC-Ch{chapter_index}", daemon=False)
 
         # ── Start Threads ─────────────────────────────────────────────────────
-        thread_a.start()
         for t in stage_b_threads:
             t.start()
         thread_c.start()
 
         # ── Join Threads in Strict Order ─────────────────────────
-        thread_a.join()
         for t in stage_b_threads:
             t.join()
         thread_c.join()
 
         if stage_c_exception is None and not cancel_token.is_cancelled and os.path.exists(out_wav_path) and os.path.getsize(out_wav_path) > 0:
             _chapter_succeeded = True
+            if pending_count and len(active_devices) > 1:
+                # Chunks, batches and busy time per device: equal busy times
+                # mean the devices really worked side by side.
+                log_callback(
+                    f"  [Ch{chapter_index}] Device share: "
+                    + ", ".join(
+                        f"{dev} {count} chunk(s) in {work_share.batches.get(dev, 0)} batch(es) "
+                        f"over {work_share.busy_seconds.get(dev, 0.0):.0f}s"
+                        for dev, count in device_stats.items()
+                    )
+                )
+            if worker_errors:
+                log_callback(
+                    f"  [Ch{chapter_index}] ⚠ {len(worker_errors)} device worker(s) failed "
+                    f"({worker_errors[-1]}); the remaining device(s) finished the chapter."
+                )
 
     finally:
         # Always release providers after all threads are joined

@@ -263,13 +263,6 @@ def check_provider_dependencies(provider_name: str) -> tuple[bool, str]:
             return True, "f5-tts package is installed"
         except ImportError:
             return False, "F5-TTS requires f5-tts package. Install with: pip install f5-tts"
-    if p_name in ("vibevoice", "vibe-voice"):
-        try:
-            import transformers
-            import soundfile  # noqa: F401
-            return True, f"VibeVoice dependencies available (transformers {transformers.__version__})"
-        except ImportError as e:
-            return False, f"VibeVoice missing dependency ({e}). Install with: pip install --upgrade transformers protobuf soundfile"
     return True, f"Provider '{p_name}' dependencies satisfied"
 
 

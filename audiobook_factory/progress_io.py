@@ -11,6 +11,8 @@ __all__ = [
     "write_progress_file",
     "update_chapter_status",
     "update_chapter_chunk",
+    "update_chapter_chunks",
+    "update_chapter_fields",
     "update_chapter_retry",
 ]
 
@@ -236,6 +238,91 @@ def update_chapter_chunk(
                 exc,
             )
 
+
+
+def update_chapter_chunks(
+    path: str,
+    chapter_num: int,
+    chunk_indices: list[int],
+) -> None:
+    """Records several completed chunk indices with a single file rewrite.
+
+    The progress file holds the whole book's text, so rewriting it once per
+    chunk is the dominant I/O cost of a run. Synthesis finishes chunks a batch
+    at a time; this writes the batch in one go.
+
+    Thread-safe. Uses _WRITE_LOCK to prevent concurrent write corruption.
+
+    Args:
+        path: Path to generation_progress.json.
+        chapter_num: 1-based chapter number.
+        chunk_indices: Zero-based chunk indices to mark as completed.
+    """
+    if not chunk_indices:
+        return
+    with _WRITE_LOCK:
+        try:
+            data = read_progress_file(path)
+        except (FileNotFoundError, ValueError) as exc:
+            logger.warning(
+                "Cannot update chunk completion — progress file unreadable: %s",
+                exc,
+            )
+            return
+
+        for ch in data.get("chapters", []):
+            if ch.get("num") == chapter_num or str(ch.get("num")) == str(chapter_num):
+                completed = ch.setdefault("completed_chunks", [])
+                known = set(completed)
+                for chunk_index in chunk_indices:
+                    if chunk_index not in known:
+                        completed.append(chunk_index)
+                        known.add(chunk_index)
+                break
+
+        try:
+            _write_unlocked(path, data)
+        except OSError as exc:
+            logger.warning(
+                "Failed to persist chunk completion for chapter %d (%d chunks): %s",
+                chapter_num,
+                len(chunk_indices),
+                exc,
+            )
+
+
+def update_chapter_fields(
+    path: str,
+    chapter_num: int,
+    fields: dict[str, Any],
+) -> None:
+    """Sets arbitrary fields on one chapter entry (e.g. duration, flagged chunks).
+
+    Thread-safe. Reads, modifies, and writes atomically under _WRITE_LOCK.
+
+    Args:
+        path: Path to generation_progress.json.
+        chapter_num: 1-based chapter number.
+        fields: Keys and JSON-serializable values to store on the entry.
+    """
+    if not fields:
+        return
+    with _WRITE_LOCK:
+        try:
+            data = read_progress_file(path)
+        except (FileNotFoundError, ValueError) as exc:
+            logger.warning("Cannot update chapter fields — progress file unreadable: %s", exc)
+            return
+
+        for ch in data.get("chapters", []):
+            if ch.get("num") == chapter_num or str(ch.get("num")) == str(chapter_num):
+                ch.update(fields)
+                break
+
+        try:
+            _write_unlocked(path, data)
+        except OSError as exc:
+            logger.warning("Failed to write chapter fields for chapter %d: %s", chapter_num, exc)
 
 
 def update_chapter_retry(

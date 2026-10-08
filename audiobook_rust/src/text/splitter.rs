@@ -1,12 +1,4 @@
 use unicode_segmentation::UnicodeSegmentation;
-use regex::Regex;
-use std::sync::OnceLock;
-
-static RE_SOFT_SPLIT_CHAR: OnceLock<Regex> = OnceLock::new();
-
-fn get_soft_split_re() -> &'static Regex {
-    RE_SOFT_SPLIT_CHAR.get_or_init(|| Regex::new(r"[;:—]").unwrap())
-}
 
 /// Smart sentence splitter matching Level 1 (paragraphs), Level 2 (sentence tokenize with abbreviation fixes),
 /// and Level 3 (soft split on punctuation for long sentences).
@@ -24,7 +16,9 @@ pub fn split_sentences_rust(text: &str, max_len: usize) -> Vec<String> {
         let sentences = segment_sentences(cleaned_para);
 
         for sentence in sentences {
-            if sentence.len() <= max_len {
+            // Lengths are in characters, matching Python's len(); byte
+            // lengths would cut non-Latin text 2-3x shorter than requested.
+            if sentence.chars().count() <= max_len {
                 final_chunks.push(sentence.to_string());
             } else {
                 // Level 3: Soft Split
@@ -99,54 +93,56 @@ fn segment_sentences(para: &str) -> Vec<String> {
     sentences
 }
 
+/// Byte offset of the `n`-th character of `s` (or `s.len()` if it is shorter).
+fn byte_offset_of_char(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map_or(s.len(), |(i, _)| i)
+}
+
 /// Splits a long sentence trying to respect punctuation boundaries.
+///
+/// `max_len` is a character count. Every slice index is derived from
+/// `char_indices`/`rfind`, so it always lands on a UTF-8 boundary.
 fn soft_split_long_sentence(sentence: &str, max_len: usize) -> Vec<String> {
+    let max_len = max_len.max(1);
     let mut chunks = Vec::new();
     let mut current_text = sentence.trim();
 
-    while current_text.len() > max_len {
-        let sub = &current_text[..max_len];
-        let mut best_split_idx = None;
+    while current_text.chars().count() > max_len {
+        let window_end = byte_offset_of_char(current_text, max_len);
+        let sub = &current_text[..window_end];
+        // End (exclusive, in bytes) of the chunk if we split after the best delimiter.
+        let mut best_split_end: Option<usize> = None;
 
-        // Priority 1: Sentence-like pauses (semicolons, colons, em-dashes)
-        for c in [';', ':', '—'] {
+        // Priority 1: Sentence-like pauses (semicolons, colons, em-dashes;
+        // ASCII and full-width forms)
+        for c in [';', ':', '—', '；', '：'] {
             if let Some(idx) = sub.rfind(c) {
-                if best_split_idx.map_or(true, |best| idx > best) {
-                    best_split_idx = Some(idx);
+                let end = idx + c.len_utf8();
+                if best_split_end.map_or(true, |best| end > best) {
+                    best_split_end = Some(end);
                 }
             }
         }
 
-        // Priority 2: Commas
-        if best_split_idx.is_none() {
-            if let Some(idx) = sub.rfind(',') {
-                best_split_idx = Some(idx);
+        // Priority 2: Commas (ASCII, full-width and the ideographic comma)
+        if best_split_end.is_none() {
+            for c in [',', '，', '、'] {
+                if let Some(idx) = sub.rfind(c) {
+                    let end = idx + c.len_utf8();
+                    if best_split_end.map_or(true, |best| end > best) {
+                        best_split_end = Some(end);
+                    }
+                }
             }
         }
 
         // Priority 3: Spaces
-        if best_split_idx.is_none() {
-            if let Some(idx) = sub.rfind(' ') {
-                best_split_idx = Some(idx);
-            }
+        if best_split_end.is_none() {
+            best_split_end = sub.rfind(' ').map(|idx| idx + 1);
         }
 
-        // Priority 4: Hard limit (chop at character boundary)
-        let split_point = match best_split_idx {
-            Some(idx) => idx + 1,
-            None => {
-                // Find nearest UTF-8 character boundary
-                let mut bound = max_len;
-                while bound > 0 && !current_text.is_char_boundary(bound) {
-                    bound -= 1;
-                }
-                if bound == 0 {
-                    max_len
-                } else {
-                    bound
-                }
-            }
-        };
+        // Priority 4: Hard limit (chop after max_len characters)
+        let split_point = best_split_end.unwrap_or(window_end);
 
         let chunk = current_text[..split_point].trim();
         if !chunk.is_empty() {

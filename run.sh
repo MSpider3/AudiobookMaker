@@ -37,6 +37,44 @@ fi
 source "$VENV_DIR/bin/activate"
 success "Virtual environment activated"
 
+# ── Stop both processes however this script ends ─────────────────────────────
+# The API server holds the TTS model in VRAM. Trapping only INT/TERM left it
+# running whenever app.py exited on its own (crash, port in use, closed from
+# the UI), so everything is stopped from an EXIT trap instead.
+API_PID=""
+APP_PID=""
+STOP_TIMEOUT=15   # seconds to wait for a graceful stop before SIGKILL
+
+stop_process() {
+    local pid="$1"
+    [[ -n "$pid" ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill "$pid" 2>/dev/null || return 0
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [[ $waited -ge $((STOP_TIMEOUT * 2)) ]]; then
+            kill -9 "$pid" 2>/dev/null || true
+            break
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    wait "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    stop_process "$APP_PID"
+    stop_process "$API_PID"
+    echo ''
+    echo 'AudiobookMaker stopped.'
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # ── Start API backend & app.py in background ───────────────────────────────────
 info "Starting API Orchestration Backend ..."
 python start_api.py &
@@ -50,7 +88,12 @@ APP_PID=$!
 info "Waiting for server..."
 TIMEOUT=30
 ELAPSED=0
+APP_ALIVE=1
 while ! curl -s "$URL" > /dev/null 2>&1; do
+    if ! kill -0 "$APP_PID" 2>/dev/null; then
+        APP_ALIVE=0
+        break
+    fi
     sleep 1
     ELAPSED=$((ELAPSED + 1))
     if [[ $ELAPSED -ge $TIMEOUT ]]; then
@@ -59,22 +102,28 @@ while ! curl -s "$URL" > /dev/null 2>&1; do
     fi
 done
 
-# ── Open browser ──────────────────────────────────────────────────────────────
-OS="$(uname -s)"
-if [[ "$OS" == "Darwin" ]]; then
-    open "$URL"
-elif command -v xdg-open &>/dev/null; then
-    xdg-open "$URL"
-elif command -v wslview &>/dev/null; then
-    wslview "$URL"
+if [[ $APP_ALIVE -eq 1 ]]; then
+    # ── Open browser ──────────────────────────────────────────────────────────
+    OS="$(uname -s)"
+    if [[ "$OS" == "Darwin" ]]; then
+        open "$URL" || true
+    elif command -v xdg-open &>/dev/null; then
+        xdg-open "$URL" || true
+    elif command -v wslview &>/dev/null; then
+        wslview "$URL" || true
+    else
+        echo "[INFO]  Open your browser at: $URL"
+    fi
+
+    success "AudiobookMaker is running at $URL"
+    echo -e "${BOLD}  Press Ctrl+C to stop.${RESET}"
+    echo ""
 else
-    echo "[INFO]  Open your browser at: $URL"
+    echo "[ERROR] $APP exited during startup."
 fi
 
-success "AudiobookMaker is running at $URL"
-echo -e "${BOLD}  Press Ctrl+C to stop.${RESET}"
-echo ""
-
-# ── Keep running until user stops it ─────────────────────────────────────────
-trap "kill $APP_PID $API_PID 2>/dev/null; echo ''; echo 'AudiobookMaker stopped.'" INT TERM
-wait $APP_PID
+# ── Keep running until app.py exits or the user stops it ─────────────────────
+# The EXIT trap stops the API server in both cases.
+APP_STATUS=0
+wait "$APP_PID" || APP_STATUS=$?
+exit "$APP_STATUS"

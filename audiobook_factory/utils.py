@@ -47,3 +47,29 @@ def format_lrc_timestamp(seconds):
     sec = int(seconds % 60)
     hundredths = int((seconds - (minutes * 60) - sec) * 100)
     return f"[{minutes:02d}:{sec:02d}.{hundredths:02d}]"
+
+
+_DONE_PREFIX = "__DONE__::"
+
+
+def encode_done_message(files=None) -> str:
+    """Builds the log-queue sentinel that carries a run's output file list.
+
+    The list is JSON-encoded: joining paths with a comma broke on any book or
+    chapter title containing one ("The Lion, the Witch and the Wardrobe").
+    """
+    return _DONE_PREFIX + json.dumps(list(files or []))
+
+
+def decode_done_message(msg: str):
+    """Returns the file list from a done sentinel, or None if `msg` is not one."""
+    if not isinstance(msg, str) or not msg.startswith(_DONE_PREFIX):
+        return None
+    payload = msg[len(_DONE_PREFIX):]
+    if not payload:
+        return []
+    try:
+        files = json.loads(payload)
+    except ValueError:
+        return [payload]
+    return [f for f in files if isinstance(f, str)] if isinstance(files, list) else []

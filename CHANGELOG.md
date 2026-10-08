@@ -4,6 +4,66 @@ All notable changes to **AudiobookMaker** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+> Rebuild the Rust extension after pulling (`cd audiobook_rust && maturin develop --release`): three of these fixes are in Rust, and a stale binary keeps the old behaviour.
+
+### ⚖️ Licence
+- **Relicensed from Apache-2.0 to AGPL-3.0-or-later.** Releases up to v1.5.0 remain available under Apache-2.0. `NOTICE` carries the copyright statement, an additional permission (AGPL section 7) to combine AudiobookMaker with the separately installed TTS engines, and third-party attributions. The web UI and the API now link to the source code.
+
+### ⚡ Added
+- **Five new TTS engines** behind a shared provider contract (`tts_providers/base_tts_provider.py`, `registry.py`): IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish Audio S2 Pro and Higgs Audio v3. Each exposes its own controls as provider options, declares its licence and VRAM needs, and installs from `requirements/tts-<engine>.txt`. Engines pin incompatible `transformers` versions, so install one per environment.
+- **Qwen3-TTS reworked**: validated preset speakers (CustomVoice), designed voices that are designed once and then cloned for the whole book on every GPU (VoiceDesign), saved voice presets, per-chunk token budgets against runaway generation, and every upstream sampling control.
+- **Natural pacing** (`chunk_planner.py`): a paragraph's sentences are spoken together up to `max_len`, paragraphs get `para_pause`, dialogue tags stay with their quote; subtitles keep sentence-level timing.
+- **Chunk verification** (`chunk_verifier.py`, `verify_chunks`): free duration/silence check by default, optional Whisper transcript check, automatic re-synthesis, and a list of chunks worth a listen in the run summary.
+- **Spoken-form text** (`speech_text.py`, `normalize_speech_text`): currency, dates, years, ordinals, roman numerals, units and abbreviations rewritten for narration (English).
+- **Chapter detection for TXT, DOCX, ODT and PDF**, real MOBI/AZW3 support (optional `mobi` package), and front/back matter that can be listed unticked instead of silently dropped.
+- **Single-file audiobooks with chapter markers** (M4B/MP3), speed control for every engine, per-chapter redo (`redo_chapters`, `--redo`), ETA and an end-of-run summary of failed chapters.
+- **CLI**: `--book` (no JSON needed), `--list-providers`, `--dry-run`, `--chapters`, `--redo`, `--tts-option`, `--verify` and the rest of the config as flags; exit codes 0 / 1 / 130.
+- **API**: `/api/v1/providers`, `/api/v1/tasks`, task file download, request validation.
+- **Automatic GPU sharing (`parallel_mode="auto"`, `--parallel-mode auto`, Parallelism in the UI)**: each chapter gets as many GPUs as it has batches to fill. A chapter that fits in one batch takes a single GPU and the next chapter starts on the other; a long chapter is shared by all of them; with more than two GPUs a medium chapter takes some and short ones the rest. Opt-in: the default stays `chunks`. Exercised with simulated GPUs only so far.
+- **Long test books in seven languages** (`tests/fixture_generation/long_books/`, `generate_long_books.py`): an original ten-chapter novella of about twenty pages each in English, French, Russian, Hindi, Chinese, Japanese and Korean, built into `tests/fixtures/source_documents/long_book_<code>.epub` for the test suite and for trying an engine or language by hand.
+
+### 🚀 Changed
+- **Multi-GPU**: all GPUs pull length-sorted batches from one shared queue per chapter; a GPU that fails hands its batch to the others. Batch size no longer shrinks after the first batch and adapts after an out-of-memory retry.
+- **Progress file** is written once per batch instead of once per chunk; chapter numbers are stable across subset runs and status is matched by title.
+- **Mastering** normalises loudness once; Rust functions release the GIL.
+- **Chapters now reach the loudness target (`loudness.py`, `audiobook_rust/src/audio/master.rs`)**: narration has a few peaks far above its average level, so one static gain stopped 2-5 LU short of the LUFS target on every engine tested (-20 to -22 instead of -18). The full gain is now applied and those peaks go through a look-ahead limiter (1 ms gain curve, held over a pitch period, smoothed so it cannot click). Chapters that already fit are untouched; the limiter never takes more than 9 dB.
+- **Chunk length follows the script (`chunk_planner.py`)**: `max_len` counts Latin characters (399 is about 25 seconds). A Chinese character is a whole syllable, so 399 of them were over a minute of speech in one TTS call. The limit is now scaled by how long the script takes to say: about a third for Chinese, between the two for Japanese and Korean; Chinese and Japanese sentences are joined without spaces. The duration check uses separate speaking rates for Han characters, kana and hangul.
+- **The pipeline log shows how the GPUs shared a chapter**: chunks, batches and busy seconds per device.
+- **Short chapters use every GPU (`chapter_pipeline.py`)**: a device takes at most an even share of the chunks still queued, where the first device used to take a whole batch — all of a short chapter — and the second T4 sat idle. An idle device also waits while another is mid-batch, so work handed back by a failed device is picked up instead of lost.
+- **Reference-voice preprocessing** rewritten: loudness (LUFS) target applied last, edge-only silence trim with fades, peak-relative soft gate, pause-learned noise profile, downsample to 24 kHz mono, and a report with warnings.
+- **Config schema 7**: `voice_preset`, `tts_options`, `redo_chapters`, `batch_size`, `pack_sentences`, `normalize_speech_text`, `verify_*`.
+
+### 🧹 Repository layout
+- The Colab and Kaggle notebooks moved to `notebooks/`; `colab_prerun_check.py`, `kaggle_prerun_check.py` and `lrc_to_srt_converter.py` moved to `scripts/` (the pre-run checks now find the project root themselves). The notebooks install one optional engine per session and call the scripts at their new place.
+- Removed the one-off Kaggle validation material: `tests/kaggle/`, `REPORT.md` and `test_whisper.py`. The pytest suite under `tests/` stays.
+
+### 🗑️ Removed
+- **VibeVoice provider** — it could never synthesize (it called a method the model does not have). Saved configs naming it fall back to Qwen3-TTS.
+
+### 🐛 Fixed
+- **Sentence breaks in other languages (`text_processing.py`, `splitter.rs`)**: an opening quote no longer stays at the end of the previous sentence in Chinese and Japanese, a French closing guillemet stays with its sentence, abbreviations such as "ул.", "г." and "डॉ." no longer end one, the Python fallback splits at the CJK full stop and the Devanagari danda, and over-long sentences are cut at full-width commas.
+- **Dialogue dashes (`extractor_engine.py`, `normalize.rs`)**: the dash that opens a line of dialogue in French or Russian was turned into a comma (", Rentre vite !"); it is now dropped.
+- **ASR verification in other languages (`chunk_verifier.py`)**: combining marks were stripped before comparing, which cut every Hindi, Thai or Arabic word into loose consonants and made any transcript look wrong. A transcript is now compared the way its script needs: Chinese by syllable sound and Japanese by reading (with the optional `pypinyin` / `pykakasi`), so the recogniser's choice of homophone, traditional character, kanji or kana is not an error; Hindi and other scripts with varying spelling by character; English and similar by word, as before.
+- **Fish Audio S2 Pro failed on every chunk in reduced precision (`fish_provider.py`)**: upstream builds its codec under `torch.inference_mode`; converting it to the model's precision outside that mode left the weights unusable ("Inference tensors do not track version counter"). Seen on a T4, where the codec runs in bfloat16.
+- **IndexTTS could not load (`requirements/tts-indextts.txt`, `indextts_provider.py`)**: upstream's bundled DAC code imports `audiotools` while the model loads; `descript-audiotools` and what it imports are now part of the install steps.
+- **Transcript given as a file path (`pipeline.py`)**: a path to a `.txt` file in the voice-transcript field was taken as the words spoken in the clip, which made cloning engines cut chunks short, ramble or go silent. The file is now read, and a transcript whose length cannot match the clip is reported before synthesis starts.
+- **ASR chunk verification (`chunk_verifier.py`)**: Whisper no longer carries context between its 30-second windows, which made one misheard window spoil the rest of a transcript.
+- **Loudness normalisation never boosted quiet audio (`audiobook_rust/src/audio/master.rs`)**: the true peak (a linear amplitude) was added to a dB gain, so any chapter needing a boost was turned *down* ~1.5 dB instead of reaching the LUFS target.
+- **Real errors hidden behind `sub_future` `UnboundLocalError` (`pipeline.py`)**: any failure, cancel or empty chapter before the subtitle stage reported "cannot access local variable 'sub_future'" and was marked failed.
+- **Cancellation (`pipeline.py`)**: `asyncio.CancelledError` from the chapter pipeline is now handled; a cancelled chapter stays `pending` instead of `failed`.
+- **Chapter order (`pipeline.py`)**: outputs (and the single-file concat) are ordered by chapter number, not by filename — "Chapter 10" no longer precedes "Chapter 2".
+- **Pronunciation map ignored (`pipeline.py`)**: fixes are now applied to pre-split sentences, which is what is actually synthesized.
+- **Encoder settings (`pipeline.py`)**: `bitrate_kbps` is honoured for MP3/OGG (`-q:a` used to override it); the Python fallback no longer emits 48/96/192 kHz files; sample-rate and stereo choices no longer change playback speed; Rust-encoded MP3s get ID3 tags.
+- **Resume cache (`pipeline.py`, `chapter_pipeline.py`)**: chunk WAVs survive a failed or cancelled chapter, retries reuse them, and a fingerprint discards them if the text, voice or TTS settings changed.
+- **Stale TTS settings (`chapter_pipeline.py`, `pipeline.py`, `qwen_provider.py`)**: pooled and preview providers now use the current run's config; the voice-prompt cache is keyed on file contents and transcript.
+- **Qwen provider (`qwen_provider.py`)**: reference auto-transcription no longer fails silently on an invalid Whisper kwarg; `top_k`, `repetition_penalty` and `seed` are passed through; CustomVoice/VoiceDesign no longer require a voice file.
+- **Text normalisation (`extractor_engine.py`, `text_processing.py`, Rust)**: removed the rules that split ordinary words ("room w as") and glued single capitals ("Vitamin Cis"); headings, HTML comments, entities and scene breaks are stripped; chapter titles such as "About a Boy" or "End of the Road" are no longer dropped as front matter.
+- **Rust sentence splitter panic on non-ASCII text (`splitter.rs`)**: lengths are counted in characters and slices land on UTF-8 boundaries.
+- **Extraction (`extractor_engine.py`, `text_extractor.py`)**: the OCR checkbox is honoured and an OCR failure no longer aborts extraction; inline HTML tags no longer split sentences in the fallback parser; TXT encoding is detected.
+- **API/UI (`api/server.py`, `api/worker.py`, `app.py`, `cli.py`)**: the WebSocket delivers the file list before closing, so API-mode runs no longer end in "No output files generated"; paths containing commas survive; restoring a progress JSON no longer blocks Generate; the chapter cache matches titles exactly; the CLI keeps every exported setting.
+
 ## [v1.5.0] - 2026-09-24
 
 ### ⚡ Added

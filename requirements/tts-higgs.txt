@@ -1,0 +1,50 @@
+# ─── AudiobookMaker — Higgs Audio v3 TTS provider (tts_provider_name = "higgs") ──
+# Provider: audiobook_factory/tts_providers/higgs_provider.py
+# Upstream: https://huggingface.co/bosonai/higgs-tts-3-4b  (weights only)
+#           https://github.com/sgl-project/sglang-omni   (reference serving code, Apache-2.0)
+#
+# Install with:  pip install -r requirements/tts-higgs.txt
+#
+# There is no upstream Python package to install: the Hugging Face repository
+# ships weights and a tokenizer only, and transformers has no Higgs v3 model
+# class. The provider runs the model in-process from stock transformers parts
+# (Qwen3Model + HiggsAudioV2TokenizerModel), so transformers is the only
+# model library needed. It was checked against transformers 5.5.0, 5.12.1 and
+# 5.19.0.
+#
+# Install PyTorch FIRST (torch >= 2.5 with the matching torchaudio build), or
+# keep the pair your Kaggle / Colab image ships; pip then leaves both alone.
+# Do NOT upgrade torchaudio on its own: a torchaudio wheel built for another
+# torch / CUDA version fails to import and the codec class refuses to load.
+#
+# CONFLICT: needs transformers >= 5.5.0 (HiggsAudioV2TokenizerModel appeared
+# in 5.3.0; the checkpoint was exported with 5.5.0). qwen-tts 0.1.1 pins
+# transformers==4.57.3 and accelerate==1.12.0, so Higgs and Qwen3-TTS cannot
+# share one environment: use a separate venv / notebook session per engine.
+# (The Fish and IndexTTS requirement files in this folder also ask for
+# transformers 4.x; OmniVoice asks for >= 5.3.0 and can share with Higgs.)
+#
+# Weights: bosonai/higgs-tts-3-4b, one 9.3 GB safetensors file, downloaded on
+# first use into the Hugging Face cache. The repository is public and not
+# gated: no token and no click-through (HF_TOKEN only raises rate limits).
+# VRAM: about 8.3 GiB of weights in float16 / bfloat16 plus 1-3 GiB while
+# synthesizing; a free 16 GB T4 fits, 8 GB cards do not. No quantized build.
+#
+# Licence: Boson Higgs TTS 3 Research and Non-Commercial License. Downloading
+# or using the weights means accepting it. Its Creator Use Grant (Section
+# II-A) lets you publish and monetize audiobooks you make with the model if
+# you credit Boson AI's Higgs Audio in the audio or prominently in the
+# accompanying text, for example:
+#   "This audio was created with Boson AI's Higgs Audio — https://www.boson.ai/higgs-audio"
+# Hosting the model for others or shipping it inside a product needs a
+# separate commercial licence from Boson. Clone only voices you have explicit,
+# verifiable consent for.
+
+transformers>=5.5.0,<6      # Qwen3Model, HiggsAudioV2TokenizerModel, PreTrainedTokenizerFast
+accelerate>=1.1.0           # init_empty_weights: build the 4B backbone without filling host RAM
+safetensors>=0.4.3          # read checkpoint tensors straight onto the GPU
+huggingface-hub             # snapshot_download (transformers pulls the version it needs)
+tokenizers                  # tokenizer.json (transformers pulls the version it needs)
+torchaudio                  # required by HiggsAudioV2TokenizerModel; reference-clip resampling
+soundfile                   # reference clip and WAV I/O
+numpy

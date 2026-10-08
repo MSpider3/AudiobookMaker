@@ -5,9 +5,21 @@ use std::collections::HashMap;
 // Initialize compile-once regular expressions
 static RE_DEWRAP: OnceLock<Regex> = OnceLock::new();
 static RE_DROPCAP: OnceLock<Regex> = OnceLock::new();
-static RE_CLASS_C: OnceLock<Regex> = OnceLock::new();
 static RE_ISO_CAP: OnceLock<Regex> = OnceLock::new();
 static RE_ALL_CAPS: OnceLock<Regex> = OnceLock::new();
+static RE_DROPCAP_MIXED: OnceLock<Regex> = OnceLock::new();
+static RE_DROPCAP_CAPS: OnceLock<Regex> = OnceLock::new();
+
+/// Words that label a single-letter identifier ("Class D", "Plan B",
+/// "Vitamin C", "Mr. T"). A capital following one is a name, not a kerning split.
+const LETTER_LABELS: &[&str] = &[
+    "class", "room", "section", "level", "floor", "group", "area", "zone",
+    "rank", "type", "grade", "exam", "test", "point", "score", "phase",
+    "stage", "category", "model", "series", "volume", "chapter", "year",
+    "course", "subject", "unit", "part", "item", "step", "plan", "vitamin",
+    "option", "team", "block", "wing", "gate", "platform", "appendix",
+    "figure", "table", "exhibit", "mr", "mrs", "ms", "dr", "agent",
+];
 static RE_HYPHEN: OnceLock<Regex> = OnceLock::new();
 static RE_SOFT_WRAP: OnceLock<Regex> = OnceLock::new();
 
@@ -19,23 +31,22 @@ fn get_dropcap_re() -> &'static Regex {
     RE_DROPCAP.get_or_init(|| Regex::new(r"(^|\n)([A-Z])\s*\n\s*([A-Z]{2,})").unwrap())
 }
 
-fn get_class_c_re() -> &'static Regex {
-    RE_CLASS_C.get_or_init(|| {
-        let descriptors = "Class|Room|Section|Level|Floor|Group|Area|Zone|Rank|Type|Grade|\
-                           Exam|Test|Point|Score|Rank|Phase|Stage|Category|Model|Series|\
-                           Volume|Chapter|Year|Course|Subject|Unit|Part|Item|Step";
-        Regex::new(&format!(r"(?i)(\b(?:{})\s+)([A-Z])([a-z]{{2,}})", descriptors)).unwrap()
-    })
-}
-
 fn get_iso_cap_re() -> &'static Regex {
-    // Equivalent to (?<![a-zA-Z])([A-Z])\s+([a-zA-Z]{1,})\b
+    // Equivalent to (?<![a-zA-Z])([A-Z])[ \t]+([a-zA-Z]+)\b
     // We match a boundary non-alphabet character or start of line
-    RE_ISO_CAP.get_or_init(|| Regex::new(r"(^|[^a-zA-Z])([A-Z])\s+([a-zA-Z]{1,})\b").unwrap())
+    RE_ISO_CAP.get_or_init(|| Regex::new(r"(^|[^a-zA-Z])([A-Z])[ \t]+([a-zA-Z]+)\b").unwrap())
 }
 
 fn get_all_caps_re() -> &'static Regex {
-    RE_ALL_CAPS.get_or_init(|| Regex::new(r"\b([A-Z])\s+([A-Z]+)\b").unwrap())
+    RE_ALL_CAPS.get_or_init(|| Regex::new(r"\b([A-Z])[ \t]+([A-Z]+)\b").unwrap())
+}
+
+fn get_dropcap_mixed_re() -> &'static Regex {
+    RE_DROPCAP_MIXED.get_or_init(|| Regex::new(r"(?m)^([ \t]*(?:#+[ \t]*)?)([A-Z])[ \t]+([a-z]+)\b").unwrap())
+}
+
+fn get_dropcap_caps_re() -> &'static Regex {
+    RE_DROPCAP_CAPS.get_or_init(|| Regex::new(r"(?m)^([ \t]*(?:#+[ \t]*)?)([A-Z])[ \t]+([A-Z]{2,})\b").unwrap())
 }
 
 fn get_hyphen_re() -> &'static Regex {
@@ -58,76 +69,87 @@ pub fn normalize_text_rust(text: &str) -> String {
     // 2. Drop cap merge
     let text = get_dropcap_re().replace_all(&text, "$1$2$3");
 
-    // 3. Class C merged identifier
-    let text = get_class_c_re().replace_all(&text, |caps: &Captures| {
-        let prefix = caps.get(1).map_or("", |m| m.as_str());
-        let cap = caps.get(2).map_or("", |m| m.as_str());
-        let rest = caps.get(3).map_or("", |m| m.as_str());
-        let combined = format!("{}{}", cap, rest);
-        let combined_lower = combined.to_lowercase();
-        
-        const NO_SPLIT_WORDS: &[&str] = &[
-            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-            "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
-            "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
-            "title", "name", "number", "code", "type", "level", "value", "status", "description", "details",
-            "list", "info", "room", "leader", "member", "head", "base", "group", "area", "zone", "rank",
-            "grade", "exam", "test", "point", "score", "phase", "stage", "category", "model", "series",
-            "volume", "chapter", "year", "course", "subject", "unit", "part", "item", "step", "boss", "user"
-        ];
-        
-        if NO_SPLIT_WORDS.contains(&combined_lower.as_str()) {
-            format!("{}{}", prefix, combined)
-        } else {
-            format!("{}{} {}", prefix, cap, rest)
-        }
-    });
-
     text.into_owned()
 }
 
-/// Fixes PDF kerning issues where a single capital letter is detached.
-fn fix_isolated_capitals(text: &str) -> String {
-    // First, handle the mixed case splits
-    let text = get_iso_cap_re().replace_all(text, |caps: &Captures| {
-        let prefix = caps.get(1).map_or("", |m| m.as_str());
-        let cap = caps.get(2).map_or("", |m| m.as_str());
-        let rest = caps.get(3).map_or("", |m| m.as_str());
-        
-        let merged = if cap == "A" || cap == "I" {
-            let rest_lower = rest.to_lowercase();
-            if cap == "A" && matches!(rest_lower.as_str(), "nd" | "s" | "t" | "re" | "n" | "ll" | "ny" | "lthough" | "gain" | "nother" | "lready" | "lways") {
-                format!("{}{}", cap, rest)
-            } else if cap == "I" && matches!(rest_lower.as_str(), "t" | "s" | "f" | "n" | "ll" | "nto" | "ndeed" | "tself") {
-                format!("{}{}", cap, rest)
-            } else {
-                format!("{} {}", cap, rest)
-            }
-        } else {
-            format!("{}{}", cap, rest)
-        };
-        format!("{}{}", prefix, merged)
-    });
-
-    // Then, handle the all-caps splits
-    let text = get_all_caps_re().replace_all(&text, |caps: &Captures| {
-        let cap = caps.get(1).map_or("", |m| m.as_str());
-        let rest = caps.get(2).map_or("", |m| m.as_str());
-        
-        if cap == "A" || cap == "I" {
+/// Joins a detached capital to the rest of its word, unless "A"/"I" is a real word here.
+fn merge_capital(cap: &str, rest: &str) -> String {
+    if cap == "A" || cap == "I" {
+        let is_upper = rest.chars().any(|c| c.is_alphabetic()) && !rest.chars().any(|c| c.is_lowercase());
+        if is_upper {
             if cap == "A" && matches!(rest, "ND" | "S" | "T" | "RE" | "N" | "LL" | "NY") {
-                format!("{}{}", cap, rest)
-            } else if cap == "I" && matches!(rest, "T" | "S" | "F" | "N") {
-                format!("{}{}", cap, rest)
-            } else {
-                format!("{} {}", cap, rest)
+                return format!("{}{}", cap, rest);
             }
-        } else {
-            format!("{}{}", cap, rest)
+            if cap == "I" && matches!(rest, "T" | "S" | "F" | "N") {
+                return format!("{}{}", cap, rest);
+            }
+            return format!("{} {}", cap, rest);
         }
-    });
+        let rest_lower = rest.to_lowercase();
+        if cap == "A" && matches!(rest_lower.as_str(), "nd" | "s" | "t" | "re" | "n" | "ll" | "ny" | "lthough" | "gain" | "nother" | "lready" | "lways") {
+            return format!("{}{}", cap, rest);
+        }
+        if cap == "I" && matches!(rest_lower.as_str(), "t" | "s" | "f" | "n" | "ll" | "nto" | "ndeed" | "tself") {
+            return format!("{}{}", cap, rest);
+        }
+        return format!("{} {}", cap, rest);
+    }
+    format!("{}{}", cap, rest)
+}
 
-    text.into_owned()
+/// True when the text right before `pos` ends in a label word ("Class ", "Mr. ").
+fn preceded_by_label(text: &str, pos: usize) -> bool {
+    let before = text[..pos].trim_end_matches(|c| c == ' ' || c == '\t');
+    if before.len() == text[..pos].len() {
+        return false; // no whitespace between the label and the capital
+    }
+    let before = before.strip_suffix('.').unwrap_or(before);
+    let word_start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_alphabetic())
+        .last()
+        .map(|(i, _)| i);
+    match word_start {
+        Some(start) => LETTER_LABELS.contains(&before[start..].to_lowercase().as_str()),
+        None => false,
+    }
+}
+
+/// Re-joins a single capital letter that extraction detached from its word.
+///
+/// By default only drop-cap position is repaired (a lone capital opening a
+/// line). Merging everywhere corrupts ordinary prose ("Vitamin C is" ->
+/// "Vitamin Cis"), so that is reserved for `aggressive`, used for PDF text
+/// where kerning splits words mid-line. Never joins across a line break.
+fn fix_isolated_capitals(text: &str, aggressive: bool) -> String {
+    if !aggressive {
+        let text = get_dropcap_mixed_re().replace_all(text, |caps: &Captures| {
+            format!("{}{}", &caps[1], merge_capital(&caps[2], &caps[3]))
+        });
+        let text = get_dropcap_caps_re().replace_all(&text, |caps: &Captures| {
+            format!("{}{}", &caps[1], merge_capital(&caps[2], &caps[3]))
+        });
+        return text.into_owned();
+    }
+
+    let text = get_iso_cap_re().replace_all(text, |caps: &Captures| {
+        let cap = caps.get(2).unwrap();
+        if preceded_by_label(text, cap.start()) {
+            return caps[0].to_string();
+        }
+        format!("{}{}", &caps[1], merge_capital(cap.as_str(), &caps[3]))
+    });
+    let text = text.into_owned();
+
+    let merged = get_all_caps_re().replace_all(&text, |caps: &Captures| {
+        let cap = caps.get(1).unwrap();
+        if preceded_by_label(&text, cap.start()) {
+            return caps[0].to_string();
+        }
+        merge_capital(cap.as_str(), &caps[2])
+    });
+    merged.into_owned()
 }
 
 /// Removes footnote links, images, headings, collapses spaces, etc. (TextNormalizer class level).
@@ -145,7 +167,7 @@ pub fn clean_text_full(raw_md: &str, title: &str, is_pdf: bool) -> String {
     // Fix broken lines
     text = get_hyphen_re().replace_all(&text, "$1").into_owned();
     text = get_soft_wrap_re().replace_all(&text, "$1 $2").into_owned();
-    text = fix_isolated_capitals(&text);
+    text = fix_isolated_capitals(&text, is_pdf);
 
     // Smart quote translations & noise stripping
     text = strip_noise(&text);
@@ -211,7 +233,11 @@ fn remove_duplicate_title(title: &str, text: &str) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut cleaned = Vec::with_capacity(lines.len());
     let stripped_title = title.trim().to_lowercase();
-    
+    if stripped_title.is_empty() {
+        // An empty title would "match" a blank line and glue paragraphs together.
+        return text.to_string();
+    }
+
     let mut skipped = false;
     for (i, line) in lines.iter().enumerate() {
         let bare = re_md_heading.replace(line, "").into_owned();
@@ -228,15 +254,21 @@ fn remove_duplicate_title(title: &str, text: &str) -> String {
 fn strip_noise(text: &str) -> String {
     let re_ocr_prefix = Regex::new(r"OCR_IMG_TEXT:\s*").unwrap();
     let re_img_tag = Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap();
-    let re_hr = Regex::new(r"(?m)^\s*(-{3,}|\*{3,}|_{3,})\s*$").unwrap();
+    // Horizontal rules and scene breaks, contiguous or spaced: ---, ***, * * *
+    let re_hr = Regex::new(r"(?m)^[ \t]*(?:[-*_~#\u{2022}\u{00b7}][ \t]*){3,}$").unwrap();
+    let re_heading = Regex::new(r"(?m)^[ \t]*#{1,6}[ \t]+").unwrap();
+    let re_html_comment = Regex::new(r"(?s)<!--.*?-->").unwrap();
     let re_bold_em = Regex::new(r"\*{1,2}([^*]+?)\*{1,2}|_{1,2}([^_]+?)_{1,2}").unwrap();
     let re_footnote = Regex::new(r"\[\[\d+\]\]\([^)]+\)|\[\d+\]\([^)]+\)").unwrap();
     let re_multi_bl = Regex::new(r"\n{3,}").unwrap();
 
     let text = re_ocr_prefix.replace_all(text, "");
     let text = re_img_tag.replace_all(&text, "");
+    let text = re_html_comment.replace_all(&text, "");
     let text = re_hr.replace_all(&text, "\n\n");
-    
+    let text = re_heading.replace_all(&text, "");
+    let text = text.replace("\\_", " ");
+
     // Replacing **bold** and _italic_ with the inner contents group 1 or 2
     let text = re_bold_em.replace_all(&text, |caps: &Captures| {
         if let Some(m) = caps.get(1) {
@@ -249,6 +281,20 @@ fn strip_noise(text: &str) -> String {
     });
 
     let text = re_footnote.replace_all(&text, "");
+
+    // Docling escapes these when exporting markdown; "&amp;" must come last.
+    let mut text = text.into_owned();
+    for (entity, ch) in [
+        ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&#x27;", "'"),
+        ("&#39;", "'"), ("&apos;", "'"), ("&nbsp;", " "), ("&amp;", "&"),
+    ] {
+        text = text.replace(entity, ch);
+    }
+
+    // A dash that opens a line of dialogue (French, Russian, Spanish ...)
+    // is not a pause inside a sentence: drop it instead of reading ", ".
+    let re_dialogue_dash = Regex::new("(?m)(^[ \\t]*|[.!?\u{2026}\u{00bb}\"\u{201d},;:][ \\t\u{00a0}]+)\u{2014}[ \\t\u{00a0}]*").unwrap();
+    let text = re_dialogue_dash.replace_all(&text, "$1").into_owned();
 
     // Smart quotes & other characters mapping
     let mut cleaned = String::with_capacity(text.len());

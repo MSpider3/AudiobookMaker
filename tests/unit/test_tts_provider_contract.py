@@ -78,16 +78,16 @@ class TestTTSProviderContract:
 
     def test_get_tts_provider_all_valid_names(self, config):
         from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
-        from audiobook_factory.tts_providers.vibevoice_provider import VibeVoiceTTSProvider
         from audiobook_factory.tts_providers.f5tts_provider import F5TTSProvider
 
         for name in ("qwen", "qwen3", "qwen3-tts", ""):
             p = get_tts_provider(name, config)
             assert isinstance(p, QwenTTSProvider)
 
+        # VibeVoice was removed: it could never synthesize.
         for name in ("vibevoice", "vibe-voice", "vibevoice-1.5b"):
-            p = get_tts_provider(name, config)
-            assert isinstance(p, VibeVoiceTTSProvider)
+            with pytest.raises(ValueError, match="Unknown TTS provider"):
+                get_tts_provider(name, config)
 
         for name in ("f5tts", "f5-tts", "f5_tts"):
             p = get_tts_provider(name, config)
@@ -102,14 +102,13 @@ class TestTTSProviderContract:
             with pytest.raises(RuntimeError, match="pip install f5-tts"):
                 p.ensure_ready()
 
-    def test_vibevoice_unapproved_model_raises(self):
-        bad_cfg = AudiobookConfig(
-            tts_provider_name="vibevoice",
-            tts_model_name="evil-repo/unapproved-vibevoice",
-        )
-        p = get_tts_provider("vibevoice", bad_cfg)
-        with pytest.raises(ValueError, match="Refusing to load unapproved VibeVoice model"):
-            p.ensure_ready()
+    def test_retired_provider_in_saved_config_falls_back_to_default(self):
+        cfg = AudiobookConfig.from_dict({
+            "tts_provider_name": "vibevoice",
+            "tts_model_name": "bezzam/VibeVoice-1.5B-hf",
+        })
+        assert cfg.tts_provider_name == "qwen"
+        assert cfg.tts_model_name == AudiobookConfig().tts_model_name
 
     def test_f5tts_temp_file_cleaned_up(self, config, monkeypatch):
         import numpy as np
@@ -150,7 +149,7 @@ class TestTTSProviderContract:
         for evicted_path in created_paths[:4]:
             assert not os.path.exists(evicted_path), f"Evicted voice ref {evicted_path} should be deleted"
 
-    def test_qwen_asr_pipeline_is_cached(self, config, monkeypatch):
+    def test_qwen_asr_runs_once_per_reference_and_is_released(self, config, monkeypatch):
         pytest.importorskip("transformers")
         from audiobook_factory.tts_providers.qwen_provider import QwenTTSProvider
         p = QwenTTSProvider(config, device="cpu")
@@ -159,16 +158,23 @@ class TestTTSProviderContract:
 
         def fake_pipeline(*args, **kwargs):
             pipeline_calls.append(kwargs)
-            return lambda path: {"text": "Transcribed speech"}
+            return lambda path, **call_kwargs: {"text": "Transcribed speech"}
 
         monkeypatch.setattr("audiobook_factory.tts_providers.qwen_provider.pipeline", fake_pipeline)
+        monkeypatch.setattr("audiobook_factory.tts_providers.qwen_provider._SHARED_TRANSCRIPTS", {})
 
         t1 = p._get_voice_transcript("/nonexistent/fake_ref_1.wav")
         assert t1 == "Transcribed speech"
         assert len(pipeline_calls) == 1
+        # The ASR model is unloaded once the text is known, so it does not
+        # hold VRAM next to the TTS model for the rest of the book.
+        assert p._asr_pipe is None
 
-        # Second call with another path uses the already-instantiated pipeline
-        t2 = p._get_voice_transcript("/nonexistent/fake_ref_2.wav")
-        assert t2 == "Transcribed speech"
-        assert len(pipeline_calls) == 1, "Pipeline should be cached at instance level, not recreated"
+        # Later batches reuse the transcript: the ASR model is not loaded again,
+        # neither by this instance nor by the one on the other GPU.
+        for _ in range(3):
+            assert p._get_voice_transcript("/nonexistent/fake_ref_1.wav") == "Transcribed speech"
+        other = QwenTTSProvider(config, device="cpu")
+        assert other._get_voice_transcript("/nonexistent/fake_ref_1.wav") == "Transcribed speech"
+        assert len(pipeline_calls) == 1, "ASR must run once per reference clip, not per batch or per GPU"
 
