@@ -38,13 +38,13 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 - **JSON-First UI Workflow** — Progress file upload placed at the very top of the app interface for immediate session restore before touching book uploads.
 - **AI text extraction** — 5-phase pipeline (Docling + OCR + ML classification + heuristic normalization) produces clean, TTS-ready text.
 - **EPUB image OCR** — EasyOCR reads text embedded in images inside EPUBs.
-- **Voice Design & Cloning** — Clone from a reference WAV or prompt an entire new voice using Qwen3-TTS. Supports **8 languages** (English, Chinese, Japanese, Korean, French, Spanish, Italian, German).
+- **Voice Design & Cloning** — Clone from a reference WAV or prompt an entire new voice using Qwen3-TTS. Qwen3-TTS speaks **10 languages** (English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian); other engines add more, including Hindi.
 - **Voice preprocessing** — 7-step audio cleaning pipeline: noise reduction, noise gate, high-pass filter, silence removal, normalization, formant shifting, resampling.
 - **Voice test tab** — Type any sentence and preview the cloned voice before generating. Includes language-labeled premium timbres for optimized results.
 - **Preview mode** — See chapter list with character + word counts before committing to a full audiobook run.
 - **Pronunciation fixes** — Upload a `.txt` file with `search==replace` pairs to fix how the TTS pronounces specific words.
 - **True Multi-GPU Parallel Utilization (`GPUPoolManager`)** — Automatically detects all available GPUs (e.g. Kaggle T4 × 2) and assigns dedicated model instances per GPU. Enables true simultaneous work-stealing parallel execution across GPUs (with VRAM safety guards) for up to 2× speedups without OOMs.
-- **Fast Diagnostic Pre-Run Verification** — Included `colab_prerun_check.py` and `kaggle_prerun_check.py` scripts run in <5 seconds to verify GPU allocation, VRAM limits, Rust compilation status, and GPU pool dispatch before loading heavy TTS model weights.
+- **Fast Diagnostic Pre-Run Verification** — Included `scripts/colab_prerun_check.py` and `scripts/kaggle_prerun_check.py` run in <5 seconds to verify GPU allocation, VRAM limits, Rust compilation status, and GPU pool dispatch before loading heavy TTS model weights.
 - **INT8 Quantization Support (`--quantization int8`)** — 8-bit model quantization via `bitsandbytes` reduces VRAM consumption by ~50% for memory-constrained environments.
 - **Cover Image Embedding CLI Tool (`--embed-cover-only`)** — Instantly inject cover image artwork and ID3 tags into existing output audio files without running TTS generation.
 - **Multi-Format Subtitle & Timed Lyrics Export** — Generates `.lrc` timed lyrics, `.srt` subtitles, and `.vtt` WebVTT files for sync with Audiobookshelf and media players.
@@ -55,8 +55,9 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 - **`torch.compile()` Speed Optimization** — Enable kernel fusion rendering to compile Qwen3 TTS model via the GPU compiler, speeding up audio generation throughput on RTX GPUs.
 - **Smart Attention Backend** — Automatically detects whether `flash_attn` is installed. Uses **Flash Attention 2** if available, otherwise gracefully falls back to PyTorch's built-in **SDPA** — no crashes on T4 or other GPUs that don't have `flash_attn`.
 - **Re-generate missing files control** — New checkbox on the Generate tab lets you decide whether chapters marked "completed" but missing audio should be re-generated or silently skipped.
-- **Multi-GPU by default** — every GPU pulls batches from one shared queue, so two T4s share a chapter and a failing GPU hands its work to the other.
-- **Google Colab & Kaggle support** — Full end-to-end pipeline works directly in Google Colab (`AudiobookMaker_Colab.ipynb`) and Kaggle (`AudiobookMaker_Kaggle.ipynb`) with public shareable Gradio links.
+- **Multi-GPU by default** — every GPU pulls batches from one shared queue, so two T4s share a chapter and a failing GPU hands its work to the other. An optional `auto` mode gives each chapter as many GPUs as it has batches to fill: short chapters run one per GPU, long ones are shared.
+- **Books in other languages** — chunk length follows the script (a Chinese character is a whole syllable, so Chinese, Japanese and Korean chunks are shorter in characters), and sentence breaks handle CJK quotes, French guillemets, dialogue dashes and the Devanagari danda.
+- **Google Colab & Kaggle support** — Full end-to-end pipeline works directly in Google Colab (`notebooks/AudiobookMaker_Colab.ipynb`) and Kaggle (`notebooks/AudiobookMaker_Kaggle.ipynb`) with public shareable Gradio links.
 
 ---
 
@@ -88,42 +89,51 @@ AudiobookMaker/
 ├── app.py                                ← Gradio UI entry point
 ├── cli.py                                ← Headless CLI entry point
 ├── start_api.py                          ← FastAPI orchestration server launcher
-├── colab_prerun_check.py                 ← Colab diagnostic verification script (<5s check)
-├── kaggle_prerun_check.py                ← Kaggle diagnostic verification script (<5s check)
-├── requirements.txt
-├── AudiobookMaker_Colab.ipynb            ← Google Colab notebook (full pipeline, shareable link)
-├── AudiobookMaker_Kaggle.ipynb           ← Kaggle notebook (dual-GPU T4x2 support, shareable link)
-├── audiobook_rust/                       ← Rust PyO3 extension for SIMD sentence splitting & 5.5x faster mastering
+├── requirements.txt                      ← Core dependencies + Qwen3-TTS
+├── requirements/                         ← One file per optional engine (tts-<engine>.txt)
+├── notebooks/
+│   ├── AudiobookMaker_Colab.ipynb        ← Google Colab notebook (full pipeline, shareable link)
+│   └── AudiobookMaker_Kaggle.ipynb       ← Kaggle notebook (dual-GPU T4x2 support, shareable link)
+├── scripts/
+│   ├── colab_prerun_check.py             ← Colab diagnostic check (<5s)
+│   ├── kaggle_prerun_check.py            ← Kaggle diagnostic check (<5s)
+│   └── lrc_to_srt_converter.py           ← Convert .lrc files to .srt
+├── audiobook_rust/                       ← Rust PyO3 extension: sentence splitting, text cleaning, mastering
 ├── docs/
 │   └── preview/                          ← UI screenshots
 ├── api/
 │   ├── server.py                         ← FastAPI server (task queue, WebSocket progress streaming)
 │   └── worker.py                         ← Background task consumer (concurrent GPU queue)
+├── tests/                                ← pytest suite (mock engine; no GPU needed)
 └── audiobook_factory/
     ├── preflight.py                      ← Automated pre-flight environment validator (<30s check)
-    ├── chapter_pipeline.py               ← 3-stage overlapped pipeline & chunk-level resume manager
-    ├── extractor_engine.py               ← Core AI text extraction engine
+    ├── pipeline.py                       ← Audiobook generation orchestrator
+    │                                        (AudiobookConfig, CancelToken, run_pipeline)
+    ├── chapter_pipeline.py               ← 3-stage per-chapter pipeline & chunk-level resume
+    ├── chunk_planner.py                  ← Cuts a chapter into TTS chunks (sentence packing, pauses, script-aware length)
+    ├── chunk_verifier.py                 ← Checks each chunk (duration, optional Whisper transcript) and triggers re-synthesis
+    ├── speech_text.py                    ← Rewrites numerals, dates, currency for narration (English)
+    ├── loudness.py                       ← Loudness normalisation with a look-ahead limiter (Python twin of the Rust code)
+    ├── extractor_engine.py               ← Core text extraction engine
     │                                        (DocumentIngestor, MLClassifier, TextNormalizer)
     ├── text_extractor.py                 ← Public API: scan() + extract()
-    ├── voice_preprocessor.py             ← 7-step voice audio cleaning pipeline
-    ├── pipeline.py                       ← Thread-safe audiobook generation orchestrator
-    │                                        (AudiobookConfig, CancelToken, run_pipeline)
-    ├── gpu_pool.py                       ← Provider-agnostic GPU device pool & manager (GPUDetector, ProviderPool, GPUPoolManager)
+    ├── voice_preprocessor.py             ← Reference-voice cleaning pipeline
+    ├── gpu_pool.py                       ← GPU detection, provider pool, device dispatch
     ├── filename_sanitizer.py             ← Cross-platform, Audiobookshelf-compatible filenames
-    ├── text_processing.py                ← Sentence splitting + NLTK auto-download + normalization
+    ├── text_processing.py                ← Sentence splitting + normalisation (Rust or NLTK)
     ├── ffmpeg_utils.py                   ← FFmpeg encoding helpers
-    ├── progress_io.py                    ← Thread-safe atomic progress JSON I/O layer & TOCTOU lock manager
+    ├── progress_io.py                    ← Thread-safe atomic progress JSON I/O
     ├── utils.py                          ← Shared utilities (LRC timestamping, SRT formatting)
-    └── tts_providers/                    ← Modular TTS provider abstraction
-        ├── base_tts_provider.py          ← BaseTTSProvider ABC + get_tts_provider() factory
-        ├── qwen_provider.py              ← QwenTTSProvider (per-device binding, Flash Attention 2 / SDPA auto-detect)
+    └── tts_providers/                    ← One module per TTS engine
+        ├── base_tts_provider.py          ← Provider contract + get_tts_provider() factory
         ├── registry.py                   ← Which engines exist (lazy imports)
+        ├── qwen_provider.py              ← Qwen3-TTS (default)
         ├── indextts_provider.py          ← IndexTTS-2.5 / IndexTTS-2
         ├── moss_provider.py              ← MOSS-TTS
         ├── omnivoice_provider.py         ← OmniVoice
         ├── fish_provider.py              ← Fish Audio S2 Pro
         ├── higgs_provider.py             ← Higgs Audio v3
-        └── f5tts_provider.py             ← F5TTSProvider (f5_tts zero-shot voice cloning)
+        └── f5tts_provider.py             ← F5-TTS
 ```
 
 ---
@@ -150,9 +160,24 @@ pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | f
 
 `requirements/tts-<engine>.txt` lists any second step an engine needs. Read the licence of an engine before publishing audio made with it: the non-commercial ones do not allow selling the result.
 
-### Testing a branch on Kaggle
+### Measured on Kaggle (2 × Tesla T4)
 
-`AudiobookMaker_Kaggle_Test.ipynb` clones a branch, runs the unit suite, extracts every fixture book, and synthesizes a test passage with every engine on both GPUs — each in its own environment — measuring speed, VRAM, loudness and word accuracy. It also measures the two-GPU speed-up, narrates a whole twenty-page book, speaks a passage in French, Russian, Chinese, Japanese, Korean and Hindi, scores how close each cloned voice is to the narrator clip, and generates a chapter through the API server and through the web UI. The long books (`tests/kaggle/assets/books/long_book_<code>.epub`, one per language) are original text written for these tests. A full run takes five to six hours; every block has a switch in the settings cell. It writes `abm_test_results.zip` with a report, logs and audio samples. Regenerate it for another branch with `python tests/kaggle/generate_test_notebook.py --branch <name>`.
+Numbers from test runs of this code on two T4 GPUs with one 22-second English narrator clip. Speed is audio produced per second of synthesis; above 1× is faster than real time.
+
+| Engine | Speed on 2 GPUs | Gain from the 2nd GPU | English word errors | VRAM per GPU |
+|---|---|---|---|---|
+| Qwen3-TTS 1.7B | 3.3× (long chapters) | 1.6× | 3% | 6–13 GB with batch size |
+| Higgs Audio v3 | 3.1× | 1.6× | 4% | 9.4 GB |
+| OmniVoice | 0.6× | 1.95× | 3% | 4–5 GB |
+| IndexTTS-2.5 | 0.6× | 1.85× | 4% | 5.7 GB |
+| MOSS-TTS | 0.6× | 1.85× | 3% | 12.6 GB |
+| Fish Audio S2 Pro | 0.5× | 1.45× | 4% | 11.4 GB |
+
+- **A whole 20-page book** (ten chapters, 32 minutes of audio) with Qwen3-TTS took 19 minutes, with 2% word errors over the whole book and no out-of-memory retries.
+- **Short chapters and two GPUs.** A Qwen batch takes about the same time whether it holds 7 chunks or 17, so a chapter that fits in one batch is no faster on two GPUs. For books with short chapters set **Parallelism** to `auto` (or `chapters`): short chapters then run one per GPU. `auto` was added after these runs and has only been exercised with simulated GPUs.
+- **Other languages with an English narrator clip (Qwen3-TTS).** Russian and Korean read well (5–6% errors). French, Japanese and Chinese were intelligible but accented, and digits were sometimes read in English. A narrator clip in the book's own language is the first thing to try.
+- **Hindi.** By ear, Higgs Audio v3 was the only engine with correct pronunciation and no dropped words; OmniVoice, MOSS-TTS and Fish were not good enough. Qwen3-TTS and IndexTTS do not support Hindi.
+- **Voice similarity.** A speaker-verification model scored English clones 0.99 against the narrator clip (two unrelated voices scored 0.63 and 0.83); clones in other languages scored 0.92–0.97.
 
 ---
 
@@ -224,6 +249,17 @@ For faster generation or execution in cloud environments (Google Colab / Kaggle 
 ### Quick CLI Usage
 
 ```bash
+# Straight from a book file, no JSON needed:
+python cli.py --book /path/to/book.epub --voice-file /path/to/narrator.wav \
+    --voice-transcript-file /path/to/narrator.txt \
+    --provider qwen --language English --output-format m4b --single-file
+
+# See the engines, their licences and options:
+python cli.py --list-providers
+
+# Check what a run would do without generating anything:
+python cli.py --book /path/to/book.epub --voice-file narrator.wav --dry-run
+
 # Basic run with progress JSON (uses cached chapter text):
 python cli.py audiobook_output/MyBook/generation_progress.json
 
@@ -254,9 +290,23 @@ python cli.py generation_progress.json --force-reprocess
 
 | Flag | Description |
 |------|-------------|
-| `config_json` | Path to `generation_progress.json` progress file (required). |
-| `--book-path` | Override path to source book file (`.epub`, `.pdf`, etc.). |
-| `--voice-file` | Override narrator voice reference WAV file. |
+| `config_json` | Path to `generation_progress.json` (exported by the UI). Optional when `--book` is given. |
+| `--book` | Generate straight from a book file (EPUB, PDF, TXT, DOCX, ODT, MOBI). |
+| `--book-path` | Book file to use with a JSON (for the cover, or when the JSON has no chapter text). |
+| `--chapters` | Only run these chapter numbers, e.g. `1-12` or `1,3,5`. |
+| `--redo` | Regenerate these chapters even if they are finished. |
+| `--provider` / `--tts-model-name` / `--tts-option KEY=VALUE` | Engine, model and engine-specific options (see `--list-providers`). |
+| `--language` | Language of the text, e.g. `English`, `Hindi`. |
+| `--voice-file` | Narrator reference clip to clone. |
+| `--voice-transcript` / `--voice-transcript-file` | What is said in the reference clip, as text or as a file. |
+| `--voice-preset` | Saved voice preset of the engine, used instead of a clip. |
+| `--single-file` | Combine all chapters into one file with chapter markers. |
+| `--speed`, `--pause`, `--para-pause`, `--max-len` | Narration pacing and chunk length. |
+| `--verify` | Check each chunk: `off`, `duration` (default) or `asr` (Whisper transcript). |
+| `--gpu-count`, `--batch-size` | GPUs to use and chunks per batch (0 = automatic). |
+| `--parallel-mode` | `chunks` (all GPUs share one chapter, default), `chapters` (one chapter per GPU) or `auto` (short chapters one per GPU, long ones shared). |
+| `--dry-run` / `--list-providers` | Print the resolved configuration / the available engines, then exit. |
+| `--local` | Run in this process even when the API server is up. |
 | `--output-dir` | Override destination output directory. |
 | `--output-format` | Override audio output format (`mp3`, `flac`, `wav`, `m4b`). |
 | `--worker-count` | Override parallel worker count. |
@@ -282,23 +332,23 @@ You can run AudiobookMaker entirely in cloud notebooks — no local GPU or insta
 
 ### 🟡 Google Colab
 
-1. **Open** [`AudiobookMaker_Colab.ipynb`](AudiobookMaker_Colab.ipynb) in Google Colab.
+1. **Open** [`notebooks/AudiobookMaker_Colab.ipynb`](notebooks/AudiobookMaker_Colab.ipynb) in Google Colab.
 2. **Enable a GPU runtime:** Go to **Runtime → Change runtime type → T4 GPU** → Save.
 3. **Run pre-run diagnostics (optional but recommended):**
    ```python
-   !python colab_prerun_check.py
+   !python scripts/colab_prerun_check.py
    ```
 4. **Run all notebook cells in order.** The notebook will automatically install dependencies, compile the Rust PyO3 extension, launch the background FastAPI server, and provide a public `gradio.live` link.
 
 ### 🟦 Kaggle Notebooks (Dual GPU T4x2 Support)
 
-1. **Upload or open** [`AudiobookMaker_Kaggle.ipynb`](AudiobookMaker_Kaggle.ipynb) in Kaggle.
+1. **Upload or open** [`notebooks/AudiobookMaker_Kaggle.ipynb`](notebooks/AudiobookMaker_Kaggle.ipynb) in Kaggle.
 2. **Configure Session Options (Right Sidebar):**
    - **Accelerator:** Set to **GPU T4x2** (enables dual-GPU parallel synthesis).
    - **Internet:** Toggle **ON** (required to clone repo and download models).
 3. **Run pre-run diagnostics:**
    ```python
-   !python kaggle_prerun_check.py
+   !python scripts/kaggle_prerun_check.py
    ```
    *Verifies both T4 GPUs, VRAM metrics, PyO3 bindings, and multi-GPU pool dispatch in <5 seconds.*
 4. **Run all notebook cells** to start the FastAPI server and launch the Gradio Web UI link.
@@ -307,7 +357,8 @@ You can run AudiobookMaker entirely in cloud notebooks — no local GPU or insta
 
 | Feature / Behavior | Detail |
 |--------------------|--------|
-| **Multi-GPU Parallelism** | Kaggle T4x2 automatically assigns dedicated model instances per GPU for up to 2× speedups. |
+| **Multi-GPU Parallelism** | Kaggle T4x2 assigns one model instance per GPU. Long chapters gain about 1.6× from the second GPU; for books with short chapters choose Parallelism `auto`. |
+| **Other engines** | Each optional engine needs its own `transformers` version, so install one per session (the notebooks have a cell for it). |
 | **Flash Attention** | T4 GPUs don't have `flash_attn` pre-installed. The app auto-detects this and uses PyTorch SDPA — generation still works flawlessly. |
 | **Rust Acceleration** | Pre-run check compiles `audiobook_rust` via `maturin`. If compilation fails, pure-Python fallbacks activate automatically. |
 | **Chunk-Level Resume** | Progress and chunk audio (`.temp_chunks/`) are cached to disk so you can resume interrupted cloud sessions without losing progress. |
@@ -351,7 +402,8 @@ Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as nar
 ### 4. ⚙️ Advanced Tab
 - **Max chunk length** — TTS input character limit per sentence chunk (default 399).
 - **Parallel chapter workers** — Process 1–8 workers simultaneously. Automatically defaults to `min(gpu_count * 4, 8)` based on detected GPUs. Thanks to our **Multi-GPU Pool** architecture (`GPUPoolManager`), workers dynamically stream work across all available GPUs in parallel with optimal VRAM management.
-- **TTS Provider** — Currently: `qwen` (Qwen3-TTS). More providers will be added in future releases.
+- **TTS Provider** — Qwen3-TTS by default; IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish Audio S2 Pro, Higgs Audio v3 and F5-TTS once installed (see [TTS engines](#-tts-engines)).
+- **Parallelism** — How several GPUs are used. `chunks`: every GPU shares one chapter (default). `chapters`: one chapter per GPU. `auto`: short chapters one per GPU, long ones shared.
 - **EasyOCR** — Enable to extract text from images embedded inside EPUB files.
 - **Force reprocess** — Re-extract text even if cached output exists.
 - **Export chapter text / Subtitles** — Option to write `.txt` chapter text, `.lrc` timed lyrics, `.srt` subtitles, and `.vtt` WebVTT subtitles alongside audio.
@@ -467,6 +519,17 @@ Modern versions of Gradio implement sandbox security checks that restrict browse
 
 ## 📝 Recent Changes
 
+### 🎙️ Six engines, natural pacing, verified chunks, AGPL (unreleased)
+- **Engines**: IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish Audio S2 Pro and Higgs Audio v3 join Qwen3-TTS behind one provider contract; Qwen3-TTS gained preset speakers, designed voices and saved voice presets. VibeVoice was removed.
+- **Narration**: sentences of a paragraph are spoken together, paragraphs get their own pause, numerals and dates are rewritten for speech, and every chunk is checked (and re-synthesized if it is cut short, silent or runs away).
+- **Audio**: chapters now reach the loudness target through a look-ahead limiter; single-file M4B/MP3 with chapter markers; speed control for every engine.
+- **Multi-GPU**: one shared queue per chapter, even sharing on short chapters, and an optional `auto` mode that hands short chapters out one per GPU.
+- **Books**: chapter detection for TXT, DOCX, ODT and PDF, real MOBI support, and correct chunking and sentence breaks for Chinese, Japanese, Korean, Hindi, French and Russian.
+- **Tools**: the CLI runs straight from a book file (`--book`), the API lists engines and serves result files, and the repository layout was tidied (`notebooks/`, `scripts/`).
+- **Licence**: relicensed from Apache-2.0 to AGPL-3.0-or-later.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list.
+
 ### 🚀 Hardening, Fail-Safe Retries & New TTS Providers (v1.3)
 - **Fail-Safe Chapter Retry System (`pipeline.py`, `progress_io.py`)**: Automatic chapter retries (`max_chapter_retries: int = 2`) with CUDA cache clearing (`torch.cuda.empty_cache()` and `gc.collect()`), exponential backoff delay, retry persistence (`update_chapter_retry`), and end-of-run retry pass (`retry_failed_at_end`).
 - **Pluggable Provider Architecture & New TTS Providers**: Native support for **VibeVoice-1.5B** ([`bezzam/VibeVoice-1.5B-hf`](https://huggingface.co/bezzam/VibeVoice-1.5B-hf)) and **F5-TTS** ([`SWAVE-LAB/F5-TTS`](https://github.com/SWAVE-LAB/F5-TTS)) zero-shot voice cloning alongside Qwen3-TTS.
@@ -490,8 +553,8 @@ Modern versions of Gradio implement sandbox security checks that restrict browse
 - **Transparent Fallback**: Graceful fallback to pure-Python implementations if Rust compilation is omitted.
 
 ### 🚀 Kaggle Dual-GPU Support & Pre-Run Diagnostics
-- **Kaggle Notebook (`AudiobookMaker_Kaggle.ipynb`)**: Native Kaggle setup supporting GPU T4x2 dual-GPU parallel execution.
-- **Fast Diagnostic Checkers**: Added `colab_prerun_check.py` and `kaggle_prerun_check.py` to test hardware, PyO3 bindings, and GPU pool dispatch in under 5 seconds before loading model weights.
+- **Kaggle Notebook (`notebooks/AudiobookMaker_Kaggle.ipynb`)**: Native Kaggle setup supporting GPU T4x2 dual-GPU parallel execution.
+- **Fast Diagnostic Checkers**: Added `scripts/colab_prerun_check.py` and `scripts/kaggle_prerun_check.py` to test hardware, PyO3 bindings, and GPU pool dispatch in under 5 seconds before loading model weights.
 
 ### 🎨 CLI Cover Art Injector & INT8 Quantization
 - **Cover Embedding Tool**: `--embed-cover-only` flag allows instant injection of cover art and ID3 metadata into existing audio files without triggering model load.

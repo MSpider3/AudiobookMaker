@@ -130,7 +130,7 @@ _SAMPLE_RATES: tuple[int, ...] = (22050, 24000, 44100, 48000)
 _BITRATES: tuple[int, ...] = (64, 96, 128, 192, 256, 320)
 _CHANNELS: tuple[int, ...] = (1, 2)
 _QUANTIZATIONS: tuple[str, ...] = ("none", "int8")
-_PARALLEL_MODES: tuple[str, ...] = ("chunks", "chapters")
+_PARALLEL_MODES: tuple[str, ...] = ("chunks", "chapters", "auto")
 _VERIFY_CHOICES: tuple[tuple[str, str], ...] = (
     ("Off", "off"),
     ("Duration check (free)", "duration"),
@@ -4139,7 +4139,8 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     C["parallel_mode"] = gr.Dropdown(
                         label="Parallelism", choices=list(_PARALLEL_MODES), value=base.parallel_mode,
-                        info="chunks: batch the chunks of one chapter (recommended). chapters: several chapters at once.",
+                        info="chunks: every GPU shares one chapter (default). chapters: one chapter per GPU. "
+                             "auto: short chapters one per GPU, long ones shared (new, for books with short chapters).",
                     )
                     C["quantization"] = gr.Radio(
                         label="Model quantization", choices=list(_QUANTIZATIONS), value=base.quantization,

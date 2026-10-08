@@ -2,7 +2,7 @@
 generate_test_documents.py
 ===========================
 Generates the deterministic synthetic book fixtures used by the extraction
-tests and by the Kaggle test notebook:
+tests:
 
 - ``dummy_book.{epub,pdf,docx,odt,txt,mobi}`` — the same six-chapter book in
   every supported format, with front and back matter that must not be narrated;

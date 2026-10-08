@@ -117,6 +117,10 @@ _ETA_MIN_SHARE: float = 0.02
 _SUMMARY_MAX_FLAGGED_PER_CHAPTER: int = 5
 
 _VALID_VERIFY_MODES: tuple[str, ...] = ("off", "duration", "asr")
+# chunks: one chapter at a time, every GPU shares its chunks (default).
+# chapters: one chapter per GPU.
+# auto: each chapter gets as many GPUs as it has batches to fill.
+_VALID_PARALLEL_MODES: tuple[str, ...] = ("chunks", "chapters", "auto")
 
 # A transcript this short may be a file path typed where the words belong.
 _MAX_PATH_LIKE_TRANSCRIPT_CHARS: int = 1024
@@ -199,6 +203,10 @@ def _get_chapter_parallelism(
     multiple chapters run simultaneously with each chapter pinned to
     one GPU. Each chapter uses only its assigned GPU.
 
+    When parallel_mode="auto": returns pool.device_count as the upper
+    bound; how many GPUs each chapter really gets is decided per chapter
+    by ``_gpus_wanted`` (see ``_run_chapters_auto``).
+
     Args:
         pool: The active ProviderPool with device count information.
         config: AudiobookConfig controlling parallelism mode.
@@ -219,6 +227,14 @@ def _get_chapter_parallelism(
         logger.info(
             "[pipeline] Chapter-mode: %d chapters simultaneously, "
             "one GPU per chapter.",
+            pool.device_count,
+        )
+        return pool.device_count
+
+    if parallel_mode == "auto":
+        logger.info(
+            "[pipeline] Auto-mode: up to %d chapters simultaneously; each "
+            "chapter gets as many GPUs as it has batches to fill.",
             pool.device_count,
         )
         return pool.device_count
@@ -277,7 +293,7 @@ class AudiobookConfig:
 
     # ── Parallelism & Hardware Optimization ───────────────────────────────────
     worker_count:        int   = 1       # chapters/chunks in parallel
-    parallel_mode:       str   = "chunks" # "chapters" | "chunks"
+    parallel_mode:       str   = "chunks" # "chunks" | "chapters" | "auto"
     gpu_count:           int   = 0       # 0 = auto-detect at runtime
     vram_headroom_gb:    float = 2.0     # GB reserved VRAM headroom for dynamic batching
 
@@ -425,10 +441,10 @@ def _validate_config(config: AudiobookConfig) -> None:
             f"Invalid verify_chunks '{config.verify_chunks}'. "
             f"Supported options: {list(_VALID_VERIFY_MODES)}"
         )
-    if config.parallel_mode not in ("chunks", "chapters"):
+    if config.parallel_mode not in _VALID_PARALLEL_MODES:
         raise ValueError(
             f"Invalid parallel_mode '{config.parallel_mode}'. "
-            f"Supported options: ['chapters', 'chunks']"
+            f"Supported options: {sorted(_VALID_PARALLEL_MODES)}"
         )
 
 
@@ -508,6 +524,126 @@ def preview_chapters(
 # ══════════════════════════════════════════════════════════════════════════════
 # Main orchestrator
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _chapter_batch_size(pool: Any, config: AudiobookConfig) -> int:
+    """How many chunks one GPU synthesizes per provider call, for scheduling.
+
+    An engine that speaks one chunk at a time counts as batch size 1: every
+    extra GPU helps it from the second chunk on.
+    """
+    explicit = int(getattr(config, "batch_size", 0) or 0)
+    if explicit > 0:
+        return explicit
+    try:
+        from audiobook_factory.tts_providers import provider_info
+
+        if not provider_info(config.tts_provider_name).supports_batch:
+            return 1
+    except Exception as exc:
+        logger.debug("Could not read provider info for scheduling: %s", exc)
+    from audiobook_factory.gpu_pool import GPUDetector
+
+    sizes = [
+        GPUDetector.suggest_batch_size(device, config.max_len, getattr(config, "vram_headroom_gb", 2.0))
+        for device in getattr(pool, "devices", [])
+    ]
+    return max(1, min(sizes)) if sizes else 1
+
+
+def _gpus_wanted(chapter: ExtractedChapter, config: AudiobookConfig, batch_size: int, device_count: int) -> int:
+    """How many GPUs a chapter can keep busy.
+
+    A batch takes about the same time whatever its size, so a chapter that
+    fits in one batch is no faster on two GPUs than on one; it is better to
+    give the second GPU another chapter. A chapter of several batches is
+    shared, one GPU per batch up to the number of GPUs.
+    """
+    from audiobook_factory.chunk_planner import plan_chunks
+
+    try:
+        chunks = len(plan_chunks(
+            chapter.text, getattr(chapter, "sentences", None), config.max_len,
+            config.pause, getattr(config, "para_pause", config.pause),
+            pack_sentences=getattr(config, "pack_sentences", True),
+        ))
+    except Exception as exc:
+        logger.debug("Could not count chunks of %r for scheduling: %s", chapter.title, exc)
+        return device_count
+    return max(1, min(device_count, -(-chunks // max(1, batch_size))))
+
+
+def _run_chapters_auto(
+    tasks: list[tuple[int, ExtractedChapter]],
+    devices: list[str],
+    wanted: dict[int, int],
+    process: Callable[[tuple[int, ExtractedChapter], Any], Any],
+    cancel: CancelToken,
+    log: Callable[[str], None],
+) -> None:
+    """Runs chapters with ``parallel_mode="auto"``.
+
+    Free GPUs are handed to the next chapter (in book order) that needs no
+    more than are free. A chapter that wants every GPU therefore waits until
+    the short ones ahead of and behind it have used the single free GPUs,
+    and then runs on all of them: nothing idles next to a long chapter.
+
+    Parameters
+    ----------
+    tasks : list[tuple[int, ExtractedChapter]]
+        Chapters in book order.
+    devices : list[str]
+        Devices of the provider pool.
+    wanted : dict[int, int]
+        GPUs each chapter number can keep busy (1..len(devices)).
+    process : Callable
+        ``process(task, pinned)`` where *pinned* is None for all GPUs, one
+        device string, or a tuple of device strings.
+    cancel : CancelToken
+        Cooperative cancellation.
+    log : Callable[[str], None]
+        Run log.
+    """
+    free = list(devices)
+    pending = list(tasks)
+    state = threading.Condition()
+    running = 0
+
+    def _run(task: tuple[int, ExtractedChapter], taken: list[str]) -> None:
+        nonlocal running
+        pinned: Any = None if len(taken) == len(devices) else taken[0] if len(taken) == 1 else tuple(taken)
+        try:
+            process(task, pinned)
+        except _CANCELLED_ERRORS:
+            cancel.cancel()
+        except Exception as exc:
+            log(f"[Pipeline] Chapter execution error: {exc}")
+        finally:
+            with state:
+                free.extend(taken)
+                # Keep the pool's own order so the same GPUs pair up again.
+                free.sort(key=devices.index)
+                running -= 1
+                state.notify_all()
+
+    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        while not cancel.is_cancelled:
+            with state:
+                if not pending:
+                    break
+                task = next((t for t in pending if wanted.get(t[0], 1) <= len(free)), None)
+                if task is None:
+                    # Every free GPU is too few for what is left; wait for more.
+                    state.wait(timeout=0.5)
+                    continue
+                count = max(1, min(len(devices), wanted.get(task[0], 1)))
+                taken = [free.pop(0) for _ in range(count)]
+                pending.remove(task)
+                running += 1
+            executor.submit(_run, task, taken)
+        with state:
+            while running:
+                state.wait(timeout=0.5)
+
 
 def _transcript_from_file(value: str) -> str | None:
     """Returns the text of *value* when it names a readable text file, else None.
@@ -771,7 +907,7 @@ def run_pipeline(
             progress(sum_frac, total)
             eta.update(num, frac)
 
-    def _process(num_chapter, pinned_device: str | None = None):
+    def _process(num_chapter, pinned_device: str | tuple[str, ...] | None = None):
         num, chapter = num_chapter
         position = positions[num]
         if cancel.is_cancelled:
@@ -833,7 +969,18 @@ def run_pipeline(
 
     try:
         max_parallel = _get_chapter_parallelism(pool, config)
-        if max_parallel > 1:
+        if max_parallel > 1 and config.parallel_mode == "auto":
+            batch_size = _chapter_batch_size(pool, config)
+            wanted = {
+                num: _gpus_wanted(chapter, config, batch_size, len(pool.devices)) for num, chapter in tasks
+            }
+            alone = sum(1 for count in wanted.values() if count == 1)
+            log(
+                f"[Pipeline] 🚀 Automatic GPU sharing: {alone} short chapter(s) take one GPU each, "
+                f"{len(wanted) - alone} longer one(s) are split across GPUs (about {batch_size} chunks per batch)."
+            )
+            _run_chapters_auto(tasks, list(pool.devices), wanted, _process, cancel, log)
+        elif max_parallel > 1:
             log(f"[Pipeline] 🚀 Inter-chapter parallelism active: processing up to {max_parallel} chapters simultaneously...")
             devices = pool.devices if pool else []
             with ThreadPoolExecutor(max_workers=max_parallel) as executor:
@@ -1345,7 +1492,7 @@ def _process_chapter_with_retry(
     provider: Any = None,
     pool: Any = None,
     prog_cb: Callable[[float], None] | None = None,
-    pinned_device: str | None = None,
+    pinned_device: str | tuple[str, ...] | None = None,
     subtitle_futures: list | None = None,
     subtitle_futures_lock: Any = None,
     completed_chunks: list[int] | None = None,
@@ -1699,7 +1846,7 @@ def _process_chapter(
     provider: "BaseTTSProvider" = None,
     pool: Any = None,
     prog_cb: Callable[[float], None] = None,
-    pinned_device: str | None = None,
+    pinned_device: str | tuple[str, ...] | None = None,
     subtitle_futures: list[tuple[int, concurrent.futures.Future]] | None = None,
     subtitle_futures_lock: threading.Lock | None = None,
     completed_chunks: list[int] | None = None,

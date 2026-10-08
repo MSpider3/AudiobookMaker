@@ -21,8 +21,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Single-file audiobooks with chapter markers** (M4B/MP3), speed control for every engine, per-chapter redo (`redo_chapters`, `--redo`), ETA and an end-of-run summary of failed chapters.
 - **CLI**: `--book` (no JSON needed), `--list-providers`, `--dry-run`, `--chapters`, `--redo`, `--tts-option`, `--verify` and the rest of the config as flags; exit codes 0 / 1 / 130.
 - **API**: `/api/v1/providers`, `/api/v1/tasks`, task file download, request validation.
-- **Kaggle test notebook** (`AudiobookMaker_Kaggle_Test.ipynb`, `tests/kaggle/abm_gpu_suite.py`) that tests a branch on real GPUs and packs the results into one archive. Besides each engine it measures the two-GPU speed-up on a text several batches long, narrates a whole twenty-page book, speaks a passage in six more languages, scores how close each cloned voice is to the narrator clip (speaker embeddings), and starts the API server and the web UI as real programs to generate through each.
-- **Long test books in seven languages** (`tests/fixture_generation/long_books/`, `generate_long_books.py`): an original ten-chapter novella of about twenty pages each in English, French, Russian, Hindi, Chinese, Japanese and Korean, built into `long_book_<code>.epub`.
+- **Automatic GPU sharing (`parallel_mode="auto"`, `--parallel-mode auto`, Parallelism in the UI)**: each chapter gets as many GPUs as it has batches to fill. A chapter that fits in one batch takes a single GPU and the next chapter starts on the other; a long chapter is shared by all of them; with more than two GPUs a medium chapter takes some and short ones the rest. Opt-in: the default stays `chunks`. Exercised with simulated GPUs only so far.
+- **Long test books in seven languages** (`tests/fixture_generation/long_books/`, `generate_long_books.py`): an original ten-chapter novella of about twenty pages each in English, French, Russian, Hindi, Chinese, Japanese and Korean, built into `tests/fixtures/source_documents/long_book_<code>.epub` for the test suite and for trying an engine or language by hand.
 
 ### 🚀 Changed
 - **Multi-GPU**: all GPUs pull length-sorted batches from one shared queue per chapter; a GPU that fails hands its batch to the others. Batch size no longer shrinks after the first batch and adapts after an out-of-memory retry.
@@ -34,6 +34,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Short chapters use every GPU (`chapter_pipeline.py`)**: a device takes at most an even share of the chunks still queued, where the first device used to take a whole batch — all of a short chapter — and the second T4 sat idle. An idle device also waits while another is mid-batch, so work handed back by a failed device is picked up instead of lost.
 - **Reference-voice preprocessing** rewritten: loudness (LUFS) target applied last, edge-only silence trim with fades, peak-relative soft gate, pause-learned noise profile, downsample to 24 kHz mono, and a report with warnings.
 - **Config schema 7**: `voice_preset`, `tts_options`, `redo_chapters`, `batch_size`, `pack_sentences`, `normalize_speech_text`, `verify_*`.
+
+### 🧹 Repository layout
+- The Colab and Kaggle notebooks moved to `notebooks/`; `colab_prerun_check.py`, `kaggle_prerun_check.py` and `lrc_to_srt_converter.py` moved to `scripts/` (the pre-run checks now find the project root themselves). The notebooks install one optional engine per session and call the scripts at their new place.
+- Removed the one-off Kaggle validation material: `tests/kaggle/`, `REPORT.md` and `test_whisper.py`. The pytest suite under `tests/` stays.
 
 ### 🗑️ Removed
 - **VibeVoice provider** — it could never synthesize (it called a method the model does not have). Saved configs naming it fall back to Qwen3-TTS.

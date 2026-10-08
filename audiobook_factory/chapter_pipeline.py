@@ -622,7 +622,7 @@ def run_chapter_pipeline(
     cancel_token: CancelToken,
     log_callback: Callable[[str], None],
     progress_callback: Callable[[int, int], None] | None = None,
-    pinned_device: str | None = None,
+    pinned_device: str | tuple[str, ...] | None = None,
     completed_chunks: list[int] | None = None,
     chunk_completed_cb: Callable[[int], None] | None = None,
     *,
@@ -646,7 +646,9 @@ def run_chapter_pipeline(
         cancel_token: CancelToken for cooperative cancellation.
         log_callback: Log callback for logging output.
         progress_callback: Optional progress callback receiving (chunks_done, total_chunks).
-        pinned_device: Optional device string to lock all synthesis to a single GPU.
+        pinned_device: Device string to lock all synthesis to a single GPU, or a
+            tuple of device strings to share the chapter among those GPUs only.
+            None uses every GPU of the pool.
         completed_chunks: Chunk indices that may be reused from the cache
             (each must still be a valid file). ``None`` reuses every valid
             chunk file found in ``out_dir``; ``[]`` reuses nothing.
@@ -724,10 +726,13 @@ def run_chapter_pipeline(
         work_queue.put(item)
 
     # ── Determine active devices & Stage B worker count ───────────────────────
-    if pinned_device is not None:
+    if pinned_device is None:
+        active_devices = pool.devices
+    elif isinstance(pinned_device, str):
         active_devices = [pinned_device]
     else:
-        active_devices = pool.devices
+        # parallel_mode="auto": some of the GPUs, the rest work on other chapters.
+        active_devices = list(pinned_device)
 
     stage_b_thread_count = len(active_devices)
 

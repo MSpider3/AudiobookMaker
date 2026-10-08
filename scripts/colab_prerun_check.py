@@ -1,5 +1,5 @@
 """
-colab_prerun_check.py — Google Colab Pre-Run Verification & Diagnostics
+scripts/colab_prerun_check.py — Google Colab Pre-Run Verification & Diagnostics
 
 Run this cell BEFORE your full audiobook generation to verify all core components,
 GPU allocation, Rust acceleration, and GPU pool dispatch.
@@ -10,11 +10,11 @@ Does NOT load the heavy 1.7B Qwen model — runs in under 5 seconds.
 import sys
 import os
 
-# Add Colab paths if not present
-if os.path.exists("/content/AudiobookMaker"):
-    sys.path.insert(0, "/content/AudiobookMaker")
-elif os.path.exists("/content"):
-    sys.path.insert(0, "/content")
+# The project root is the folder above scripts/; make its packages importable
+# wherever this file is run from.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 print("=" * 62)
 print("AudiobookMaker — Google Colab Pre-Run Verification")

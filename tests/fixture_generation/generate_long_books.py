@@ -5,9 +5,10 @@ Builds the long test books: one ten-chapter novella of about twenty pages in
 each of seven languages (English, French, Russian, Hindi, Chinese, Japanese,
 Korean).
 
-They exist for what the small ``dummy_book`` fixtures cannot show: how long a
-real book takes, whether two GPUs share a chapter of realistic length, and
-whether text in other scripts is split, synthesized and scored correctly.
+They exist for what the small ``dummy_book`` fixtures cannot show: chapters of
+realistic length, and text in other scripts being extracted, split into
+chunks and compared correctly. They are also handy input for trying an engine
+or a language by hand.
 
 The text lives in ``long_books/<code>.json`` (original prose written for this
 project, no third-party text). This script turns each file into
@@ -17,7 +18,6 @@ project, no third-party text). This script turns each file into
 Usage::
 
     python tests/fixture_generation/generate_long_books.py
-    python tests/kaggle/sync_assets.py        # copy them next to the notebook's other inputs
 """
 
 from __future__ import annotations

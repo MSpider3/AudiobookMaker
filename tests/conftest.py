@@ -9,8 +9,7 @@ devices the GPU pool finds, so the suite is pinned to CPU: on a machine with
 two GPUs the mock pool would otherwise get two workers and tests written for
 one device fail for reasons that have nothing to do with the code under test.
 
-Real-GPU behaviour is covered by ``tests/kaggle/abm_gpu_suite.py``. Set
-``ABM_TEST_USE_GPU=1`` to run the suite against the visible GPUs anyway.
+Set ``ABM_TEST_USE_GPU=1`` to run the suite against the visible GPUs anyway.
 """
 from __future__ import annotations
 
