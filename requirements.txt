@@ -65,7 +65,7 @@ fastapi
 uvicorn[standard]
 websockets
 
-
-
-
-
+# ── Optional: chunk verification with speech recognition (verify_chunks="asr") ──
+# faster-whisper      # the recogniser (transformers' Whisper is used without it)
+# pypinyin            # Chinese books: compare by sound, so homophones are not errors
+# pykakasi            # Japanese books: compare by reading, so kanji/kana choices are not errors

@@ -94,6 +94,8 @@ LANGUAGES             = ["fr", "ru", "zh", "ja", "ko", "hi"]   # tried with Qwen
 OTHER_ENGINE_LANGUAGES = ["hi"]   # tried with each other engine that supports them; add more codes to widen the test
 LANGUAGE_SECONDS      = 60        # length of the passage spoken per language
 LONG_BOOK_CHAPTERS    = 0         # chapters of the long book to narrate; 0 = all ten
+COMPARE_CHAPTER_MODE  = True      # narrate the long book a second time with one chapter per GPU (adds 10-20 min)
+COMPARE_CLONE_MODES   = True      # repeat the Qwen language passages cloning from the voice embedding only (adds 10 min)
 SCALING_OTHER_ENGINES = True      # also measure 1-vs-2 GPU for every other engine (adds 5-25 min each)
 SCALING_OTHER_CHUNKS  = 16        # chunks for that measurement, in batches of 4
 
@@ -255,7 +257,9 @@ sh(f"{sys.executable} -m pip install -q -r requirements.txt", log_name="setup")
 sh(f"{sys.executable} -m pip install -q -r requirements-dev.txt maturin", log_name="setup")
 sh(f"cd audiobook_rust && {sys.executable} -m pip install -q . ", log_name="setup")
 if ASR_SCORING:
-    sh(f"{sys.executable} -m pip install -q faster-whisper", log_name="setup")
+    # pypinyin / pykakasi: Chinese is scored by sound and Japanese by reading, so the
+    # recogniser's choice of homophone, kanji or kana is not counted as a mistake.
+    sh(f"{sys.executable} -m pip install -q faster-whisper pypinyin pykakasi", log_name="setup")
 sh(f"{sys.executable} -c \\"import audiobook_rust; print('Rust extension:', [n for n in dir(audiobook_rust) if not n.startswith('_')])\\"")
 """),
         _code("""
@@ -326,9 +330,21 @@ if RUN_LONG_BOOK:
     # A complete book of realistic length: all ten chapters, automatic batch size, both GPUs.
     suite(f"longbook --name qwen --max-chapters {LONG_BOOK_CHAPTERS} {ASR_FLAG}",
           timeout_min=LONG_RUN_TIMEOUT_MIN, log_name="longbook_qwen")
+    if COMPARE_CHAPTER_MODE:
+        # Same book with one chapter per GPU. A batch costs about the same time whatever its
+        # size, so a chapter that fits in one batch gains nothing from being split over two GPUs.
+        suite(f"longbook --name qwen --parallel-mode chapters --tag longbook_qwen_chapter_mode "
+              f"--max-chapters {LONG_BOOK_CHAPTERS} {ASR_FLAG}",
+              timeout_min=LONG_RUN_TIMEOUT_MIN, log_name="longbook_qwen_chapter_mode")
 if RUN_LANGUAGES and LANGUAGES:
     suite(f"languages --name qwen --langs {','.join(LANGUAGES)} --seconds {LANGUAGE_SECONDS} {ASR_FLAG}",
           timeout_min=LONG_RUN_TIMEOUT_MIN, log_name="languages_qwen")
+    if COMPARE_CLONE_MODES:
+        # The narrator clip is English. Cloning "in context" may carry its accent into other
+        # languages; cloning from the voice's embedding alone may pronounce them more cleanly.
+        suite(f"languages --name qwen --langs {','.join(LANGUAGES)} --seconds {LANGUAGE_SECONDS} "
+              f"--option x_vector_only_mode=true --suffix _embedding_only {ASR_FLAG}",
+              timeout_min=LONG_RUN_TIMEOUT_MIN, log_name="languages_qwen_embedding_only")
 if RUN_API_AND_UI:
     # The server programs themselves, not their functions: start, use over HTTP, stop.
     suite("api --name qwen", timeout_min=PROVIDER_TIMEOUT_MIN, log_name="api_qwen")

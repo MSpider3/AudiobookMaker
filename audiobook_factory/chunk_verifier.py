@@ -58,10 +58,6 @@ _ASR_SAMPLE_RATE: int = 16000
 _CJK_PATTERN = re.compile(
     "[぀-ヿ㐀-䶿一-鿿가-힯豈-﫿]"
 )
-# Whisper writes Mandarin in traditional or simplified characters as it
-# pleases; a prompt in simplified characters settles it, so a correct reading
-# of a simplified-Chinese book is not scored as all wrong.
-_ASR_INITIAL_PROMPTS: dict[str, str] = {"zh": "以下是普通话的句子，使用简体中文。"}
 
 _WHISPER_LANGUAGE_CODES: dict[str, str] = {
     "english": "en", "chinese": "zh", "japanese": "ja", "korean": "ko",
@@ -112,13 +108,105 @@ def expected_seconds(text: str, speed: float = 1.0) -> float:
     return seconds / max(0.25, float(speed or 1.0))
 
 
-def _normalize_for_compare(text: str) -> list[str]:
+_COMPARE_WORDS: str = "words"
+_COMPARE_CHARS: str = "chars"
+_COMPARE_PINYIN: str = "pinyin"
+_COMPARE_KANA: str = "kana"
+# Share of combining marks above which a script is compared by character:
+# Devanagari, Bengali, Tamil, Thai ... are written with vowel signs that an
+# ASR model spells one way and a book another.
+_MARK_HEAVY_SHARE: float = 0.10
+# Devanagari spelling variants that sound the same: nukta dropped,
+# chandrabindu written as anusvara.
+_INDIC_FOLDS: dict[int, int | None] = {0x093C: None, 0x0901: 0x0902}
+
+_kakasi: Any = None
+
+
+def _comparison_mode(reference: str) -> str:
+    """How a transcript of *reference* should be compared with it.
+
+    * ``words`` - space-delimited scripts with a stable spelling (English,
+      French, Russian ...).
+    * ``pinyin`` - Chinese: by syllable sound, so a homophone the ASR model
+      chose ("小鹤" for "小禾") or traditional characters do not count as errors.
+    * ``kana`` - Japanese: by reading, so kanji written as kana (or the
+      other way round) does not count.
+    * ``chars`` - Korean, and scripts whose spelling varies between writers
+      (Hindi and other Indic scripts, Thai): by character.
+    """
+    han = kana = hangul = marks = letters = 0
+    for char in reference:
+        code = ord(char)
+        if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:
+            kana += 1
+        elif 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F:
+            hangul += 1
+        elif _CJK_PATTERN.match(char):
+            han += 1
+        category = unicodedata.category(char)[0]
+        if category == "M":
+            marks += 1
+        if category in "LM":
+            letters += 1
+    if kana:
+        return _COMPARE_KANA
+    if han:
+        return _COMPARE_PINYIN
+    if hangul or (letters and marks / letters > _MARK_HEAVY_SHARE):
+        return _COMPARE_CHARS
+    return _COMPARE_WORDS
+
+
+def _to_pinyin(text: str) -> str | None:
+    """*text* with every Han character replaced by its toneless pinyin, or None without pypinyin."""
+    try:
+        from pypinyin import lazy_pinyin  # type: ignore
+    except ImportError:
+        return None
+    return " ".join(lazy_pinyin(text, errors=lambda other: [other]))
+
+
+def _to_kana(text: str) -> str | None:
+    """*text* in hiragana, or None without pykakasi."""
+    global _kakasi
+    try:
+        if _kakasi is None:
+            import pykakasi  # type: ignore
+            _kakasi = pykakasi.kakasi()
+        return "".join(item["hira"] for item in _kakasi.convert(text))
+    except ImportError:
+        return None
+    except Exception as exc:
+        logger.debug("[verify] Could not convert Japanese text to kana: %s", exc)
+        return None
+
+
+def _normalize_for_compare(text: str, mode: str | None = None) -> list[str]:
     """Lower-cases, strips punctuation and tokenizes for transcript comparison.
 
-    Space-delimited scripts are compared word by word; CJK text has no word
-    spacing, so each character is a token.
+    Parameters
+    ----------
+    text : str
+        The reference text or a transcript of it.
+    mode : str | None
+        One of the ``_COMPARE_*`` modes; by default the mode that suits
+        *text* itself. A transcript must be tokenized with the mode of its
+        reference, so both sides are cut the same way.
+
+    Returns
+    -------
+    list[str]
+        Words, characters, pinyin syllables or kana, depending on the mode.
     """
+    mode = mode or _comparison_mode(text)
     text = unicodedata.normalize("NFKC", text).lower()
+    if mode == _COMPARE_PINYIN:
+        text = _to_pinyin(text) or text
+    elif mode == _COMPARE_KANA:
+        text = _to_kana(text) or text
+    elif mode == _COMPARE_CHARS:
+        text = text.translate(_INDIC_FOLDS)
     # Letters, digits and combining marks are kept. The marks matter: \w does
     # not match them, and dropping them cuts every Devanagari, Thai or Arabic
     # word into loose consonants.
@@ -127,15 +215,20 @@ def _normalize_for_compare(text: str) -> list[str]:
     )
     tokens: list[str] = []
     for word in text.split():
-        if _CJK_PATTERN.search(word):
-            tokens.extend(ch for ch in word if not ch.isspace())
+        if mode in (_COMPARE_CHARS, _COMPARE_KANA) or _CJK_PATTERN.search(word):
+            tokens.extend(word)
         else:
             tokens.append(word)
     return tokens
 
 
 def error_rate(reference: str, hypothesis: str) -> float:
-    """Token error rate between two texts (word level, character level for CJK).
+    """Token error rate between a text and a transcript of it.
+
+    English and other space-delimited text is compared word by word; Chinese
+    by syllable sound and Japanese by reading (when ``pypinyin`` /
+    ``pykakasi`` are installed), other scripts by character. See
+    :func:`_comparison_mode`.
 
     Returns
     -------
@@ -143,8 +236,9 @@ def error_rate(reference: str, hypothesis: str) -> float:
         Edit distance divided by the reference length; 0.0 for identical
         texts, and 1.0 or more when little of the reference was spoken.
     """
-    ref = _normalize_for_compare(reference)
-    hyp = _normalize_for_compare(hypothesis)
+    mode = _comparison_mode(reference)
+    ref = _normalize_for_compare(reference, mode)
+    hyp = _normalize_for_compare(hypothesis, mode)
     if not ref:
         return 0.0 if not hyp else 1.0
     previous = list(range(len(hyp) + 1))
@@ -308,9 +402,10 @@ class ChunkVerifier:
             if self._asr_backend == "faster-whisper":
                 # No carry-over between 30 s windows: with it, one misheard
                 # window makes Whisper repeat or invent the text that follows.
+                # No prompt either: Whisper repeats a prompt back as speech
+                # when a window starts quietly.
                 segments, _ = self._asr.transcribe(
                     samples, language=language, beam_size=1, condition_on_previous_text=False,
-                    initial_prompt=_ASR_INITIAL_PROMPTS.get(language or ""),
                 )
                 return " ".join(segment.text for segment in segments).strip()
             generate_kwargs = {"language": language} if language else {}
@@ -342,7 +437,7 @@ class ChunkVerifier:
             if rate_of_error > self.max_error_rate:
                 return ChunkVerdict(
                     False,
-                    f"transcript mismatch ({rate_of_error:.0%} of words differ)",
+                    f"transcript mismatch ({rate_of_error:.0%} of the text differs)",
                     rate_of_error,
                 )
             return ChunkVerdict(True, "", rate_of_error)

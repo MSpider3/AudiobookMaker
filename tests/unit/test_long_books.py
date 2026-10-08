@@ -9,10 +9,10 @@ sensible spoken length whatever the script.
 
 from __future__ import annotations
 
-import filecmp
 import json
 import os
 import sys
+import zipfile
 
 import pytest
 
@@ -31,6 +31,12 @@ _MIN_MINUTES: float = 25.0
 _MAX_MINUTES: float = 60.0
 # 399 Latin characters are about 26 seconds; no chunk may run far past that.
 _MAX_CHUNK_SECONDS: float = 40.0
+
+
+def _zip_members(path: str) -> dict[str, bytes]:
+    """Name and uncompressed content of every member of a ZIP file."""
+    with zipfile.ZipFile(path) as archive:
+        return {name: archive.read(name) for name in archive.namelist()}
 
 
 def _manifest() -> dict:
@@ -61,7 +67,9 @@ def test_built_files_are_up_to_date(tmp_path):
         rebuilt = tmp_path / books.book_file_name(code)
         books.build_long_epub(source, str(rebuilt))
         committed = os.path.join(_FIXTURES, books.book_file_name(code))
-        assert filecmp.cmp(str(rebuilt), committed, shallow=False), (
+        # Compared member by member: the compressed bytes differ between zlib
+        # builds (this test failed on Kaggle when it compared whole files).
+        assert _zip_members(str(rebuilt)) == _zip_members(committed), (
             f"{books.book_file_name(code)} is stale — run: python tests/fixture_generation/generate_long_books.py"
         )
         assert books.describe(source) == next(e for e in _manifest()["books"] if e["code"] == code)

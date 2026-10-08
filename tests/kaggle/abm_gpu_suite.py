@@ -221,6 +221,20 @@ def _speech_windows(samples, rate: int, max_seconds: float = 24.0, min_seconds: 
     return [window for window in windows if len(window) >= rate // 4]
 
 
+def _wrong_script(reference: str, transcript: str) -> bool:
+    """True when the text is not in Latin letters but a real part of its transcript is.
+
+    Whisper answers some Hindi windows in romanised form ("bursat ki pahli
+    subah"). The words can be right, but they cannot be compared with
+    Devanagari, and even one such window ruins the score.
+    """
+    def latin_share(text: str) -> float:
+        letters = [char for char in text if char.isalpha()]
+        return sum(char.isascii() for char in letters) / len(letters) if letters else 0.0
+
+    return latin_share(reference) < 0.3 and latin_share(transcript) > 0.15
+
+
 def _spoken_text(config, paragraphs: tuple[str, ...]) -> str:
     """The text the TTS engine was actually asked to say (after normalisation)."""
     from audiobook_factory.pipeline import _prepare_speech_text
@@ -638,7 +652,7 @@ def _measure_run(config, paragraphs: tuple[str, ...], tag: str, score_words: boo
                  max_error_rate: float = _MAX_WORD_ERROR_RATE) -> tuple[str, dict, str, list[str], list[str]]:
     """Runs one synthesis job and measures it. Returns (status, metrics, error, logs, notes)."""
     import torch
-    from audiobook_factory.chunk_verifier import error_rate, expected_seconds
+    from audiobook_factory.chunk_verifier import _comparison_mode, error_rate, expected_seconds
     from audiobook_factory.text_extractor import ExtractedChapter
     from audiobook_factory.tts_providers import provider_info
 
@@ -718,10 +732,17 @@ def _measure_run(config, paragraphs: tuple[str, ...], tag: str, score_words: boo
             notes.append("ASR unavailable — word accuracy not scored.")
         else:
             rate = error_rate(spoken, transcript)
-            metrics["word_error_rate"] = round(rate, 3)
+            metrics["comparison"] = _comparison_mode(spoken)
             metrics["transcript_head"] = transcript[:240]
-            if rate > max_error_rate:
-                problems.append(f"word error rate {rate:.0%} (limit {max_error_rate:.0%})")
+            metrics["transcript"] = transcript[:6000]
+            if _wrong_script(spoken, transcript):
+                # Whisper sometimes answers Hindi in Latin letters; that says
+                # nothing about the speech, so it is not scored.
+                notes.append("ASR wrote the transcript in another script than the text — word accuracy not scored.")
+            else:
+                metrics["word_error_rate"] = round(rate, 3)
+                if rate > max_error_rate:
+                    problems.append(f"word error rate {rate:.0%} (limit {max_error_rate:.0%})")
 
     try:
         with open(os.path.join(config.output_dir, "generation_progress.json"), encoding="utf-8") as fh:
@@ -1164,7 +1185,8 @@ def cmd_longbook(args) -> None:
             chapters = chapters[: args.max_chapters]
         work = os.path.join(RESULTS_DIR, "work", tag)
         config = _build_config(args, work, output_format="m4b", single_file_mode=True,
-                               book_title=entry["title"], author=entry["author"], language=entry["language"])
+                               book_title=entry["title"], author=entry["author"], language=entry["language"],
+                               parallel_mode=args.parallel_mode)
         _reset_gpu_state()
         shutil.rmtree(work, ignore_errors=True)
         capture = _WarningCapture()
@@ -1177,6 +1199,7 @@ def cmd_longbook(args) -> None:
         messages = [m for _, m in logs]
         metrics: dict[str, Any] = {
             "book": entry["file"], "language": entry["language"], "chapters": len(chapters),
+            "parallel_mode": args.parallel_mode,
             "wall_seconds": round(wall, 1), "peak_ram_gb": _peak_rss_gb(),
             "library_warnings": len(capture.messages), "first_warnings": capture.messages[:12],
             "out_of_memory_retries": sum("out of memory" in m.lower() or "out-of-memory" in m.lower()
@@ -1284,7 +1307,7 @@ def cmd_languages(args) -> None:
     wanted = [code.strip().lower() for code in args.langs.split(",") if code.strip()]
     wanted = wanted or [book["code"] for book in _long_books() if book["code"] != "en"]
     for code in wanted:
-        tag = f"lang_{args.name}_{code}"
+        tag = f"lang_{args.name}_{code}{args.suffix}"
         entry = _long_book(code)
         if entry is None:
             _write_result(tag, "fail", error=f"no long test book for language code {code!r} in {_FIXTURES}")
@@ -1723,7 +1746,7 @@ def cmd_report(_args) -> None:
     for result in results:
         m = result.get("metrics", {})
         keys = []
-        for key in ("speedup", "language", "speed_x_realtime", "audio_minutes", "audio_seconds",
+        for key in ("speedup", "language", "parallel_mode", "speed_x_realtime", "audio_minutes", "audio_seconds",
                     "synthesis_seconds", "word_error_rate", "loudness_lufs", "chapters_completed",
                     "flagged_chunks", "out_of_memory_retries", "peak_ram_gb", "lowest_clone",
                     "same_voice_reference", "device_share", "vram_peak_gb", "chunks_reused_on_resume",
@@ -1841,6 +1864,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_synthesis_args(longbook)
     longbook.add_argument("--lang", default="en", help="Language code of the long test book.")
     longbook.add_argument("--max-chapters", type=int, default=0, help="0 = the whole book.")
+    longbook.add_argument("--parallel-mode", default="chunks", choices=["chunks", "chapters"],
+                          help="chunks: one chapter at a time on all GPUs; chapters: one chapter per GPU.")
     longbook.add_argument("--no-asr", action="store_true")
     longbook.set_defaults(handler=cmd_longbook)
 
@@ -1848,6 +1873,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_synthesis_args(languages)
     languages.add_argument("--langs", default="", help="Comma-separated language codes; default: every book but English.")
     languages.add_argument("--seconds", type=float, default=60.0, help="Length of the passage per language.")
+    languages.add_argument("--suffix", default="", help="Added to the result names, to compare two settings.")
     languages.add_argument("--no-asr", action="store_true")
     languages.set_defaults(handler=cmd_languages)
 

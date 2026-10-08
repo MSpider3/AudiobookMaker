@@ -216,3 +216,50 @@ class TestNewStages:
         assert "| Sample | Similarity |" in report and "| qwen_clone | 0.995 |" in report
         assert "lowest_clone=0.98" in report
 
+    def test_romanised_transcript_of_hindi_is_not_scored(self):
+        hindi = "बरसात की पहली सुबह पीपलखेड़ा कस्बे में बरसात इस बार कुछ जल्दी आ गई थी"
+        assert abm_gpu_suite._wrong_script(hindi, "bursat ki pahli subah people khira khazbah mein") is True
+        # One romanised window among Devanagari ones is enough to spoil a score.
+        assert abm_gpu_suite._wrong_script(hindi, "bursat ki pahli subah पीपल केड़ा कस्बे में बरसात इस बार कुछ जल्दी") is True
+        assert abm_gpu_suite._wrong_script(hindi, "बरसाथ की पहली सुबह पीपल केड़ा कजबे में") is False
+        assert abm_gpu_suite._wrong_script("The tide went out.", "the tide went out") is False
+
+    def test_long_book_can_run_with_one_chapter_per_gpu(self):
+        parser = abm_gpu_suite.build_parser()
+        assert parser.parse_args(["longbook", "--name", "qwen"]).parallel_mode == "chunks"
+        args = parser.parse_args(["longbook", "--name", "qwen", "--parallel-mode", "chapters"])
+        assert args.parallel_mode == "chapters"
+        notebook = generate_test_notebook.build("some-branch")
+        code = "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
+        assert "--parallel-mode chapters" in code and "x_vector_only_mode=true" in code
+
+    def test_language_result_keeps_the_transcript_and_how_it_was_compared(self, tmp_path, monkeypatch):
+        # A full run of the language test on the mock engine, with the
+        # recogniser replaced: what it "hears" decides the outcome.
+        monkeypatch.setattr(abm_gpu_suite, "RESULTS_DIR", str(tmp_path))
+        monkeypatch.setattr(abm_gpu_suite, "_reset_gpu_state", lambda: None)
+        heard = {"text": ""}
+        monkeypatch.setattr(abm_gpu_suite, "_transcribe", lambda samples, language="English": heard["text"])
+        parser = abm_gpu_suite.build_parser()
+
+        def run(suffix: str) -> dict:
+            args = parser.parse_args(["languages", "--name", "mock", "--langs", "hi", "--seconds", "8",
+                                      "--verify", "off", "--suffix", suffix])
+            abm_gpu_suite.cmd_languages(args)
+            with open(tmp_path / f"lang_mock_hi{suffix}.json", encoding="utf-8") as fh:
+                return json.load(fh)
+
+        chapter = abm_gpu_suite._book_chapters(abm_gpu_suite._long_book("hi"))[0]
+        passage = " ".join(abm_gpu_suite._leading_paragraphs(chapter.text, 8.0))
+
+        heard["text"] = passage.replace("।", "")          # read correctly
+        good = run("_a")
+        assert good["metrics"]["comparison"] == "chars"
+        assert good["metrics"]["word_error_rate"] < 0.05
+        assert good["metrics"]["transcript"] == heard["text"][:6000]
+
+        heard["text"] = "bursat ki pahli subah " + passage[:40]   # partly romanised by the recogniser
+        mixed = run("_b")
+        assert "word_error_rate" not in mixed["metrics"]
+        assert any("another script" in note for note in mixed["notes"])
+
