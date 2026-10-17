@@ -4,6 +4,14 @@ All notable changes to **AudiobookMaker** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### ⚡ Added
+- **Standalone book combiner (`scripts/combine_book.py`)**: joins chapter files downloaded in parts (folders and ZIP files from Kaggle or Colab) into one audiobook with chapter markers, title, author and cover, and merges `.srt` / `.lrc` / `.vtt` subtitles with every cue shifted to its place in the book. Reads chapter order and titles from `generation_progress.json`, stops on missing chapters (`--allow-missing` to override), matches files to chapters by title (file names from older versions carry a different number than the progress file), converts only the chapters whose format differs from the rest and stream-copies everything else, and keeps each chapter's subtitles inside its own time span. Needs only Python and FFmpeg, so it can be downloaded on its own. Checked on a real 213-chapter, 50-hour book.
+
+### 🐛 Fixed
+- **Voice test with a long text (`pipeline.py`)**: the preview sent the whole test text to the engine in one call. A long paragraph ran past Qwen3-TTS's length budget ("hit its 2646-token budget") and came back as runaway audio. The test text is now cut into chunks like a chapter and the audio joined with the usual pauses.
+
 ## [v1.6.0] - 2026-10-08
 
 > Rebuild the Rust extension after pulling (`cd audiobook_rust && maturin develop --release`): three of these fixes are in Rust, and a stale binary keeps the old behaviour.

@@ -97,6 +97,7 @@ AudiobookMaker/
 ├── scripts/
 │   ├── colab_prerun_check.py             ← Colab diagnostic check (<5s)
 │   ├── kaggle_prerun_check.py            ← Kaggle diagnostic check (<5s)
+│   ├── combine_book.py                   ← Join chapters downloaded in parts into one audiobook (needs only Python + FFmpeg)
 │   └── lrc_to_srt_converter.py           ← Convert .lrc files to .srt
 ├── audiobook_rust/                       ← Rust PyO3 extension: sentence splitting, text cleaning, mastering
 ├── docs/
@@ -352,6 +353,24 @@ You can run AudiobookMaker entirely in cloud notebooks — no local GPU or insta
    ```
    *Verifies both T4 GPUs, VRAM metrics, PyO3 bindings, and multi-GPU pool dispatch in <5 seconds.*
 4. **Run all notebook cells** to start the FastAPI server and launch the Gradio Web UI link.
+
+### 📦 Combining a book downloaded in parts
+
+Kaggle and Colab limit how much you can download at once, so a long book often comes down as several ZIP files or folders of chapters. `scripts/combine_book.py` joins them into one audiobook with a chapter marker per chapter, the title, author and cover, and merges the `.srt` / `.lrc` / `.vtt` subtitles with every line moved to its place in the whole book.
+
+It needs only **Python 3.9+ and FFmpeg** — no TTS models, no `transformers`, nothing else from this project — so you can fetch just that one file:
+
+```bash
+curl -O https://raw.githubusercontent.com/MSpider3/AudiobookMaker/main/scripts/combine_book.py
+
+python combine_book.py part1.zip part2.zip more_chapters/ --progress generation_progress.json
+# → "<Book Title>.m4b" (or the book's format) plus "<Book Title>.srt" / ".lrc" / ".vtt"
+```
+
+- **Inputs:** any mix of folders and ZIP files holding the chapter files (`Chapter 7 - Title.mp3` …) and their subtitles.
+- **`--progress`:** the book's `generation_progress.json`. It gives the chapter order and titles, the author and the cover, and lets the tool stop if a chapter is missing. Without it, chapters are ordered by the number in their file name.
+- **Output:** `-o book.m4b` or `--format mp3` choose the file; by default it is named after the book. Audio is copied without re-encoding; only chapters whose format differs from the rest are converted to match first (a 213-chapter, 50-hour book combined in about 10 minutes).
+- **Missing chapters:** the tool lists them and stops; `--allow-missing` combines what is there.
 
 ### Notes on Cloud Environments
 
