@@ -213,3 +213,62 @@ class TestSubtitleShifting:
 
     def test_lrc_with_several_time_tags(self):
         assert cb.shift_lrc("[ar:x]\n[00:01.50][00:03.00]Again\n", 10.0) == ["[00:11.50]Again", "[00:13.00]Again"]
+
+    def test_cue_running_past_the_chapter_is_kept_inside_it(self):
+        # A real book had a last subtitle starting a second after its chapter's
+        # audio ended, so it overlapped the next chapter in the combined file.
+        text = "1\n00:14:18,920 --> 00:14:22,040\nLast line.\n"
+        blocks, _ = cb.shift_srt(text, 100.0, 1, limit=100.0 + 857.84)
+        assert blocks == ["1\n00:15:57,840 --> 00:15:57,840\nLast line."]
+        assert cb.shift_lrc("[14:18.92]Last line.\n", 0.0, limit=857.84) == ["[14:17.84]Last line."]
+
+
+class TestMatchingByTitle:
+    """File names may carry a different number than the progress file (a real book did)."""
+
+    def test_titles_decide_and_numbers_break_ties(self, tmp_path):
+        names = {"Chapter 1 - Crimson.mp3": 1, "Chapter 109 - Deduction.mp3": 1, "Chapter 175 Deduction.mp3": 1,
+                 "Chapter 174 - Madam Sharon.mp3": 1}
+        for name in names:
+            _tone(tmp_path / name, 1)
+        progress = tmp_path / "generation_progress.json"
+        _progress(progress, {2: "Chapter 1: Crimson", 110: "Chapter 109: Deduction",
+                             175: "Chapter 174: Madam Sharon", 176: "Chapter 175: Deduction"})
+        book = cb.load_progress(str(progress))
+        chapters = cb.match_chapters(cb._collect([str(tmp_path)], str(tmp_path)), book, allow_missing=False)
+        found = {c.number: os.path.basename(c.audio) for c in chapters}
+        assert found == {2: "Chapter 1 - Crimson.mp3", 110: "Chapter 109 - Deduction.mp3",
+                         175: "Chapter 174 - Madam Sharon.mp3", 176: "Chapter 175 Deduction.mp3"}
+
+    def test_newer_names_with_the_entry_number_still_match(self, tmp_path):
+        _tone(tmp_path / "Chapter 2 - Chapter 1 Crimson.mp3", 1)
+        progress = tmp_path / "generation_progress.json"
+        _progress(progress, {2: "Chapter 1: Crimson"})
+        chapters = cb.match_chapters(cb._collect([str(tmp_path)], str(tmp_path)),
+                                     cb.load_progress(str(progress)), allow_missing=False)
+        assert os.path.basename(chapters[0].audio) == "Chapter 2 - Chapter 1 Crimson.mp3"
+
+
+class TestMixedParts:
+
+    def test_only_the_odd_chapter_is_converted_and_the_rest_copied(self, tmp_path):
+        for n in (2, 3):
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=1",
+                            "-ac", "1", "-ar", "24000", "-c:a", "aac", "-b:a", "64k", "-f", "mp4",
+                            str(tmp_path / f"Chapter {n} - Part {n}.m4b")], check=True)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=1",
+                        "-ac", "2", "-ar", "44100", "-c:a", "aac", "-b:a", "128k", "-f", "mp4",
+                        str(tmp_path / "Chapter 1 - Part 1.m4b")], check=True)
+        out = tmp_path / "out" / "book.m4b"
+        out.parent.mkdir()
+        book = cb.Book(title="Mixed")
+        chapters = cb.match_chapters(cb._collect([str(tmp_path)], str(tmp_path)), book, allow_missing=False)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        assert cb.combine_audio(chapters, book, str(out), "", 64, str(scratch)) is True   # copied after conforming
+        info = json.loads(subprocess.run(["ffprobe", "-v", "error", "-show_streams", "-show_chapters", "-of", "json",
+                                          str(out)], capture_output=True, text=True, check=True).stdout)
+        stream = info["streams"][0]
+        assert (stream["sample_rate"], stream["channels"]) == ("24000", 1)
+        assert len(info["chapters"]) == 3
+

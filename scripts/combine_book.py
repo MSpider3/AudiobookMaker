@@ -59,7 +59,7 @@ _ENCODERS: dict[str, list[str]] = {
 _LOSSLESS_FORMATS: tuple[str, ...] = ("flac", "wav")
 _DEFAULT_BITRATE_KBPS: int = 64
 # "Chapter 12 - Title.mp3" (current names) and "0012_Title.mp3" (older names).
-_CHAPTER_NAME = re.compile(r"^chapter\s+(\d+)\s*-\s*(.*)$", re.IGNORECASE)
+_CHAPTER_NAME = re.compile(r"^chapter\s+(\d+)\s*[-:.]?\s*(.*)$", re.IGNORECASE)
 _NUMBERED_NAME = re.compile(r"^(\d{1,4})[_\s.-]+(.*)$")
 _SRT_TIME = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})")
 _VTT_TIME = re.compile(r"(?:(\d{1,2}):)?(\d{2}):(\d{2})\.(\d{3})")
@@ -132,6 +132,28 @@ def _chapter_number(path: str) -> tuple[int | None, str]:
     return None, stem
 
 
+def _title_key(title: str) -> str:
+    """A chapter title reduced to its words, for matching a file name with the progress file.
+
+    "Chapter 108: Deep Into The Night" and the file name
+    "Chapter 108 - Deep Into The Night" (or "Chapter 109 - Chapter 108 Deep
+    Into The Night") both become "deepintothenight".
+    """
+    core = title.strip()
+    while True:
+        match = _CHAPTER_NAME.match(core)
+        if not match or not match.group(2):
+            break
+        core = match.group(2)
+    return re.sub(r"[\W_]+", "", core.lower())
+
+
+def _title_number(title: str) -> int | None:
+    """The chapter number written in a title ("Chapter 108: ..." -> 108), or None."""
+    match = _CHAPTER_NAME.match(title.strip())
+    return int(match.group(1)) if match else None
+
+
 def _natural_key(path: str) -> list:
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", os.path.basename(path))]
 
@@ -160,6 +182,54 @@ def load_progress(path: str) -> Book:
     )
 
 
+def _assign_by_title(chapters: list[Chapter], audio: list[str]) -> None:
+    """Gives each chapter of the progress file its audio file.
+
+    File names do not reliably carry the progress file's chapter numbers:
+    depending on the version that wrote them they hold that number or the one
+    in the title ("Chapter 109 - Deduction" for entry 110, "Chapter 109:
+    Deduction"). Titles are therefore matched first, and numbers only decide
+    between chapters with the same title or stand in when the title differs.
+    """
+    files = []
+    for path in audio:
+        number, title = _chapter_number(path)
+        files.append((path, number, _title_key(title)))
+    # Largest first, so a chapter downloaded twice keeps its most complete copy.
+    files.sort(key=lambda item: os.path.getsize(item[0]), reverse=True)
+    taken: set[str] = set()
+
+    def numbers_of(chapter: Chapter) -> list[int]:
+        found = [_title_number(chapter.title), chapter.number]
+        return [n for n in dict.fromkeys(found) if n is not None]
+
+    def pick(chapter: Chapter, accept) -> None:
+        for path, number, key in files:
+            if path not in taken and accept(number, key):
+                chapter.audio = path
+                taken.add(path)
+                return
+
+    passes = (
+        # 1. same title and a number that belongs to the chapter
+        lambda c: (lambda number, key: key == _title_key(c.title) and number in numbers_of(c)),
+        # 2. same title, when only one chapter has that title
+        lambda c: (lambda number, key: key == _title_key(c.title)
+                   and sum(_title_key(o.title) == key for o in chapters) == 1),
+        # 3. the number written in the chapter's title, then its entry number
+        lambda c: (lambda number, key: number is not None and number == (numbers_of(c) or [None])[0]),
+        lambda c: (lambda number, key: number is not None and number == c.number),
+    )
+    for make in passes:
+        for chapter in chapters:
+            if not chapter.audio:
+                pick(chapter, make(chapter))
+    leftover = [os.path.basename(path) for path, _n, _k in files if path not in taken]
+    if leftover:
+        logger.warning("%d audio file(s) did not match any chapter of the progress file and are left out: %s",
+                       len(leftover), ", ".join(leftover[:10]) + (" ..." if len(leftover) > 10 else ""))
+
+
 def match_chapters(files: list[str], book: Book, allow_missing: bool) -> list[Chapter]:
     """Pairs chapter audio and subtitle files with the chapters of the book.
 
@@ -185,9 +255,6 @@ def match_chapters(files: list[str], book: Book, allow_missing: bool) -> list[Ch
 
     if book.chapters:
         chapters = [Chapter(number, title or f"Chapter {number}") for number, title, _status in book.chapters]
-        if unnumbered:
-            logger.warning("Ignoring files that are not named after a chapter: %s",
-                           ", ".join(os.path.basename(p) for p in unnumbered))
     elif by_number:
         chapters = [Chapter(number, _chapter_number(paths[0])[1]) for number, paths in sorted(by_number.items())]
         if unnumbered:
@@ -198,15 +265,18 @@ def match_chapters(files: list[str], book: Book, allow_missing: bool) -> list[Ch
         chapters = [Chapter(index, _chapter_number(path)[1], audio=path) for index, path in enumerate(unnumbered, 1)]
         by_number = {chapter.number: [chapter.audio] for chapter in chapters}
 
-    for chapter in chapters:
-        candidates = by_number.get(chapter.number, [])
-        if len(candidates) > 1:
-            # The same chapter downloaded twice (or in two formats): keep the largest file.
-            candidates = sorted(candidates, key=os.path.getsize, reverse=True)
-            logger.warning("Chapter %d appears %d times; using %s", chapter.number, len(candidates),
-                           os.path.basename(candidates[0]))
-        if candidates:
-            chapter.audio = candidates[0]
+    if book.chapters:
+        _assign_by_title(chapters, audio)
+    else:
+        for chapter in chapters:
+            candidates = by_number.get(chapter.number, [])
+            if len(candidates) > 1:
+                # The same chapter downloaded twice (or in two formats): keep the largest file.
+                candidates = sorted(candidates, key=os.path.getsize, reverse=True)
+                logger.warning("Chapter %d appears %d times; using %s", chapter.number, len(candidates),
+                               os.path.basename(candidates[0]))
+            if candidates:
+                chapter.audio = candidates[0]
 
     missing = [chapter for chapter in chapters if not chapter.audio]
     if missing and not allow_missing:
@@ -245,9 +315,16 @@ def _require(tool: str) -> str:
 
 def probe(path: str) -> tuple[float, str, int, int]:
     """``(seconds, codec, sample_rate, channels)`` of the first audio stream of *path*."""
+    seconds, codec, rate, channels, _bitrate = probe_full(path)
+    return seconds, codec, rate, channels
+
+
+def probe_full(path: str) -> tuple[float, str, int, int, int]:
+    """``(seconds, codec, sample_rate, channels, bit_rate)`` of the first audio stream of *path*."""
     result = subprocess.run(
         [_require("ffprobe"), "-v", "error", "-select_streams", "a:0",
-         "-show_entries", "stream=codec_name,sample_rate,channels:format=duration", "-of", "json", path],
+         "-show_entries", "stream=codec_name,sample_rate,channels,bit_rate:format=duration,bit_rate",
+         "-of", "json", path],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -260,7 +337,13 @@ def probe(path: str) -> tuple[float, str, int, int]:
         seconds = 0.0
     if seconds <= 0:
         raise CombineError(f"{path} has no audio.")
-    return seconds, str(stream.get("codec_name") or ""), int(stream.get("sample_rate") or 0), int(stream.get("channels") or 0)
+    bitrate = stream.get("bit_rate") or (info.get("format") or {}).get("bit_rate") or 0
+    try:
+        bitrate = int(bitrate)
+    except (TypeError, ValueError):
+        bitrate = 0
+    return (seconds, str(stream.get("codec_name") or ""), int(stream.get("sample_rate") or 0),
+            int(stream.get("channels") or 0), bitrate)
 
 
 def _metadata_escape(value: str) -> str:
@@ -311,15 +394,43 @@ def combine_audio(chapters: list[Chapter], book: Book, output: str, cover: str, 
     if output_format not in _ENCODERS:
         raise CombineError(f"Unsupported output format: .{output_format}")
 
-    formats = set()
+    def family(extension: str) -> str:
+        extension = extension.lstrip(".").lower()
+        return "mp4" if extension in ("m4b", "m4a", "mp4") else extension
+
+    kinds: dict[str, tuple[str, str, int, int]] = {}
+    bitrates: dict[tuple[str, str, int, int], list[int]] = {}
     for chapter in chapters:
-        chapter.seconds, codec, rate, channels = probe(chapter.audio)
-        formats.add((os.path.splitext(chapter.audio)[1].lower(), codec, rate, channels))
-    # Stream copy only when every part is the same kind of file as the output.
-    same_container = {fmt[0] for fmt in formats} == {"." + output_format} or (
-        output_format in ("m4b", "m4a", "mp4") and {fmt[0] for fmt in formats} <= {".m4b", ".m4a", ".mp4"}
-    )
-    copy = len(formats) == 1 and same_container
+        chapter.seconds, codec, rate, channels, bitrate = probe_full(chapter.audio)
+        kind = (family(os.path.splitext(chapter.audio)[1]), codec, rate, channels)
+        kinds[chapter.audio] = kind
+        bitrates.setdefault(kind, []).append(bitrate)
+    # The format most chapters share. When it suits the output, only the
+    # chapters that differ are converted to it and everything is then copied:
+    # re-encoding a whole book because one chapter differs takes hours.
+    majority = max(bitrates, key=lambda kind: len(bitrates[kind]))
+    encoder_codec = {"mp4": "aac", "aac": "aac", "mp3": "mp3", "ogg": "opus", "opus": "opus", "webm": "opus",
+                     "flac": "flac", "wav": "pcm_s16le"}.get(family(output_format))
+    copy = majority[0] == family(output_format) and (majority[1] == encoder_codec or len(bitrates) == 1)
+    odd = [chapter for chapter in chapters if kinds[chapter.audio] != majority] if copy else []
+    parts = {chapter.audio: chapter.audio for chapter in chapters}
+    if odd:
+        kept = sorted(b for b in bitrates[majority] if b) or [bitrate_kbps * 1000]
+        target_bitrate = kept[len(kept) // 2]
+        logger.info("%d chapter(s) differ from the rest (%s, %d Hz, %d channel(s)); converting only those.",
+                    len(odd), majority[1], majority[2], majority[3])
+        for index, chapter in enumerate(odd):
+            converted = os.path.join(scratch, f"conformed_{index:04d}.{output_format}")
+            cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", chapter.audio, "-vn",
+                   *_ENCODERS[output_format], "-ar", str(majority[2]), "-ac", str(majority[3])]
+            if output_format not in _LOSSLESS_FORMATS:
+                cmd += ["-b:a", str(target_bitrate)]
+            cmd += (["-f", "mp4"] if output_format == "m4b" else []) + [converted]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise CombineError(f"Could not convert {chapter.audio}: {result.stderr.strip()[-300:]}")
+            parts[chapter.audio] = converted
+            chapter.seconds = probe(converted)[0]
 
     with_chapters = output_format in _CHAPTER_FORMATS
     metadata = os.path.join(scratch, "metadata.txt")
@@ -332,7 +443,7 @@ def combine_audio(chapters: list[Chapter], book: Book, output: str, cover: str, 
             listing = os.path.join(scratch, "parts.txt")
             with open(listing, "w", encoding="utf-8") as fh:
                 for chapter in chapters:
-                    fh.write("file '" + os.path.abspath(chapter.audio).replace("'", "'\\''") + "'\n")
+                    fh.write("file '" + os.path.abspath(parts[chapter.audio]).replace("'", "'\\''") + "'\n")
             cmd += ["-f", "concat", "-safe", "0", "-i", listing]
             audio_inputs = 1
         else:
@@ -403,8 +514,20 @@ def _read(path: str) -> str:
         return fh.read().replace("\r\n", "\n").replace("\r", "\n")
 
 
-def shift_srt(text: str, offset: float, first_index: int) -> tuple[list[str], int]:
-    """SRT cues moved by *offset* seconds and renumbered from *first_index*."""
+def _clamp(start: float, end: float, limit: float | None) -> tuple[float, float]:
+    """Keeps a cue inside its chapter: subtitles may run a little past the chapter's audio."""
+    if limit is None:
+        return start, end
+    start = min(start, limit)
+    return start, max(start, min(end, limit))
+
+
+def shift_srt(text: str, offset: float, first_index: int, limit: float | None = None) -> tuple[list[str], int]:
+    """SRT cues moved by *offset* seconds and renumbered from *first_index*.
+
+    *limit* is the end of the chapter in book time; no cue goes past it, so
+    a chapter's subtitles never overlap the next chapter's.
+    """
     blocks, index = [], first_index
     for block in re.split(r"\n\s*\n", text.strip()):
         lines = block.split("\n")
@@ -414,14 +537,14 @@ def shift_srt(text: str, offset: float, first_index: int) -> tuple[list[str], in
         times = list(_SRT_TIME.finditer(lines[timing]))
         if len(times) < 2:
             continue
-        start, end = (_seconds_from(t) + offset for t in times[:2])
+        start, end = _clamp(*(_seconds_from(t) + offset for t in times[:2]), limit)
         body = lines[timing + 1:]
         blocks.append(f"{index}\n{_srt_time(start)} --> {_srt_time(end)}\n" + "\n".join(body))
         index += 1
     return blocks, index
 
 
-def shift_vtt(text: str, offset: float) -> list[str]:
+def shift_vtt(text: str, offset: float, limit: float | None = None) -> list[str]:
     """WebVTT cues moved by *offset* seconds (the header and notes are dropped)."""
     cues = []
     for block in re.split(r"\n\s*\n", text.strip()):
@@ -434,12 +557,12 @@ def shift_vtt(text: str, offset: float) -> list[str]:
         if not start_match or not end_match:
             continue
         settings = right[end_match.end():].rstrip()
-        start, end = _seconds_from(start_match) + offset, _seconds_from(end_match) + offset
+        start, end = _clamp(_seconds_from(start_match) + offset, _seconds_from(end_match) + offset, limit)
         cues.append(f"{_vtt_time(start)} --> {_vtt_time(end)}{settings}\n" + "\n".join(lines[timing + 1:]))
     return cues
 
 
-def shift_lrc(text: str, offset: float) -> list[str]:
+def shift_lrc(text: str, offset: float, limit: float | None = None) -> list[str]:
     """LRC lines moved by *offset* seconds (per-file tags such as [ti:] are dropped)."""
     lines = []
     for line in text.split("\n"):
@@ -453,6 +576,8 @@ def shift_lrc(text: str, offset: float) -> list[str]:
         for tag in tags:
             minutes, seconds, fraction = int(tag.group(1)), int(tag.group(2)), tag.group(3) or "0"
             value = minutes * 60 + seconds + int(fraction.ljust(3, "0")[:3]) / 1000 + offset
+            if limit is not None:
+                value = min(value, limit)
             lines.append(f"{_lrc_time(value)}{lyric}")
     return lines
 
@@ -474,12 +599,12 @@ def combine_subtitles(chapters: list[Chapter], book: Book, output: str) -> list[
             if path:
                 text = _read(path)
                 if extension == ".srt":
-                    blocks, next_index = shift_srt(text, offset, next_index)
+                    blocks, next_index = shift_srt(text, offset, next_index, offset + chapter.seconds)
                     srt_blocks += blocks
                 elif extension == ".vtt":
-                    vtt_cues += shift_vtt(text, offset)
+                    vtt_cues += shift_vtt(text, offset, offset + chapter.seconds)
                 else:
-                    lrc_lines += shift_lrc(text, offset)
+                    lrc_lines += shift_lrc(text, offset, offset + chapter.seconds)
             offset += chapter.seconds
         target = base + extension
         with open(target, "w", encoding="utf-8") as fh:

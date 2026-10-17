@@ -369,7 +369,7 @@ python combine_book.py part1.zip part2.zip more_chapters/ --progress generation_
 
 - **Inputs:** any mix of folders and ZIP files holding the chapter files (`Chapter 7 - Title.mp3` …) and their subtitles.
 - **`--progress`:** the book's `generation_progress.json`. It gives the chapter order and titles, the author and the cover, and lets the tool stop if a chapter is missing. Without it, chapters are ordered by the number in their file name.
-- **Output:** `-o book.m4b` or `--format mp3` choose the file; by default it is named after the book. When every part has the same format the audio is copied without re-encoding; otherwise it is re-encoded (`--bitrate`, default the book's bitrate).
+- **Output:** `-o book.m4b` or `--format mp3` choose the file; by default it is named after the book. Audio is copied without re-encoding; only chapters whose format differs from the rest are converted to match first (a 213-chapter, 50-hour book combined in about 10 minutes).
 - **Missing chapters:** the tool lists them and stops; `--allow-missing` combines what is there.
 
 ### Notes on Cloud Environments
