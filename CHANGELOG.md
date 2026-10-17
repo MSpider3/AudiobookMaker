@@ -4,7 +4,7 @@ All notable changes to **AudiobookMaker** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.7.0] - 2026-10-18
 
 ### ⚡ Added
 - **Standalone book combiner (`scripts/combine_book.py`)**: joins chapter files downloaded in parts (folders and ZIP files from Kaggle or Colab) into one audiobook with chapter markers, title, author and cover, and merges `.srt` / `.lrc` / `.vtt` subtitles with every cue shifted to its place in the book. Reads chapter order and titles from `generation_progress.json`, stops on missing chapters (`--allow-missing` to override), matches files to chapters by title (file names from older versions carry a different number than the progress file), converts only the chapters whose format differs from the rest and stream-copies everything else, and keeps each chapter's subtitles inside its own time span. Needs only Python and FFmpeg, so it can be downloaded on its own. Checked on a real 213-chapter, 50-hour book.
