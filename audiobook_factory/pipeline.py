@@ -2126,6 +2126,39 @@ def _cleanup_preview_provider() -> None:
 atexit.register(_cleanup_preview_provider)
 
 
+def _preview_chunks(text: str, config: AudiobookConfig) -> list:
+    """The chunks a test text is spoken in, planned like a chapter's."""
+    from audiobook_factory.chunk_planner import plan_chunks
+
+    try:
+        return plan_chunks(
+            text, None, config.max_len, config.pause, getattr(config, "para_pause", config.pause),
+            pack_sentences=getattr(config, "pack_sentences", True),
+        )
+    except Exception as exc:
+        logger.debug("[preview_tts] Could not plan chunks (%s); speaking the text in one piece.", exc)
+        return []
+
+
+def _join_preview_audio(parts: list[bytes | str], pauses: list[float], out_path: str) -> None:
+    """Writes the chunk audio of a preview, with its pauses, as one WAV file."""
+    import io
+
+    import numpy as np
+
+    pieces: list[Any] = []
+    rate = 0
+    for index, part in enumerate(parts):
+        data, part_rate = sf.read(io.BytesIO(part) if isinstance(part, (bytes, bytearray)) else part, dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        rate = rate or part_rate
+        pieces.append(data)
+        if index < len(parts) - 1:
+            pieces.append(np.zeros(int(rate * max(0.0, float(pauses[index]))), dtype=np.float32))
+    sf.write(out_path, np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32), rate or 24000)
+
+
 def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
     """
     Generate a short TTS preview and return raw WAV bytes.
@@ -2172,7 +2205,20 @@ def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
                     # instruct text or transcript are ignored until the model
                     # itself changes.
                     provider.config = config
-            provider.synthesize(text.strip(), config.voice_file, out_path)
+            chunks = _preview_chunks(text.strip(), config)
+            if len(chunks) <= 1:
+                provider.synthesize(text.strip(), config.voice_file, out_path)
+            else:
+                # Long test text is cut like a chapter: one call for several
+                # paragraphs runs past the engine's length budget.
+                voice_bytes = b""
+                if config.voice_file and os.path.isfile(config.voice_file):
+                    with open(config.voice_file, "rb") as vf:
+                        voice_bytes = vf.read()
+                results = provider.synthesize_batch(
+                    texts=[chunk.text for chunk in chunks], voice_ref=voice_bytes, return_bytes=True,
+                )
+                _join_preview_audio([audio for audio, _ in results], [c.pause_after for c in chunks], out_path)
             if os.path.exists(out_path):
                 with open(out_path, "rb") as f:
                     return f.read()

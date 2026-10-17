@@ -234,3 +234,62 @@ async def test_wait_for_other_providers_cancels_promptly():
     assert cancel_token.is_cancelled is True
     pool_a.release(provider_a)
 
+
+
+class TestPreviewOfLongText:
+    """A long test text is cut into chunks like a chapter, not sent as one call.
+
+    A 1,065-character test paragraph went to Qwen3-TTS in one piece, ran past
+    its length budget and came back as runaway audio.
+    """
+
+    def test_long_text_is_spoken_in_chunks_and_joined(self, monkeypatch):
+        import io
+
+        import soundfile as sf
+
+        from audiobook_factory import pipeline as pipeline_mod
+
+        pipeline_mod._cleanup_preview_provider()
+        calls: list[list[str]] = []
+
+        class _Recording(MockTTSProvider):
+            def synthesize_batch(self, texts, voice_ref, *, return_bytes=True):
+                calls.append(list(texts))
+                return super().synthesize_batch(texts, voice_ref, return_bytes=return_bytes)
+
+        monkeypatch.setattr(
+            "audiobook_factory.tts_providers.get_tts_provider",
+            lambda name, config, device=None, dtype_override=None: _Recording(config, device="cpu"),
+        )
+        sentence = "The tide went out at dawn, as it had every morning since the lighthouse was built. "
+        text = "\n\n".join(sentence * 3 for _ in range(4))          # about 1,000 characters
+        cfg = AudiobookConfig(tts_provider_name="mock", max_len=399, pause=0.5, para_pause=1.0)
+        try:
+            wav = pipeline_mod.preview_tts(text, cfg)
+        finally:
+            pipeline_mod._cleanup_preview_provider()
+
+        assert len(calls) == 1 and len(calls[0]) >= 3, "the text must be cut into chunks"
+        assert all(len(chunk) <= 399 for chunk in calls[0])
+        assert "".join(calls[0]).replace(" ", "") == text.replace("\n", "").replace(" ", "")
+        data, rate = sf.read(io.BytesIO(wav))
+        assert len(data) / rate > 1.0                           # one WAV with all chunks and pauses
+
+    def test_short_text_still_goes_through_synthesize(self, monkeypatch):
+        from audiobook_factory import pipeline as pipeline_mod
+
+        pipeline_mod._cleanup_preview_provider()
+
+        class _NoBatch(MockTTSProvider):
+            def synthesize_batch(self, *args, **kwargs):
+                raise AssertionError("one short sentence must not be batched")
+
+        monkeypatch.setattr(
+            "audiobook_factory.tts_providers.get_tts_provider",
+            lambda name, config, device=None, dtype_override=None: _NoBatch(config, device="cpu"),
+        )
+        try:
+            assert pipeline_mod.preview_tts("Hello there.", AudiobookConfig(tts_provider_name="mock"))
+        finally:
+            pipeline_mod._cleanup_preview_provider()
