@@ -323,6 +323,25 @@ class TestWhisperPerGpu:
         assert _SlowWhisper.peak == 2
         assert loaded == _DEVICES  # loaded once per GPU, by prepare()
 
+    def test_whisper_models_load_one_at_a_time(self, monkeypatch):
+        verifier = ChunkVerifier("asr")
+        active, peak = [0], [0]
+
+        def _load(device):
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            time.sleep(0.2)
+            active[0] -= 1
+            return _SlowWhisper(), "faster-whisper"
+
+        monkeypatch.setattr(verifier, "_load_asr", _load)
+        threads = [threading.Thread(target=verifier.prepare, args=(d,)) for d in _DEVICES]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert peak[0] == 1 and set(verifier._models) == set(_DEVICES)
+
     def test_prepare_does_nothing_without_asr(self, monkeypatch):
         verifier = ChunkVerifier("duration")
         monkeypatch.setattr(verifier, "_load_asr", lambda device: pytest.fail("Whisper loaded"))

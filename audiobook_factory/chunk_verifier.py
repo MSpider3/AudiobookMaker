@@ -251,6 +251,9 @@ def error_rate(reference: str, hypothesis: str) -> float:
     return previous[-1] / len(ref)
 
 
+_ASR_LOAD_LOCK = threading.Lock()
+
+
 class ChunkVerifier:
     """Judges synthesized chunks. One instance is shared by all GPU workers.
 
@@ -387,7 +390,10 @@ class ChunkVerifier:
         """
         if device not in self._models and device not in self._failed:
             try:
-                self._models[device] = self._load_asr(device)
+                # One load at a time: two transformers loads from two threads
+                # fail ("Cannot copy out of meta tensor"), seen on 2 x T4.
+                with _ASR_LOAD_LOCK:
+                    self._models[device] = self._load_asr(device)
             except Exception as exc:
                 self._failed.add(device)
                 logger.warning(
