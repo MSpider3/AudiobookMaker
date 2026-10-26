@@ -99,7 +99,6 @@ try:
         class AudiobookConfig:
             tts_provider_name = "qwen"
             device = "cuda"
-            worker_count = 4
             gpu_count = 0
         cfg = AudiobookConfig()
 
@@ -151,7 +150,7 @@ except ImportError:
 print("\n" + "=" * 62)
 print("All Kaggle pre-run diagnostic checks passed!")
 if len(devices) > 1:
-    print(f"Recommended Settings for Dual GPU: worker_count=8 | parallel_mode=chunks")
+    print("Recommended Settings for Dual GPU: parallel_mode=chunks (or auto)")
 else:
-    print("Recommended Settings: worker_count=4 | parallel_mode=chunks")
+    print("Recommended Settings: parallel_mode=chunks")
 print("=" * 62)

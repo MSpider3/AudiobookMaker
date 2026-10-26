@@ -61,6 +61,21 @@ class TestWorkShare:
         sizes = [len(share.take(work, batch_size=8)) for _ in range(3)]
         assert sizes == [3, 2, 2]
 
+    def test_long_and_short_chunks_are_split_by_text_not_by_count(self):
+        # Chapter 1 of the long test book, longest first: by count the first
+        # GPU got 2,500 characters and the second 684 (Kaggle, 7x slower).
+        lengths = [393, 385, 383, 381, 372, 298, 288, 241, 161, 129, 128, 25]
+        work: queue.Queue = queue.Queue()
+        for index, length in enumerate(lengths):
+            work.put((index, "x" * length))
+        share = _WorkShare(workers=2)
+        first = share.take(work, batch_size=16)
+        second = share.take(work, batch_size=16)
+        a, b = (sum(len(text) for _, text in batch) for batch in (first, second))
+        assert work.empty() and abs(a - b) < 400   # within one chunk of an even split
+        assert abs(len(first) - len(second)) <= 1   # and the same number of chunks
+        assert {first[0][0], second[0][0]} == {0, 1}  # each gets one of the two longest
+
     def test_every_chunk_is_taken_exactly_once(self):
         share, work = _WorkShare(workers=3), _queue_of(17)
         taken = []
@@ -99,7 +114,7 @@ class _Recorder:
 
     def __call__(self, batch, provider, voice_ref, config, out_dir, master_queue,
                  cancel_token, progress_state, chapter_index, verifier,
-                 chunk_completed_cb, note_written, chunk_flagged_cb):
+                 chunk_completed_cb, note_written, chunk_flagged_cb, device=None):
         time.sleep(self.seconds_per_batch)
         if provider.device == self.failing_device:
             raise RuntimeError(f"{provider.device} broke")
@@ -163,7 +178,7 @@ class TestStageBWorkers:
 
     def test_chunks_stay_queued_when_every_device_fails(self, monkeypatch):
         class _AlwaysFails(_Recorder):
-            def __call__(self, batch, provider, *args):
+            def __call__(self, batch, provider, *args, **kwargs):
                 raise RuntimeError(f"{provider.device} broke")
 
         work, errors, stats, sentinels = _run_workers(monkeypatch, _AlwaysFails(), chunk_count=4)

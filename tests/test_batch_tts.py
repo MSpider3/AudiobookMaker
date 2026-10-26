@@ -23,7 +23,6 @@ def run_test():
         tts_provider_name="qwen",
         tts_model_name="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         device=device,
-        worker_count=4,
         parallel_mode="chunks",
         output_dir=test_out_dir
     )

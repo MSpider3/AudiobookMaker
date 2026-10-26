@@ -24,10 +24,10 @@ class TestCliHeadless:
 
     def test_arg_parser_defaults_and_flags(self):
         parser = _build_parser()
-        args = parser.parse_args(["/tmp/progress.json", "--output-format", "wav", "--worker-count", "4"])
+        args = parser.parse_args(["/tmp/progress.json", "--output-format", "wav", "--gpu-count", "2"])
         assert args.config_json == "/tmp/progress.json"
         assert args.output_format == "wav"
-        assert args.worker_count == 4
+        assert args.gpu_count == 2
 
     def test_load_config_merges_settings(self):
         with tempfile.TemporaryDirectory() as td:
@@ -41,7 +41,7 @@ class TestCliHeadless:
                 json.dump(data, f)
 
             parser = _build_parser()
-            args = parser.parse_args([json_path, "--worker-count", "8"])
+            args = parser.parse_args([json_path, "--gpu-count", "1"])
             meta, settings, chapters, path = _load_config(args)
 
             assert meta["book_title"] == "CLI Test Novel"

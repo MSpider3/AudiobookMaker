@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_F5_MAX_REFERENCE_SECONDS: float = 12.0   # f5_tts preprocess_ref_audio_text clips longer clips
+
 
 class F5TTSProvider(BaseTTSProvider):
     """
@@ -121,23 +123,20 @@ class F5TTSProvider(BaseTTSProvider):
                 "F5-TTS model is not loaded. Please install f5-tts (pip install f5-tts) or switch providers."
             )
 
-        ref_file = voice_ref if isinstance(voice_ref, str) else None
-        _tmp_ref_file: str | None = None
-        if isinstance(voice_ref, bytes):
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-                tf.write(voice_ref)
-                ref_file = tf.name
-                _tmp_ref_file = tf.name
+        ref_file = self.resolve_voice_path(voice_ref)
 
         try:
             nfe_step = int(self.option("nfe_step", getattr(self.config, "nfe_step", 32)))
             speed = getattr(self.config, "speed", 1.0)
             seed = getattr(self.config, "seed", -1)
 
-            # An empty ref_text makes F5-TTS transcribe the clip itself; use
-            # the user's transcript when they supplied one.
+            # F5-TTS keeps at most ~12 s of the reference clip. Its transcript
+            # must match what is kept, or the model reads the rest aloud
+            # before the text (seen on Kaggle with a 22 s clip). For a longer
+            # clip an empty ref_text makes F5 transcribe the part it keeps.
             ref_text = (getattr(self.config, "voice_transcript", "") or "").strip()
+            if ref_text and sf.info(ref_file).duration > _F5_MAX_REFERENCE_SECONDS:
+                ref_text = ""
 
             infer_kwargs: dict[str, Any] = {
                 "ref_file": ref_file,
@@ -155,12 +154,6 @@ class F5TTSProvider(BaseTTSProvider):
         except Exception as exc:
             logger.error("[F5-TTS] Inference error: %s", exc)
             raise RuntimeError(f"F5-TTS synthesis failed: {exc}") from exc
-        finally:
-            if _tmp_ref_file is not None:
-                try:
-                    os.unlink(_tmp_ref_file)
-                except OSError:
-                    pass
 
         duration = len(audio_data) / float(sample_rate) if sample_rate > 0 else est_duration
 

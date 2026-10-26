@@ -363,39 +363,30 @@ pub fn master_audio_rust(
         .map(|path| read_wav_samples(path))
         .collect();
 
-    // Verify all decoded successfully and determine sample rate
+    // Every file must decode: skipping one would silently drop its audio
+    // (a partial file holds up to 20 chunks).
     let mut sample_rate = default_sample_rate;
     let mut chunks = Vec::with_capacity(decoded_results.len());
 
     for (p, res) in chunk_paths.iter().zip(decoded_results.into_iter()) {
-        match res {
-            Ok((samples, rate)) => {
-                sample_rate = rate; // use the rate from the files
-                chunks.push(samples);
-            }
-            Err(e) => {
-                println!("[Master Rust] Warning: Failed to read chunk {}: {}", p, e);
-                // We keep going but skip this corrupt chunk
-            }
-        }
-    }
-
-    if chunks.is_empty() {
-        return Err("No valid WAV files were decoded.".to_string());
+        let (samples, rate) = res.map_err(|e| format!("Failed to read chunk {}: {}", p, e))?;
+        sample_rate = rate; // use the rate from the files
+        chunks.push(samples);
     }
 
     // Concatenate all chunks adding silence pause between them
     let pause_len = (pause_sec * sample_rate as f64) as usize;
     let pause_samples = vec![0.0f32; pause_len];
-    
-    let total_len: usize = chunks.iter().map(|c| c.len()).sum::<usize>() 
+
+    let total_len: usize = chunks.iter().map(|c| c.len()).sum::<usize>()
         + (chunks.len() - 1) * pause_len;
-        
+
     let mut concatenated = Vec::with_capacity(total_len);
-    
+    let last = chunks.len() - 1;
+
     for (i, chunk) in chunks.into_iter().enumerate() {
         concatenated.extend_from_slice(&chunk);
-        if i < chunk_paths.len() - 1 {
+        if i < last {
             concatenated.extend_from_slice(&pause_samples);
         }
     }

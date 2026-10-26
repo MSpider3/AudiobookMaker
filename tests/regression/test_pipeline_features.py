@@ -220,10 +220,9 @@ class TestChunkVerifier:
     def test_asr_mode_rejects_a_transcript_that_does_not_match(self, monkeypatch):
         verifier = ChunkVerifier("asr", max_error_rate=0.3)
         text = "This sentence has about sixty characters of ordinary narration."
-        monkeypatch.setattr(verifier, "_asr", object())
-        monkeypatch.setattr(verifier, "_transcribe", lambda samples, rate: "completely different words were spoken")
+        monkeypatch.setattr(verifier, "_transcribe", lambda samples, rate, device=None: "completely different words were spoken")
         assert not verifier.check(text, self._wav(4.5), 4.5).ok
-        monkeypatch.setattr(verifier, "_transcribe", lambda samples, rate: text.lower())
+        monkeypatch.setattr(verifier, "_transcribe", lambda samples, rate, device=None: text.lower())
         assert verifier.check(text, self._wav(4.5), 4.5).ok
 
 

@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
 _MAX_COMPLETED_TASKS: int = 50
+# A task keeps its newest log lines only; older ones are counted in log_base.
+_MAX_TASK_LOG_LINES: int = 10_000
+_LOG_TRIM_SLACK: int = 1_000
+# Events waiting for one WebSocket client; a slow client loses the oldest.
+_MAX_SUBSCRIBER_EVENTS: int = 1_000
 # Config fields that name a file the pipeline reads.
 _PATH_FIELDS: tuple[str, ...] = ("voice_file", "cover_image", "voice_preset")
 _SCALAR_TYPES: tuple[type, ...] = (str, int, float, bool, type(None))
@@ -201,6 +206,8 @@ class Task:
     status: str = "queued"  # queued, running, completed, failed, cancelled
     progress: float = 0.0
     logs: List[str] = field(default_factory=list)
+    # Log lines dropped from the front of ``logs`` (they stay countable).
+    log_base: int = 0
     output_files: List[str] = field(default_factory=list)
     error_message: Optional[str] = None
     # Wall-clock times (seconds since the epoch).
@@ -246,7 +253,13 @@ class Task:
 
     async def add_log(self, text: str):
         self.logs.append(text)
-        await self.broadcast({"type": "log", "message": text})
+        index = self.log_base + len(self.logs) - 1
+        if len(self.logs) > _MAX_TASK_LOG_LINES + _LOG_TRIM_SLACK:
+            dropped = len(self.logs) - _MAX_TASK_LOG_LINES
+            del self.logs[:dropped]
+            self.log_base += dropped
+        # The absolute line number lets a client resume polling at the right line.
+        await self.broadcast({"type": "log", "message": text, "index": index})
 
     async def set_progress(self, val: float):
         self.progress = val
@@ -286,6 +299,15 @@ class Task:
         for sub in list(self.subscribers):
             try:
                 sub.put_nowait(data)
+            except asyncio.QueueFull:
+                # A slow client: drop its oldest event so the newest (status,
+                # session end) still arrive.
+                try:
+                    sub.get_nowait()
+                    sub.task_done()
+                    sub.put_nowait(data)
+                except (asyncio.QueueEmpty, asyncio.QueueFull, ValueError):
+                    pass
             except Exception:
                 pass
 

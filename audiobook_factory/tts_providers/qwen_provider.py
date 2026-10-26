@@ -2104,7 +2104,7 @@ class QwenTTSProvider(BaseTTSProvider):
         if out_of_memory and len(texts) == 1:
             raise RuntimeError(
                 f"CUDA out of memory on {self._device} for a single chunk of {len(texts[0])} chars. "
-                "Lower max_len or worker_count, or use the 0.6B checkpoint."
+                "Lower max_len or batch_size, or use the 0.6B checkpoint."
             ) from failure
         if len(texts) > 1:
             if out_of_memory:

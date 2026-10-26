@@ -36,7 +36,6 @@ class TestProgressPersistenceRegression:
                 output_dir=td,
                 output_format="mp3",
                 tts_provider_name="mock",
-                worker_count=1,
             )
 
             sentences = [f"Sentence number {i} in the persistence test chapter." for i in range(5)]

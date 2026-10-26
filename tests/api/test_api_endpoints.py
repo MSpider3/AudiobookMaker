@@ -581,8 +581,8 @@ class TestCancelAndWebSocket:
             with client.websocket_connect("/api/v1/ws/ws-history") as ws:
                 received = [ws.receive_json() for _ in range(4)]
                 assert received == [
-                    {"type": "log", "message": "first line"},
-                    {"type": "log", "message": "second line"},
+                    {"type": "log", "message": "first line", "index": 0},
+                    {"type": "log", "message": "second line", "index": 1},
                     {"type": "progress", "progress": 0.25},
                     {"type": "status", "status": "running"},
                 ]

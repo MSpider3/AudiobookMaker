@@ -53,7 +53,6 @@ class TestCoverEncodingRegression:
                 output_dir=td,
                 output_format="mp3",
                 tts_provider_name="mock",
-                worker_count=1,
             )
 
             chapters = [

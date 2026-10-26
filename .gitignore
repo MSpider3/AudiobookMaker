@@ -80,6 +80,8 @@ desktop.ini
 *.ipynb
 !AudiobookMaker_Colab.ipynb
 !AudiobookMaker_Kaggle.ipynb
+!AudiobookMaker_Colab_Try_Engines.ipynb
+!AudiobookMaker_Kaggle_Try_Engines.ipynb
 !program_testing.ipynb
 
 # ── Logs ─────────────────────────────────────────────────────────────────────

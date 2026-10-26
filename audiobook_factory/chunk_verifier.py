@@ -251,6 +251,9 @@ def error_rate(reference: str, hypothesis: str) -> float:
     return previous[-1] / len(ref)
 
 
+_ASR_LOAD_LOCK = threading.Lock()
+
+
 class ChunkVerifier:
     """Judges synthesized chunks. One instance is shared by all GPU workers.
 
@@ -282,10 +285,12 @@ class ChunkVerifier:
         self.speed: float = float(speed or 1.0)
         self.asr_model: str = asr_model
         self.max_error_rate: float = float(max_error_rate)
-        self._asr: Any = None
-        self._asr_backend: str = ""
-        self._asr_failed: bool = False
-        self._lock = threading.Lock()
+        # One Whisper per device, each behind its own lock: with a single
+        # shared model every GPU worker queued behind the others' transcripts.
+        self._models: dict[str, tuple[Any, str]] = {}
+        self._failed: set[str] = set()
+        self._locks: dict[str, threading.Lock] = {}
+        self._guard = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -330,29 +335,36 @@ class ChunkVerifier:
 
     # ── ASR ──────────────────────────────────────────────────────────────────
 
-    def _load_asr(self) -> None:
-        """Loads Whisper once, preferring faster-whisper, on the freest GPU."""
-        device, compute_type = "cpu", "int8"
+    def _lock_for(self, device: str) -> threading.Lock:
+        with self._guard:
+            return self._locks.setdefault(device, threading.Lock())
+
+    @staticmethod
+    def _freest_device() -> str:
+        """The CUDA device with most free memory, or "cpu"."""
         try:
             import torch
             if torch.cuda.is_available():
                 free = [torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())]
-                index = max(range(len(free)), key=free.__getitem__)
-                device, compute_type = f"cuda:{index}", "float16"
+                return f"cuda:{max(range(len(free)), key=free.__getitem__)}"
         except Exception as exc:
             logger.debug("Could not probe CUDA for the ASR verifier: %s", exc)
+        return "cpu"
 
+    def _load_asr(self, device: str) -> tuple[Any, str]:
+        """Loads Whisper on *device*, preferring faster-whisper."""
+        on_gpu = device.startswith("cuda")
+        index = int(device.split(":")[1]) if on_gpu and ":" in device else 0
         try:
             from faster_whisper import WhisperModel  # type: ignore
 
             name = self.asr_model.split("/")[-1].replace("whisper-", "")
-            kwargs: dict[str, Any] = {"compute_type": compute_type}
-            if device.startswith("cuda"):
-                kwargs.update(device="cuda", device_index=int(device.split(":")[1]))
+            kwargs: dict[str, Any] = {"compute_type": "float16" if on_gpu else "int8"}
+            if on_gpu:
+                kwargs.update(device="cuda", device_index=index)
             else:
                 kwargs.update(device="cpu")
-            self._asr = WhisperModel(name, **kwargs)
-            self._asr_backend = "faster-whisper"
+            model, backend = WhisperModel(name, **kwargs), "faster-whisper"
         except Exception as exc:
             # Not installed, or its CUDA/cuDNN build does not match this
             # machine: the transformers implementation needs nothing extra.
@@ -361,18 +373,49 @@ class ChunkVerifier:
             import torch
             from transformers import pipeline  # type: ignore
 
-            on_gpu = device.startswith("cuda")
-            self._asr = pipeline(
+            model = pipeline(
                 "automatic-speech-recognition",
                 model=self.asr_model,
-                device=int(device.split(":")[1]) if on_gpu else -1,
+                device=index if on_gpu else -1,
                 dtype=torch.float16 if on_gpu else torch.float32,
             )
-            self._asr_backend = "transformers"
-        logger.info("[verify] ASR %s (%s) loaded on %s.", self.asr_model, self._asr_backend, device)
+            backend = "transformers"
+        logger.info("[verify] ASR %s (%s) loaded on %s.", self.asr_model, backend, device)
+        return model, backend
 
-    def _transcribe(self, samples: Any, rate: int) -> str:
-        """Transcribes one chunk. Returns "" when ASR is unavailable."""
+    def _model_for(self, device: str) -> tuple[Any, str] | None:
+        """The Whisper of *device*, loaded on first use; None if it cannot load.
+
+        The caller holds ``self._lock_for(device)``.
+        """
+        if device not in self._models and device not in self._failed:
+            try:
+                # One load at a time: two transformers loads from two threads
+                # fail ("Cannot copy out of meta tensor"), seen on 2 x T4.
+                with _ASR_LOAD_LOCK:
+                    self._models[device] = self._load_asr(device)
+            except Exception as exc:
+                self._failed.add(device)
+                logger.warning(
+                    "[verify] Could not load ASR model %s on %s (%s). "
+                    "Falling back to duration-only verification there.", self.asr_model, device, exc,
+                )
+        return self._models.get(device)
+
+    def prepare(self, device: str | None = None) -> None:
+        """Loads the Whisper of *device* now, if ASR checking is on.
+
+        A GPU worker calls this before measuring free memory for its batch
+        size, so the batches leave room for Whisper.
+        """
+        if self.mode != "asr":
+            return
+        device = device or self._freest_device()
+        with self._lock_for(device):
+            self._model_for(device)
+
+    def _transcribe(self, samples: Any, rate: int, device: str | None = None) -> str | None:
+        """Transcribes one chunk on *device*. Returns None when ASR is unavailable."""
         import numpy as np
 
         if rate != _ASR_SAMPLE_RATE:
@@ -387,29 +430,23 @@ class ChunkVerifier:
         samples = np.ascontiguousarray(samples, dtype=np.float32)
         language = _WHISPER_LANGUAGE_CODES.get(self.language.lower().strip())
 
-        with self._lock:
-            if self._asr is None and not self._asr_failed:
-                try:
-                    self._load_asr()
-                except Exception as exc:
-                    self._asr_failed = True
-                    logger.warning(
-                        "[verify] Could not load ASR model %s (%s). "
-                        "Falling back to duration-only verification.", self.asr_model, exc,
-                    )
-            if self._asr is None:
-                return ""
-            if self._asr_backend == "faster-whisper":
+        device = device or self._freest_device()
+        with self._lock_for(device):
+            loaded = self._model_for(device)
+            if loaded is None:
+                return None
+            model, backend = loaded
+            if backend == "faster-whisper":
                 # No carry-over between 30 s windows: with it, one misheard
                 # window makes Whisper repeat or invent the text that follows.
                 # No prompt either: Whisper repeats a prompt back as speech
                 # when a window starts quietly.
-                segments, _ = self._asr.transcribe(
+                segments, _ = model.transcribe(
                     samples, language=language, beam_size=1, condition_on_previous_text=False,
                 )
                 return " ".join(segment.text for segment in segments).strip()
             generate_kwargs = {"language": language} if language else {}
-            result = self._asr(
+            result = model(
                 {"array": samples, "sampling_rate": _ASR_SAMPLE_RATE},
                 chunk_length_s=30,
                 generate_kwargs=generate_kwargs,
@@ -418,11 +455,12 @@ class ChunkVerifier:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    def check(self, text: str, wav_bytes: bytes, duration: float) -> ChunkVerdict:
+    def check(self, text: str, wav_bytes: bytes, duration: float, device: str | None = None) -> ChunkVerdict:
         """Judges one synthesized chunk.
 
-        Never raises: a verifier failure accepts the chunk rather than
-        failing the chapter.
+        *device* is the GPU that made the chunk; its own Whisper transcribes
+        it (None: the freest GPU). Never raises: a verifier failure accepts
+        the chunk rather than failing the chapter.
         """
         if not self.enabled:
             return ChunkVerdict(True)
@@ -430,8 +468,8 @@ class ChunkVerifier:
             verdict, samples, rate = self._check_signal(text, wav_bytes, duration)
             if not verdict.ok or self.mode != "asr" or samples is None:
                 return verdict
-            transcript = self._transcribe(samples, rate)
-            if not transcript and self._asr is None:
+            transcript = self._transcribe(samples, rate, device)
+            if transcript is None:
                 return verdict
             rate_of_error = error_rate(text, transcript)
             if rate_of_error > self.max_error_rate:
@@ -447,8 +485,9 @@ class ChunkVerifier:
 
     def close(self) -> None:
         """Releases the ASR model."""
-        with self._lock:
-            self._asr = None
+        for device in list(self._models):
+            with self._lock_for(device):
+                self._models.pop(device, None)
         try:
             import torch
             if torch.cuda.is_available():

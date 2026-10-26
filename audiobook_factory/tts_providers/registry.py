@@ -27,6 +27,8 @@ _PROVIDERS: dict[str, tuple[str, str]] = {
     "fish":      ("audiobook_factory.tts_providers.fish_provider", "FishSpeechProvider"),
     "higgs":     ("audiobook_factory.tts_providers.higgs_provider", "HiggsAudioProvider"),
     "f5tts":     ("audiobook_factory.tts_providers.f5tts_provider", "F5TTSProvider"),
+    "breeze":    ("audiobook_factory.tts_providers.breeze_provider", "BreezeTTSProvider"),
+    "ming":      ("audiobook_factory.tts_providers.ming_provider", "MingTTSProvider"),
     "mock":      ("tests.fixtures.mock_provider", "MockTTSProvider"),
 }
 
@@ -39,6 +41,8 @@ _ALIASES: dict[str, str] = {
     "fish-speech": "fish", "fishspeech": "fish", "s2-pro": "fish", "fish-s2-pro": "fish",
     "higgs-audio": "higgs", "higgs-audio-v3": "higgs", "higgs-v3": "higgs", "higgs-tts": "higgs",
     "f5-tts": "f5tts", "f5_tts": "f5tts",
+    "breeze-tts": "breeze", "breeze-tts-2": "breeze",
+    "ming-tts": "ming", "ming-3.0-tts": "ming", "ming3": "ming",
     "dummy": "mock", "test": "mock",
 }
 

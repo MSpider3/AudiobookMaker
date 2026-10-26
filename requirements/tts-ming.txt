@@ -1,0 +1,30 @@
+# ─── AudiobookMaker — Ming-3.0-TTS provider (tts_provider_name = "ming") ──────
+# Provider: audiobook_factory/tts_providers/ming_provider.py
+# Upstream: https://github.com/inclusionAI/Ming-3.0-tts  (model: inclusionAI/Ming-3.0-tts-0.5B)
+#
+# Install with:  pip install -r requirements/tts-ming.txt
+# then clone the code (not a pip package) and point the provider at it:
+#
+#   git clone https://github.com/inclusionAI/Ming-3.0-tts.git
+#   git -C Ming-3.0-tts checkout 028c1ea
+#   export ABM_MING_REPO=$PWD/Ming-3.0-tts
+#
+# ONE ENGINE PER ENVIRONMENT: this pins transformers 4.46.3 (upstream's pin).
+# Measured on Kaggle T4s: under transformers 4.57.3 the model, even upstream's
+# own example, speaks unintelligible babble; under 4.46.3 it was word-perfect
+# in English and Chinese. Qwen3-TTS (4.57.x) will not load next to it.
+# Keep the environment's torch / torchaudio (upstream's torch 2.6.0 pin is not
+# needed; torch 2.11 worked).
+#
+# Weights: 3 GB (bfloat16), public, downloaded on first use.
+# Licence: MIT (code and weights).
+
+transformers==4.46.3
+accelerate==1.3.0
+x_transformers==2.9.2
+diffusers==0.33.0
+onnxruntime
+inflect
+loguru
+einops
+soundfile

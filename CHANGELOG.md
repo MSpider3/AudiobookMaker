@@ -4,6 +4,42 @@ All notable changes to **AudiobookMaker** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### ⚡ Added
+- **Two new TTS engines**, checked on Kaggle 2 × T4:
+  - **Breeze TTS 2 (`breeze`)**: English / Chinese with style instructions, batched; shares the Qwen3-TTS environment. Weights are research / non-commercial only. On 2 × T4: 0–5% word errors with a narrator clip in the book's language, about 0.9× real time.
+  - **Ming-3.0-TTS 0.5B (`ming`)**: seven languages, MIT licence. Needs transformers 4.46.3 in its own environment: under 4.57.3 even upstream's example is unintelligible on a T4; under 4.46.3 it was word-perfect.
+  - Both run from a clone of their repository (`ABM_BREEZE_REPO`, `ABM_MING_REPO`); the notebooks' engine cell clones it at the reviewed commit.
+- **Fish Audio Drama-3 is listed as planned** in the README: it needs 48 GB+ of GPU memory (FP8 on Ada/Hopper) and transformers 5.19, so it cannot run on Kaggle or Colab.
+
+### 🐛 Fixed
+- **Deadlock with two jobs on one multi-GPU pool (`gpu_pool.py`, `chapter_pipeline.py`)**: a chapter took its GPUs one at a time with no time limit, so job A could hold GPU 0 and job B GPU 1, each waiting forever for the other. A chapter now takes all its GPUs in one step (`ProviderPool.acquire_devices`); a long wait is logged every minute and can be cancelled.
+- **Fallback GPU named after the wrong device**: a chapter pinned to a busy GPU that ran on another one kept the pinned GPU's name and batch size.
+- **Voice previews next to a running job (`pipeline.py`, `app.py`)**: a preview loaded a second copy of the model outside the pool and could run the GPU out of memory, and two previews at once called one model from two threads. A preview now borrows the idle job model, is refused while a book is being generated, and previews run one at a time.
+- **Whisper chunk checks made the GPUs wait on each other (`chunk_verifier.py`)**: one shared Whisper behind one lock. Each GPU now has its own, loaded before its batch size is measured so the batches leave room for it.
+- **Progress file written by two processes (`progress_io.py`)**: the lock only worked inside one process, while the web UI and the API server both write the file (through the same temporary file). Writes now also hold an OS file lock (`generation_progress.json.lock`).
+- **Mastering silently skipped audio it could not read (`master.rs`, `chapter_pipeline.py`)**: a missing or unreadable chunk or partial file (up to 20 chunks) was dropped from the chapter with a warning. Mastering now stops with an error and the chapter is retried. The Rust pause count no longer counts skipped files.
+- **Backend memory grew without limit (`api/`)**: a task keeps its newest 10,000 log lines (`?since=` offsets stay valid) and each WebSocket client at most 1,000 queued events.
+- **Importing the library downloaded NLTK data**: now fetched the first time sentences are split.
+- **README**: config schema 7, no "SIMD" claim, the real chapter file names, sequential model warmup, and an up-to-date guide to adding an engine.
+
+- **Engines installed side by side (`engine_envs.py`, `engine_worker.py`, `tts_providers/remote_provider.py`)**: each engine that needs its own `transformers` gets an environment of its own (`python -m audiobook_factory.engine_envs install <engine>`), sharing torch and the app's packages with the main environment. The app runs it in a worker process per GPU; switching engines needs no reinstall, and ending the worker frees all its GPU memory. Environments are built with `venv --without-pip` plus the main environment's package folders, which also works on Kaggle (whose `venv` cannot see its own packages).
+- **Two notebooks per platform**: *Try engines* (install several engines, hear the same text in each, with speed, GPU memory and Whisper word errors; `audiobook_factory/engine_trial.py`) and *Make the audiobook* (only the chosen engine).
+
+### 🐛 Fixed (found by the Kaggle rounds of the side-by-side engines)
+- **F5-TTS read the end of the narrator transcript aloud** before the text (65% word errors on a chapter): it keeps only ~12 s of the reference clip, so the transcript of a longer clip no longer matches. The transcript is now passed only for clips F5 keeps whole (1.8% word errors after).
+- **One GPU did most of a short chapter**: chunks are queued longest first, and the first GPU took the first half (2,500 against 684 characters). Chunks are now dealt to the free GPUs in turn; on 2 × T4 the busy times came out at 126 / 124 s (Qwen) and 340 / 351 s (MOSS).
+- **Engine workers see only their own GPU** (`CUDA_VISIBLE_DEVICES`).
+
+### 🚀 Changed
+- **Engines that speak one chunk at a time** (Ming, Fish S2 Pro, IndexTTS, F5-TTS) now take one chunk per turn instead of four, so both GPUs finish a chapter together. Measured with Ming on 2 × T4: the GPUs' busy times went from 268 s / 397 s to 274 s / 271 s, and the chapter's synthesis from 397 s to 274 s.
+- **`parallel_mode="auto"` and `"chapters"` measured on 2 × T4**: four 3-minute chapters took 293 s and 294 s (2.6× real time) against 521 s (1.4×) with the default `chunks`. The Kaggle run notebook was run end to end (Rust build, API server, web UI, CLI in all three modes).
+- **README and notebooks: "Which engine should I use?"** — best uses, pros and cons, languages and voice methods (cloning, description, built-in readers) of every engine, marked as the result of automated testing by an AI assistant.
+
+### 🗑️ Removed
+- **`worker_count` / `--worker-count`**: read by nothing. Old progress files that carry it still load.
+
 ## [v1.7.0] - 2026-10-18
 
 ### ⚡ Added

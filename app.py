@@ -816,6 +816,10 @@ def _missing_requirements(info: Any) -> list[str]:
     except Exception:
         Requirement = None  # type: ignore[assignment]
 
+    from audiobook_factory import engine_envs
+
+    if engine_envs.is_installed(str(getattr(info, "name", ""))):
+        return []   # installed with engine_envs, possibly in an environment of its own
     missing: list[str] = []
     for spec in getattr(info, "pip_requirements", ()) or ():
         name = re.split(r"[\s\[<>=!~;@]", str(spec).strip(), maxsplit=1)[0]
@@ -846,7 +850,11 @@ def _missing_requirements(info: Any) -> list[str]:
 
 
 def _install_command(key: str, info: Any) -> str:
-    """The pip command that installs an engine's own dependencies."""
+    """The command that installs an engine's own dependencies."""
+    from audiobook_factory import engine_envs
+
+    if key in engine_envs.SETUPS and key != "qwen":
+        return engine_envs.install_command(key)
     requirements_file = os.path.join("requirements", f"tts-{key}.txt")
     if os.path.isfile(os.path.join(_ROOT, requirements_file)):
         return f"pip install -r {requirements_file}"
@@ -1164,7 +1172,6 @@ _CONFIG_FIELDS_NOT_IN_UI: frozenset[str] = frozenset({
     "book_path",             # the uploaded file, passed in by the handler
     "output_dir",            # derived from the book title
     "redo_chapters",         # set by "Redo selected chapters"
-    "worker_count",          # read by nothing; accepted in old files only
     "device",                # the GPU pool picks devices
     "preview_mode",          # "Preview Chapters" has its own handler
     "retry_failed_at_end",   # always on
@@ -1336,32 +1343,12 @@ def _preview_provider(cfg: AudiobookConfig) -> Any:
     """The provider instance ``preview_tts`` uses, created if necessary.
 
     Shares the pipeline's one-model preview cache, so designing a voice or
-    saving a preset reuses the model a voice test already loaded.
+    saving a preset reuses the model a voice test already loaded. The caller
+    holds ``pipeline._preview_cache_lock``.
     """
     import audiobook_factory.pipeline as pipeline_module
-    from audiobook_factory.tts_providers import get_tts_provider
 
-    getter = getattr(pipeline_module, "get_preview_provider", None)
-    if callable(getter):
-        return getter(cfg)
-    cache = getattr(pipeline_module, "_preview_provider_cache", None)
-    lock = getattr(pipeline_module, "_preview_cache_lock", None)
-    if not isinstance(cache, dict) or lock is None:
-        return get_tts_provider(cfg.tts_provider_name, cfg)
-    key = (cfg.tts_provider_name, getattr(cfg, "tts_model_name", ""), getattr(cfg, "quantization", ""))
-    with lock:
-        provider = cache.get("provider")
-        if provider is None or cache.get("key") != key:
-            if provider is not None:
-                try:
-                    provider.cleanup()
-                except Exception as exc:
-                    logger.warning("Error releasing the previous preview model: %s", exc)
-            provider = get_tts_provider(cfg.tts_provider_name, cfg)
-            cache.update(provider=provider, name=cfg.tts_provider_name, key=key)
-        else:
-            provider.config = cfg
-    return provider
+    return pipeline_module._cached_preview_provider(cfg)
 
 
 def _release_preview_provider() -> None:
@@ -1464,9 +1451,29 @@ def _with_preview_provider(cfg: AudiobookConfig, action: Callable[[Any], Any]) -
     active = _active_local_run()
     if active is not None:
         raise _UiError(f"⚠️ '{active.book_title}' is being generated. Try again after it finishes.")
+    import audiobook_factory.pipeline as pipeline_module
+
     backend_up = is_api_healthy()
     try:
-        return action(_preview_provider(cfg))
+        # One caller per model at a time, and never next to a loaded job pool.
+        with pipeline_module._preview_cache_lock:
+            try:
+                pool = pipeline_module._pool_for_preview(cfg.tts_provider_name)
+                provider = pool.acquire(
+                    cancel_token=pipeline_module._Deadline(pipeline_module._PREVIEW_POOL_WAIT_SEC)
+                ) if pool is not None else None
+            except (RuntimeError, *pipeline_module._CANCELLED_ERRORS) as exc:
+                if not isinstance(exc, RuntimeError):
+                    exc = RuntimeError("A book is being generated. Try again after it finishes.")
+                raise _UiError(f"⚠️ {exc}") from exc
+            if provider is None:
+                return action(_preview_provider(cfg))
+            # The idle job model: borrowing it loads no second copy.
+            try:
+                provider.config = cfg
+                return action(provider)
+            finally:
+                pool.release(provider)
     finally:
         if backend_up:
             _release_preview_provider()
@@ -1937,7 +1944,9 @@ async def _listen_task_ws(run: _Run, task_id: str) -> None:
                 kind = data.get("type")
                 if kind == "log":
                     run.add_log(str(data.get("message", "")))
-                    run.remote_log_count += 1
+                    # Lines can be trimmed or dropped on the way: trust the server's index.
+                    index = data.get("index")
+                    run.remote_log_count = int(index) + 1 if isinstance(index, int) else run.remote_log_count + 1
                 elif kind == "progress":
                     run.set_progress(float(data.get("progress") or 0.0))
                 elif kind == "status":
@@ -1991,6 +2000,9 @@ def _poll_task(run: _Run, task_id: str) -> None:
         if "log_offset" not in state:
             # Older backend: the whole log on every request.
             logs = logs[offset:]
+        else:
+            # Later than asked when the backend dropped old lines.
+            offset = int(state["log_offset"])
         for line in logs:
             run.add_log(str(line))
         offset += len(logs)

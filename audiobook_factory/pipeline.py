@@ -8,7 +8,6 @@ New in this version
 - Audiobookshelf-compatible filenames via filename_sanitizer.make_safe_filename()
 - preview_mode      — returns chapter stats table without calling TTS
 - export_text       — writes a .txt file per chapter alongside the audio
-- worker_count      — ThreadPoolExecutor for parallel chapter processing
 - pronunciation_map — regex search-replace applied to text before TTS
 - tts_provider_name — selects which provider to use (currently: "qwen")
 - TTS logic delegated to tts_providers.get_tts_provider()
@@ -84,7 +83,7 @@ from audiobook_factory.progress_io import (
     update_chapter_chunks,
     update_chapter_fields,
     update_chapter_retry,
-    _WRITE_LOCK,
+    _progress_lock,
     _write_unlocked,
 )
 
@@ -160,7 +159,7 @@ def _finalize_progress_file(progress_path: str, chapters: list) -> None:
     if not os.path.exists(progress_path):
         return
     try:
-        with _WRITE_LOCK:
+        with _progress_lock(progress_path):
             data = read_progress_file(progress_path)
             chapter_entries = data.get("chapters", [])
             completed_count = sum(1 for c in chapter_entries if c.get("status") == "completed")
@@ -292,7 +291,6 @@ class AudiobookConfig:
     channels:            int   = 1        # Audio channels (1 = mono, 2 = stereo)
 
     # ── Parallelism & Hardware Optimization ───────────────────────────────────
-    worker_count:        int   = 1       # chapters/chunks in parallel
     parallel_mode:       str   = "chunks" # "chunks" | "chapters" | "auto"
     gpu_count:           int   = 0       # 0 = auto-detect at runtime
     vram_headroom_gb:    float = 2.0     # GB reserved VRAM headroom for dynamic batching
@@ -967,6 +965,8 @@ def run_pipeline(
         finally:
             _update_chapter_prog(num, 1.0)
 
+    # Until the run ends the pool stays loaded, even between chapters.
+    pool.begin_job()
     try:
         max_parallel = _get_chapter_parallelism(pool, config)
         if max_parallel > 1 and config.parallel_mode == "auto":
@@ -1062,6 +1062,7 @@ def run_pipeline(
         return output_files
 
     finally:
+        pool.end_job()
         for p in [prog_path_out, prog_path_tmp]:
             _finalize_progress_file(p, chapters)
         _await_subtitle_futures(subtitle_futures, cancel)
@@ -2106,7 +2107,10 @@ class _ImmediateQueue(queue.Queue):
 # same session, eventually exhausted VRAM. Cache one instance and clean up
 # the old one whenever the requested provider changes.
 _preview_provider_cache: dict[str, Any] = {"name": None, "provider": None, "key": None}
-_preview_cache_lock = threading.Lock()
+# Held for a whole preview, not just the cache lookup: one model must not be
+# called from two threads, and a job's cleanup must wait for a running preview.
+_preview_cache_lock = threading.RLock()
+_PREVIEW_POOL_WAIT_SEC: float = 10.0
 
 
 def _cleanup_preview_provider() -> None:
@@ -2159,74 +2163,133 @@ def _join_preview_audio(parts: list[bytes | str], pauses: list[float], out_path:
     sf.write(out_path, np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32), rate or 24000)
 
 
+class _Deadline:
+    """Cancel token that fires after *seconds* (for ``ProviderPool.acquire``)."""
+
+    def __init__(self, seconds: float) -> None:
+        self._end = time.monotonic() + seconds
+
+    @property
+    def is_cancelled(self) -> bool:
+        return time.monotonic() >= self._end
+
+
+def _pool_for_preview(provider_name: str) -> Any:
+    """The idle job pool of *provider_name* to borrow a model from, or None.
+
+    Refuses while any pool is synthesizing: a preview would then load a
+    second copy of a model, or share a GPU with the job, and run out of
+    memory. Idle pools of other engines are freed so their weights do not
+    sit next to the preview model.
+    """
+    from audiobook_factory.gpu_pool import GPUPoolManager
+
+    manager = GPUPoolManager.instance()
+    pools = manager.all_pools()
+    busy = [name for name, pool in pools.items() if not pool.is_idle]
+    if busy:
+        raise RuntimeError(
+            f"A book is being generated with {', '.join(busy)}. Test the voice after it finishes "
+            "(a preview now would load a second copy of the model)."
+        )
+    for name in pools:
+        if name != provider_name:
+            try:
+                manager.evict(name)
+            except RuntimeError as exc:
+                raise RuntimeError(f"A book is being generated with {name}. Test the voice after it finishes.") from exc
+    return pools.get(provider_name)
+
+
+def _cached_preview_provider(config: AudiobookConfig) -> Any:
+    """The one cached preview model, (re)created for *config* if needed.
+
+    The caller holds ``_preview_cache_lock``.
+    """
+    from audiobook_factory.tts_providers import get_tts_provider
+
+    provider = _preview_provider_cache.get("provider")
+    cached_name = _preview_provider_cache.get("name")
+    current_key = (
+        config.tts_provider_name,
+        getattr(config, "tts_model_name", getattr(config, "tts_model_variant", "")),
+        getattr(config, "quantization", ""),
+    )
+    if provider is None or _preview_provider_cache.get("key") != current_key or cached_name != config.tts_provider_name:
+        if provider is not None:
+            logger.info(
+                "[preview_tts] Switching preview provider %s -> %s: freeing previous model.",
+                cached_name, config.tts_provider_name,
+            )
+            try:
+                provider.cleanup()
+            except Exception as exc:
+                logger.warning("[preview_tts] Error cleaning up previous preview provider: %s", exc)
+        provider = get_tts_provider(config.tts_provider_name, config)
+        _preview_provider_cache.update(provider=provider, name=config.tts_provider_name, key=current_key)
+    else:
+        # The cached instance still holds the config it was built with;
+        # without this, edited sampling settings, language, instruct text or
+        # transcript are ignored until the model itself changes.
+        provider.config = config
+    return provider
+
+
+def _speak_preview(provider: Any, text: str, config: AudiobookConfig, out_path: str) -> None:
+    """Synthesizes *text* with *provider* into *out_path*."""
+    chunks = _preview_chunks(text, config)
+    if len(chunks) <= 1:
+        provider.synthesize(text, config.voice_file, out_path)
+        return
+    # Long test text is cut like a chapter: one call for several paragraphs
+    # runs past the engine's length budget.
+    voice_bytes = b""
+    if config.voice_file and os.path.isfile(config.voice_file):
+        with open(config.voice_file, "rb") as vf:
+            voice_bytes = vf.read()
+    results = provider.synthesize_batch(
+        texts=[chunk.text for chunk in chunks], voice_ref=voice_bytes, return_bytes=True,
+    )
+    _join_preview_audio([audio for audio, _ in results], [c.pause_after for c in chunks], out_path)
+
+
 def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
     """
     Generate a short TTS preview and return raw WAV bytes.
     Used by the Voice Studio tab.
 
-    Reuses a single cached provider instance across calls instead of
-    loading a fresh model per click; automatically frees the previous
-    provider's GPU memory when the requested provider name or variant changes.
+    Borrows the model of an idle job pool of the same engine when there is
+    one; otherwise reuses a single cached provider, freeing the previous
+    one's GPU memory when the requested provider name or variant changes.
+    Refuses while a book is being generated. Previews run one at a time.
     """
-    from audiobook_factory.tts_providers import get_tts_provider
-
     if not text.strip():
         return None
 
     with tempfile.TemporaryDirectory(dir=str(_TEMP_DIR)) as tmp:
         out_path = os.path.join(tmp, "preview.wav")
-        try:
-            with _preview_cache_lock:
-                provider = _preview_provider_cache.get("provider")
-                cached_name = _preview_provider_cache.get("name")
-                cached_key = _preview_provider_cache.get("key")
-                current_key = (
-                    config.tts_provider_name,
-                    getattr(config, "tts_model_name", getattr(config, "tts_model_variant", "")),
-                    getattr(config, "quantization", ""),
-                )
-                if provider is None or cached_key != current_key or cached_name != config.tts_provider_name:
-                    if provider is not None:
-                        logger.info(
-                            "[preview_tts] Switching preview provider %s -> %s: freeing previous model.",
-                            cached_name, config.tts_provider_name,
-                        )
-                        try:
-                            provider.cleanup()
-                        except Exception as exc:
-                            logger.warning("[preview_tts] Error cleaning up previous preview provider: %s", exc)
-                    provider = get_tts_provider(config.tts_provider_name, config)
-                    _preview_provider_cache["provider"] = provider
-                    _preview_provider_cache["name"] = config.tts_provider_name
-                    _preview_provider_cache["key"] = current_key
-                else:
-                    # The cached instance still holds the config it was built
-                    # with; without this, edited sampling settings, language,
-                    # instruct text or transcript are ignored until the model
-                    # itself changes.
+        with _preview_cache_lock:
+            pool = _pool_for_preview(config.tts_provider_name)
+            if pool is not None:
+                try:
+                    provider = pool.acquire(cancel_token=_Deadline(_PREVIEW_POOL_WAIT_SEC))
+                except _CANCELLED_ERRORS as exc:
+                    raise RuntimeError("A book is being generated. Test the voice after it finishes.") from exc
+                try:
                     provider.config = config
-            chunks = _preview_chunks(text.strip(), config)
-            if len(chunks) <= 1:
-                provider.synthesize(text.strip(), config.voice_file, out_path)
+                    _speak_preview(provider, text.strip(), config, out_path)
+                finally:
+                    pool.release(provider)
             else:
-                # Long test text is cut like a chapter: one call for several
-                # paragraphs runs past the engine's length budget.
-                voice_bytes = b""
-                if config.voice_file and os.path.isfile(config.voice_file):
-                    with open(config.voice_file, "rb") as vf:
-                        voice_bytes = vf.read()
-                results = provider.synthesize_batch(
-                    texts=[chunk.text for chunk in chunks], voice_ref=voice_bytes, return_bytes=True,
-                )
-                _join_preview_audio([audio for audio, _ in results], [c.pause_after for c in chunks], out_path)
-            if os.path.exists(out_path):
-                with open(out_path, "rb") as f:
-                    return f.read()
-        except Exception as e:
-            logger.warning("[preview_tts] Error: %s", e)
-            # The cached provider may be in a bad state (e.g. OOM mid-load) —
-            # drop it so the next preview call starts clean instead of
-            # repeatedly failing against a half-initialised model.
-            _cleanup_preview_provider()
-            raise e
+                try:
+                    _speak_preview(_cached_preview_provider(config), text.strip(), config, out_path)
+                except Exception as e:
+                    logger.warning("[preview_tts] Error: %s", e)
+                    # The cached provider may be in a bad state (e.g. OOM
+                    # mid-load): drop it so the next preview starts clean.
+                    _cleanup_preview_provider()
+                    raise
+        if os.path.exists(out_path):
+            with open(out_path, "rb") as f:
+                return f.read()
     return None
