@@ -28,6 +28,7 @@ __all__ = ["GPUDetector", "ProviderPool", "GPUPoolManager"]
 _DEFAULT_MIN_VRAM_GB: float = 5.0
 _ACQUIRE_POLL_TIMEOUT_SEC: float = 0.5
 _AFFINITY_PREFER_TIMEOUT_SEC: float = 0.1
+_WAIT_LOG_INTERVAL_SEC: float = 60.0
 _BYTES_PER_GB: float = 1024.0 * 1024.0 * 1024.0
 _DEFAULT_CHUNK_CHARS: int = 399
 _VRAM_PER_CHUNK_GB: float = 0.5
@@ -242,6 +243,8 @@ class ProviderPool:
             dev: queue.Queue(maxsize=1) for dev in self._devices
         }
         self._device_map: dict[str, BaseTTSProvider] = {}
+        # Every take and release happens under this, so a multi-GPU take is atomic.
+        self._available = threading.Condition()
 
         logger.info(
             "Initializing ProviderPool[%s] with %d device(s): %s",
@@ -355,12 +358,35 @@ class ProviderPool:
             return "cpu"
         return self._devices[chapter_index % len(self._devices)]
 
+    def _device_of(self, provider: BaseTTSProvider) -> str | None:
+        """The pool device *provider* was created for."""
+        for device, instance in self._device_map.items():
+            if instance is provider:
+                return device
+        return None
+
+    def _wait_turn(self, started: float, next_log: float, what: str) -> float:
+        """Waits for a release (caller holds ``_available``); logs long waits.
+
+        Returns the time of the next log line.
+        """
+        self._available.wait(timeout=_ACQUIRE_POLL_TIMEOUT_SEC)
+        now = time.monotonic()
+        if now < next_log:
+            return next_log
+        logger.info("[gpu_pool] Waiting %.0fs for %s (pool=%s), in use by another job.",
+                    now - started, what, self._provider_name)
+        return now + _WAIT_LOG_INTERVAL_SEC
+
     def acquire(
         self,
         cancel_token: Any | None = None,
         preferred_device: str | None = None,
     ) -> BaseTTSProvider:
-        """Acquire an available TTS provider from the pool with device affinity.
+        """Acquire one available TTS provider, preferring *preferred_device*.
+
+        The preferred device is waited for briefly; after that any free
+        device is taken. ``device_of_provider`` tells which one it was.
 
         Args:
             cancel_token: Optional cancellation token.
@@ -372,20 +398,57 @@ class ProviderPool:
         Raises:
             CancelledError: If cancellation is requested.
         """
-        if preferred_device and preferred_device in self._device_queues:
-            try:
-                return self._device_queues[preferred_device].get(timeout=_AFFINITY_PREFER_TIMEOUT_SEC)
-            except queue.Empty:
-                pass
+        started = time.monotonic()
+        next_log = started + _WAIT_LOG_INTERVAL_SEC
+        with self._available:
+            while True:
+                _check_cancellation(cancel_token)
+                preferred = self._device_queues.get(preferred_device) if preferred_device else None
+                if preferred is not None and not preferred.empty():
+                    return preferred.get_nowait()
+                if preferred is None or time.monotonic() - started >= _AFFINITY_PREFER_TIMEOUT_SEC:
+                    for dev_queue in self._device_queues.values():
+                        if not dev_queue.empty():
+                            return dev_queue.get_nowait()
+                next_log = self._wait_turn(started, next_log, "a free GPU")
 
-        while True:
-            _check_cancellation(cancel_token)
-            for dev_queue in self._device_queues.values():
-                try:
-                    return dev_queue.get(block=False)
-                except queue.Empty:
-                    continue
-            time.sleep(_ACQUIRE_POLL_TIMEOUT_SEC)
+    def acquire_devices(
+        self,
+        devices: list[str],
+        cancel_token: Any | None = None,
+    ) -> dict[str, BaseTTSProvider]:
+        """Acquire the providers of every device in *devices* in one step.
+
+        Waits until all of them are free and takes them together. Taking
+        GPUs one at a time would let two jobs each hold one and wait forever
+        for the other's.
+
+        Args:
+            devices: Pool devices wanted, e.g. ``["cuda:0", "cuda:1"]``.
+            cancel_token: Optional cancellation token.
+
+        Returns:
+            Provider per device, in the order of *devices*.
+
+        Raises:
+            ValueError: If a device is not in this pool.
+            CancelledError: If cancellation is requested.
+        """
+        unknown = [device for device in devices if device not in self._device_queues]
+        if unknown:
+            raise ValueError(f"Device(s) {unknown} are not in pool {self._provider_name}: {self._devices}")
+        started = time.monotonic()
+        next_log = started + _WAIT_LOG_INTERVAL_SEC
+        with self._available:
+            while True:
+                _check_cancellation(cancel_token)
+                if all(not self._device_queues[device].empty() for device in devices):
+                    return {device: self._device_queues[device].get_nowait() for device in devices}
+                next_log = self._wait_turn(started, next_log, ", ".join(devices))
+
+    def device_of_provider(self, provider: BaseTTSProvider) -> str:
+        """The device *provider* runs on, as named by this pool."""
+        return self._device_of(provider) or str(getattr(provider, "device", "") or "cpu")
 
     def release(self, provider: BaseTTSProvider) -> None:
         """Return a TTS provider instance to its device queue.
@@ -393,16 +456,17 @@ class ProviderPool:
         Args:
             provider: The BaseTTSProvider instance to return.
         """
-        dev = getattr(provider, "device", None)
-        if dev and dev in self._device_queues:
-            self._device_queues[dev].put(provider)
-        else:
-            for q in self._device_queues.values():
-                try:
-                    q.put_nowait(provider)
-                    break
-                except queue.Full:
-                    continue
+        dev = self._device_of(provider) or getattr(provider, "device", None)
+        with self._available:
+            target = self._device_queues.get(dev) if dev else None
+            try:
+                if target is not None:
+                    target.put_nowait(provider)
+                else:
+                    next(q for q in self._device_queues.values() if not q.full()).put_nowait(provider)
+            except (queue.Full, StopIteration):
+                logger.warning("[gpu_pool] Provider for %s released twice or after cleanup; ignored.", dev)
+            self._available.notify_all()
 
     @contextmanager
     def acquire_context(

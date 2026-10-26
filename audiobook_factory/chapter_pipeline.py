@@ -364,6 +364,7 @@ def _verify_and_repair(
     voice_ref: bytes,
     config: AudiobookConfig,
     cancel_token: CancelToken,
+    device: str | None = None,
 ) -> tuple[bytes, float, str | None]:
     """Checks one chunk and re-synthesizes it while it fails.
 
@@ -375,7 +376,7 @@ def _verify_and_repair(
     Raises:
         RuntimeError: If every attempt produced no usable audio at all.
     """
-    verdict = verifier.check(text, audio, duration)
+    verdict = verifier.check(text, audio, duration, device=device)
     if verdict.ok:
         return audio, duration, None
 
@@ -402,7 +403,7 @@ def _verify_and_repair(
             continue
         finally:
             provider.config = config
-        new_verdict = verifier.check(text, new_audio, new_duration)
+        new_verdict = verifier.check(text, new_audio, new_duration, device=device)
         if new_verdict.ok:
             return new_audio, new_duration, None
         if new_verdict.score < best[0]:
@@ -429,6 +430,7 @@ def _synthesize_batch(
     chunk_completed_cb: Callable[[int], None] | None = None,
     chunks_completed_cb: Callable[[list[int]], None] | None = None,
     chunk_flagged_cb: Callable[[int, str], None] | None = None,
+    device: str | None = None,
 ) -> None:
     """Synthesizes one batch, verifies it and hands each chunk to Stage C.
 
@@ -450,6 +452,7 @@ def _synthesize_batch(
             finished by this batch, called once.
         chunk_flagged_cb: Optional callback for chunks kept despite failing
             verification.
+        device: The GPU running *provider*; its own Whisper checks the chunks.
 
     Raises:
         Exception: Anything the provider raises; the caller decides what to
@@ -469,7 +472,7 @@ def _synthesize_batch(
             if verifier is not None and verifier.enabled:
                 data, duration, flag = _verify_and_repair(
                     provider, verifier, chunk_index, text, data, duration,
-                    voice_ref, config, cancel_token,
+                    voice_ref, config, cancel_token, device=device,
                 )
                 if flag and chunk_flagged_cb is not None:
                     chunk_flagged_cb(chunk_index, flag)
@@ -543,6 +546,9 @@ def _stage_b_device_worker(
     retired = False
     holding = False  # True while this worker has a batch the others may need back
     try:
+        if verifier is not None and verifier.enabled:
+            # Load this GPU's Whisper first, so the batch size leaves room for it.
+            verifier.prepare(device)
         batch_size = max(1, _batch_size_for(device, provider, config))
         while not cancel_token.is_cancelled:
             limit = getattr(provider, "batch_size_limit", None)
@@ -575,7 +581,7 @@ def _stage_b_device_worker(
                 _synthesize_batch(
                     batch, provider, voice_ref, config, out_dir, master_queue,
                     cancel_token, progress_state, chapter_index, verifier,
-                    chunk_completed_cb, _note_written, chunk_flagged_cb,
+                    chunk_completed_cb, _note_written, chunk_flagged_cb, device=device,
                 )
                 share.record(device, time.monotonic() - batch_started)
             except CancelledError:
@@ -725,24 +731,22 @@ def run_chapter_pipeline(
     for item in sorted(pending_items, key=lambda entry: len(entry[1]), reverse=True):
         work_queue.put(item)
 
-    # ── Determine active devices & Stage B worker count ───────────────────────
-    if pinned_device is None:
-        active_devices = pool.devices
-    elif isinstance(pinned_device, str):
-        active_devices = [pinned_device]
+    # ── Take the GPUs ─────────────────────────────────────────────────────────
+    # All of a chapter's GPUs are taken in one step: one at a time, two jobs
+    # sharing the pool could each hold one and wait forever for the other.
+    device_providers: dict[str, BaseTTSProvider] = {}
+    if isinstance(pinned_device, str):
+        # One GPU: the pinned one if it frees up quickly, else any free one.
+        provider = pool.acquire(cancel_token=cancel_token, preferred_device=pinned_device)
+        device_providers[pool.device_of_provider(provider)] = provider
     else:
-        # parallel_mode="auto": some of the GPUs, the rest work on other chapters.
-        active_devices = list(pinned_device)
-
+        # None: every GPU of the pool; a tuple (parallel_mode="auto"): just those.
+        device_providers = pool.acquire_devices(
+            pool.devices if pinned_device is None else list(pinned_device), cancel_token=cancel_token,
+        )
+    active_devices = list(device_providers)
     stage_b_thread_count = len(active_devices)
 
-    log_callback(
-        f"  [Ch{chapter_index}] Synthesizing {total_chunks} chunk(s) "
-        f"({cached_count} cached, {pending_count} pending) "
-        f"on {stage_b_thread_count} device(s): {', '.join(active_devices)}..."
-    )
-
-    device_providers: dict[str, BaseTTSProvider] = {}
     stage_b_threads: list[threading.Thread] = []
     worker_errors: list[BaseException] = []
     device_stats: dict[str, int] = {device: 0 for device in active_devices}
@@ -753,13 +757,16 @@ def run_chapter_pipeline(
     _chapter_succeeded: bool = False
 
     try:
-        for device in active_devices:
-            provider = pool.acquire(cancel_token=cancel_token, preferred_device=device)
+        log_callback(
+            f"  [Ch{chapter_index}] Synthesizing {total_chunks} chunk(s) "
+            f"({cached_count} cached, {pending_count} pending) "
+            f"on {stage_b_thread_count} device(s): {', '.join(active_devices)}..."
+        )
+        for provider in device_providers.values():
             # Pools outlive a single run, so a pooled provider still carries
             # the config of whichever job created it. It is exclusively ours
             # until release(), so point it at this job's settings.
             provider.config = config
-            device_providers[device] = provider
 
         for device in active_devices:
             t = threading.Thread(

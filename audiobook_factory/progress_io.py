@@ -21,15 +21,19 @@ import logging
 import os
 import re
 import threading
-from typing import Any
+import time
+from contextlib import ExitStack, contextmanager
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
 _WRITE_LOCK = threading.Lock()
-# Module-level lock protecting all writes to progress JSON files within this process.
-# Prevents concurrent write corruption when chapters run in parallel.
-# Note: This is an in-process thread lock. Cross-process coordination (e.g. across separate
-# CLI/API Python processes writing to the same progress file) requires file-level locking.
+# Serializes the threads of this process. ``_progress_lock`` adds an OS file
+# lock on top, because the web UI and the API server are separate processes
+# that write the same progress file.
+
+_LOCK_SUFFIX: str = ".lock"
+_LOCK_RETRY_SEC: float = 0.05
 
 _SUPPORTED_ENCODINGS: tuple[str, ...] = ("utf-8-sig", "utf-8", "latin-1")
 # Tried in order on read. utf-8-sig strips BOM automatically.
@@ -40,6 +44,54 @@ _MIN_VALID_JSON_SIZE: int = 10
 
 _JSON_OBJECT_PATTERN = re.compile(r'\{', re.MULTILINE)
 # Used to find the start of a JSON object when the file has leading garbage.
+
+
+@contextmanager
+def _os_file_lock(lock_path: str) -> Iterator[None]:
+    """Holds an exclusive OS lock on *lock_path* (blocks until free)."""
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)) or ".", exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(_LOCK_RETRY_SEC)
+            try:
+                yield
+            finally:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _progress_lock(path: str) -> Iterator[None]:
+    """Exclusive access to the progress file *path*, across threads and processes.
+
+    The lock is a sidecar file (``<path>.lock``): the progress file itself is
+    replaced on every write, so a lock on it would not outlive the write.
+    """
+    with _WRITE_LOCK, ExitStack() as stack:
+        try:
+            stack.enter_context(_os_file_lock(path + _LOCK_SUFFIX))
+        except OSError as exc:
+            # A read-only or lock-less filesystem: keep the in-process lock.
+            logger.debug("No file lock for %s (%s); using the in-process lock only.", path, exc)
+        yield
 
 
 def _strip_leading_garbage(raw: str) -> str:
@@ -139,7 +191,7 @@ def write_progress_file(path: str, data: dict[str, Any]) -> None:
     """Writes data to a progress JSON file atomically.
 
     Uses temp file + os.replace() to guarantee the file is never
-    partially written. Thread-safe via module-level _WRITE_LOCK.
+    partially written. Safe across threads and processes (``_progress_lock``).
 
     Args:
         path: Destination path.
@@ -148,7 +200,7 @@ def write_progress_file(path: str, data: dict[str, Any]) -> None:
     Raises:
         OSError: If the write fails.
     """
-    with _WRITE_LOCK:
+    with _progress_lock(path):
         _write_unlocked(path, data)
 
 
@@ -170,7 +222,7 @@ def update_chapter_status(
         reset_chunks: If True, resets completed_chunks to [] for this
                       chapter. Set True when marking "completed".
     """
-    with _WRITE_LOCK:
+    with _progress_lock(path):
         try:
             data = read_progress_file(path)
         except (FileNotFoundError, ValueError) as exc:
@@ -204,14 +256,14 @@ def update_chapter_chunk(
 ) -> None:
     """Appends a completed chunk index to the chapter's completed_chunks list.
 
-    Thread-safe. Uses _WRITE_LOCK to prevent concurrent write corruption.
+    Thread-safe. Holds ``_progress_lock`` to prevent concurrent write corruption.
 
     Args:
         path: Path to generation_progress.json.
         chapter_num: 1-based chapter number.
         chunk_index: Zero-based chunk index to mark as completed.
     """
-    with _WRITE_LOCK:
+    with _progress_lock(path):
         try:
             data = read_progress_file(path)
         except (FileNotFoundError, ValueError) as exc:
@@ -251,7 +303,7 @@ def update_chapter_chunks(
     chunk is the dominant I/O cost of a run. Synthesis finishes chunks a batch
     at a time; this writes the batch in one go.
 
-    Thread-safe. Uses _WRITE_LOCK to prevent concurrent write corruption.
+    Thread-safe. Holds ``_progress_lock`` to prevent concurrent write corruption.
 
     Args:
         path: Path to generation_progress.json.
@@ -260,7 +312,7 @@ def update_chapter_chunks(
     """
     if not chunk_indices:
         return
-    with _WRITE_LOCK:
+    with _progress_lock(path):
         try:
             data = read_progress_file(path)
         except (FileNotFoundError, ValueError) as exc:
@@ -298,7 +350,7 @@ def update_chapter_fields(
 ) -> None:
     """Sets arbitrary fields on one chapter entry (e.g. duration, flagged chunks).
 
-    Thread-safe. Reads, modifies, and writes atomically under _WRITE_LOCK.
+    Thread-safe. Reads, modifies, and writes atomically under ``_progress_lock``.
 
     Args:
         path: Path to generation_progress.json.
@@ -307,7 +359,7 @@ def update_chapter_fields(
     """
     if not fields:
         return
-    with _WRITE_LOCK:
+    with _progress_lock(path):
         try:
             data = read_progress_file(path)
         except (FileNotFoundError, ValueError) as exc:
@@ -333,7 +385,7 @@ def update_chapter_retry(
 ) -> None:
     """Updates a chapter's retry count, last error, and status in progress JSON.
 
-    Thread-safe. Reads, modifies, and writes atomically under _WRITE_LOCK.
+    Thread-safe. Reads, modifies, and writes atomically under ``_progress_lock``.
 
     Args:
         path: Path to generation_progress.json.
@@ -341,7 +393,7 @@ def update_chapter_retry(
         attempt: Retry attempt count.
         error_message: Error string (truncated to 500 characters).
     """
-    with _WRITE_LOCK:
+    with _progress_lock(path):
         try:
             data = read_progress_file(path)
         except (FileNotFoundError, ValueError) as exc:
@@ -369,9 +421,9 @@ def update_chapter_retry(
 
 
 def _write_unlocked(path: str, data: dict[str, Any]) -> None:
-    """Writes data without acquiring _WRITE_LOCK.
+    """Writes data without taking the progress lock.
 
-    INTERNAL USE ONLY. Caller must already hold _WRITE_LOCK.
+    INTERNAL USE ONLY. Caller must already hold ``_progress_lock(path)``.
     Used by update_chapter_status and update_chapter_chunk which read
     and write within a single lock acquisition.
 

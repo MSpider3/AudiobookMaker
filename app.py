@@ -1336,32 +1336,12 @@ def _preview_provider(cfg: AudiobookConfig) -> Any:
     """The provider instance ``preview_tts`` uses, created if necessary.
 
     Shares the pipeline's one-model preview cache, so designing a voice or
-    saving a preset reuses the model a voice test already loaded.
+    saving a preset reuses the model a voice test already loaded. The caller
+    holds ``pipeline._preview_cache_lock``.
     """
     import audiobook_factory.pipeline as pipeline_module
-    from audiobook_factory.tts_providers import get_tts_provider
 
-    getter = getattr(pipeline_module, "get_preview_provider", None)
-    if callable(getter):
-        return getter(cfg)
-    cache = getattr(pipeline_module, "_preview_provider_cache", None)
-    lock = getattr(pipeline_module, "_preview_cache_lock", None)
-    if not isinstance(cache, dict) or lock is None:
-        return get_tts_provider(cfg.tts_provider_name, cfg)
-    key = (cfg.tts_provider_name, getattr(cfg, "tts_model_name", ""), getattr(cfg, "quantization", ""))
-    with lock:
-        provider = cache.get("provider")
-        if provider is None or cache.get("key") != key:
-            if provider is not None:
-                try:
-                    provider.cleanup()
-                except Exception as exc:
-                    logger.warning("Error releasing the previous preview model: %s", exc)
-            provider = get_tts_provider(cfg.tts_provider_name, cfg)
-            cache.update(provider=provider, name=cfg.tts_provider_name, key=key)
-        else:
-            provider.config = cfg
-    return provider
+    return pipeline_module._cached_preview_provider(cfg)
 
 
 def _release_preview_provider() -> None:
@@ -1464,9 +1444,17 @@ def _with_preview_provider(cfg: AudiobookConfig, action: Callable[[Any], Any]) -
     active = _active_local_run()
     if active is not None:
         raise _UiError(f"⚠️ '{active.book_title}' is being generated. Try again after it finishes.")
+    import audiobook_factory.pipeline as pipeline_module
+
     backend_up = is_api_healthy()
     try:
-        return action(_preview_provider(cfg))
+        # One caller per model at a time, and never next to a loaded job pool.
+        with pipeline_module._preview_cache_lock:
+            try:
+                pipeline_module._pool_for_preview(cfg.tts_provider_name)
+            except RuntimeError as exc:
+                raise _UiError(f"⚠️ {exc}") from exc
+            return action(_preview_provider(cfg))
     finally:
         if backend_up:
             _release_preview_provider()

@@ -99,7 +99,7 @@ class _Recorder:
 
     def __call__(self, batch, provider, voice_ref, config, out_dir, master_queue,
                  cancel_token, progress_state, chapter_index, verifier,
-                 chunk_completed_cb, note_written, chunk_flagged_cb):
+                 chunk_completed_cb, note_written, chunk_flagged_cb, device=None):
         time.sleep(self.seconds_per_batch)
         if provider.device == self.failing_device:
             raise RuntimeError(f"{provider.device} broke")
@@ -163,7 +163,7 @@ class TestStageBWorkers:
 
     def test_chunks_stay_queued_when_every_device_fails(self, monkeypatch):
         class _AlwaysFails(_Recorder):
-            def __call__(self, batch, provider, *args):
+            def __call__(self, batch, provider, *args, **kwargs):
                 raise RuntimeError(f"{provider.device} broke")
 
         work, errors, stats, sentinels = _run_workers(monkeypatch, _AlwaysFails(), chunk_count=4)
