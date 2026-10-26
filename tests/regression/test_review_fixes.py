@@ -135,6 +135,7 @@ class TestCancellationAndResume:
 
         with tempfile.TemporaryDirectory() as td:
             cfg = _config(td)
+            cfg.batch_size = 4   # three batches of four; the third one fails
             provider = _mock_providers(cfg, FailsOnThirdBatch)[0]
             files, _ = _run(cfg, [_chapter(1, sentences)])
             assert files == []

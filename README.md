@@ -165,7 +165,7 @@ pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | f
 
 **The newest engines on Kaggle (2 × T4, 2026-10-26):**
 - **Breeze TTS 2:** word-perfect in English (0–5% word errors) and Chinese (0%) **when the narrator clip is in the book's language**; an English clip reading Chinese came out garbled. A 3.4-minute chapter took about 4 minutes on two T4s (≈0.9× real time); 8.8 GB per GPU.
-- **Ming-3.0-TTS 0.5B:** word-perfect in English and Chinese with transformers 4.46.3, but unintelligible with Kaggle's default 4.57.3, so it needs its own environment (the provider refuses to run on another version). About 0.4× real time per T4, 3.3 GB per GPU.
+- **Ming-3.0-TTS 0.5B:** with transformers 4.46.3, 0–1.4% word errors in English and 0% in Chinese (Chinese clip); Japanese read with the English clip had 8–18% character errors. Unintelligible with Kaggle's default 4.57.3, so it needs its own environment (the provider refuses to run on another version). 0.44× real time per T4, 3.1 GB per GPU; it speaks one chunk at a time, so two GPUs roughly double that.
 
 **Planned, needs bigger hardware: Fish Audio Drama-3** ([fishaudio/drama-3](https://huggingface.co/fishaudio/drama-3)). A 35B mixture-of-experts model (3B active) with multi-speaker dialogue, about 80 languages and voice cloning. Not added yet because it cannot run on Kaggle or Colab:
 - it needs at least 48 GB of GPU memory with its FP8 weights, and FP8 needs an Ada/Hopper GPU (compute capability 8.9+); on older GPUs it falls back to fp16 weights of about 70 GB, a path upstream has not tested;
@@ -188,10 +188,51 @@ Numbers from test runs of this code on two T4 GPUs with one 22-second English na
 | Fish Audio S2 Pro | 0.5× | 1.45× | 4% | 11.4 GB |
 
 - **A whole 20-page book** (ten chapters, 32 minutes of audio) with Qwen3-TTS took 19 minutes, with 2% word errors over the whole book and no out-of-memory retries.
-- **Short chapters and two GPUs.** A Qwen batch takes about the same time whether it holds 7 chunks or 17, so a chapter that fits in one batch is no faster on two GPUs. For books with short chapters set **Parallelism** to `auto` (or `chapters`): short chapters then run one per GPU. `auto` was added after these runs and has only been exercised with simulated GPUs.
+- **Short chapters and two GPUs.** A Qwen batch takes about the same time whether it holds 7 chunks or 17, so a chapter that fits in one batch is no faster on two GPUs. For books with short chapters set **Parallelism** to `auto` (or `chapters`): short chapters then run one per GPU, two chapters at the same time. Measured on four 3-minute chapters (Qwen3-TTS, 2 × T4): `chunks` (default) 521 s, 1.4× real time; `chapters` 294 s, 2.6×; `auto` 293 s, 2.6× (it gave each chapter one GPU). Long chapters (several batches) still do best split across both GPUs, which `auto` also does.
 - **Other languages with an English narrator clip (Qwen3-TTS).** Russian and Korean read well (5–6% errors). French, Japanese and Chinese were intelligible but accented, and digits were sometimes read in English. A narrator clip in the book's own language is the first thing to try.
 - **Hindi.** By ear, Higgs Audio v3 was the only engine with correct pronunciation and no dropped words; OmniVoice, MOSS-TTS and Fish were not good enough. Qwen3-TTS and IndexTTS do not support Hindi.
 - **Voice similarity.** A speaker-verification model scored English clones 0.99 against the narrator clip (two unrelated voices scored 0.63 and 0.83); clones in other languages scored 0.92–0.97.
+
+
+### Which engine should I use?
+
+> ⚠️ **How these recommendations were made.** The picks, speeds and error rates in this section come from **automated test runs carried out by an AI coding assistant (Claude)** on Kaggle (2 × Tesla T4) in October 2026, with one 22-second English narrator clip (plus a short Chinese clip) and short test texts. Quality was scored mostly by Whisper transcription (word error rate), not by people listening; only Hindi was judged by ear. Treat them as a starting point: listen to one test chapter before narrating a whole book.
+
+**Three ways to give a book its voice**
+- **Voice cloning:** you supply a 5–30 second clip of the narrator (and, for some engines, the exact words spoken in it). Every engine can do this.
+- **Voice description:** no clip; you describe the voice in words. Qwen3-TTS (VoiceDesign model, plain prose such as "a calm, deep male voice") and OmniVoice (attribute tags such as `female, low pitch, british accent`).
+- **Built-in readers:** pick a ready-made speaker by name. Only Qwen3-TTS (CustomVoice model: Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan and three more).
+
+Any engine marked "saved presets" can store a cloned or designed voice and reuse it later without the clip.
+
+**Quick picks**
+
+| You want | Use |
+|---|---|
+| An English audiobook, fast | **Qwen3-TTS** (3.3× real time on two T4s; set Parallelism to `auto` for books with short chapters) |
+| To sell the audiobook | Qwen3-TTS, MOSS-TTS or Ming-3.0-TTS (Apache-2.0 / MIT); IndexTTS-2.5 with conditions; Higgs v3 allows monetised audiobooks under its Creator grant with attribution |
+| Hindi (and other Indian languages) | **Higgs Audio v3**, the only engine with correct Hindi pronunciation by ear |
+| Chinese | Breeze TTS 2 with a Chinese narrator clip (word-perfect in tests), or Qwen3-TTS |
+| Many languages | Higgs Audio v3 (102), Fish Audio S2 Pro (83), OmniVoice (600+, weaker) |
+| No narrator clip | Qwen3-TTS: a built-in reader (CustomVoice) or a described voice (VoiceDesign); OmniVoice: attribute tags |
+| Emotion and delivery control | IndexTTS-2.5 (emotion set apart from the voice), Fish S2 Pro and Higgs v3 (inline tags such as `[whisper]`), Breeze (a style instruction) |
+| A small GPU (8 GB or less) | Ming-3.0-TTS (3.3 GB), OmniVoice (4 GB), F5-TTS (3 GB), Qwen3-TTS 0.6B |
+
+**Every engine**
+
+| Engine | Clone / describe / built-in | Languages | Speed on 2 × T4 | Pros | Cons |
+|---|---|---|---|---|---|
+| Qwen3-TTS (`qwen`) | ✅ / ✅ VoiceDesign / ✅ 9 readers | 10 | 3.3× | Fastest; batched; commercial use; saved presets; all three voice methods | With an English clip, French, Japanese and Chinese sound accented and digits are sometimes read in English; no Hindi |
+| Higgs Audio v3 (`higgs`) | ✅ / ❌ / ❌ | 102 | 3.1× | Fast; best Hindi; inline emotion and sound tags | Non-commercial except the Creator grant; 11 GB VRAM |
+| OmniVoice (`omnivoice`) | ✅ / ✅ attribute tags / ❌ | 600+ | 0.6× | Small (4 GB); most languages | Non-commercial; slow; Hindi not good by ear |
+| IndexTTS-2.5 (`indextts`) | ✅ (no transcript) / emotion only / ❌ | 5 | 0.6× | Emotion apart from the voice; native speed control; pronunciation tags | 22 kHz; custom licence; one chunk at a time |
+| MOSS-TTS (`moss`) | ✅ / ❌ / ❌ | 31 | 0.6× | Commercial use; duration control; pause markers; Pinyin / IPA | 11–13 GB VRAM; ~13 GB download; Hindi not good |
+| Fish Audio S2 Pro (`fish`) | ✅ (transcript required) / inline tags / ❌ | 83 | 0.5× | Very expressive tags; 44.1 kHz | Non-commercial; 12 GB VRAM; slowest; Hindi not good |
+| Breeze TTS 2 (`breeze`) | ✅ (transcript required) / style instruction / ❌ | English, Chinese | ≈0.9× | Word-perfect English and Chinese in tests; batched | The clip must be in the book's language; non-commercial (not even selling the book); 9 GB VRAM |
+| Ming-3.0-TTS 0.5B (`ming`) | ✅ (transcript required) / ❌ / ❌ | 7 | 0.44× per GPU | MIT (commercial use); small; 44.1 kHz; word-perfect English and Chinese in tests | Needs its own environment (transformers 4.46.3); one chunk at a time; slow |
+| F5-TTS (`f5tts`) | ✅ / ❌ / ❌ | English, Chinese | not measured | Tiny (3 GB) | Non-commercial; not tested on Kaggle |
+
+Engines are not tested for languages outside their own list. For a book in another language, use a narrator clip in that language: cloning across languages was accented (Qwen3-TTS) or garbled (Breeze).
 
 ---
 

@@ -44,9 +44,10 @@ __all__ = ["run_chapter_pipeline", "_validate_chunk_file"]
 _PARTIAL_FLUSH_CHUNK_COUNT: int = 20
 _MINIMUM_CHUNK_WAV_BYTES: int = 1000
 # Minimum valid WAV file size. Files smaller than this are corrupted.
-_SEQUENTIAL_BATCH_SIZE: int = 4
-# Batch size for providers that synthesize one text at a time anyway: small
-# enough that progress, cancellation and the chunk cache stay current.
+_SEQUENTIAL_BATCH_SIZE: int = 1
+# Batch size for providers that synthesize one text at a time anyway. One
+# chunk per take keeps the GPUs finishing together: with 4, a Ming chapter on
+# 2 x T4 left one GPU idle for a third of the chapter (5 vs 8 chunks).
 _IDLE_WORKER_POLL_SECONDS: float = 0.1
 # How often a device with nothing to do re-checks the queue while another works.
 _FATAL_VERDICT_SCORE: float = 10.0
