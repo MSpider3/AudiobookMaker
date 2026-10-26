@@ -220,7 +220,7 @@ Any engine marked "saved presets" can store a cloned or designed voice and reuse
 | Many languages | Higgs Audio v3 (102), Fish Audio S2 Pro (83), OmniVoice (600+, weaker) |
 | No narrator clip | Qwen3-TTS: a built-in reader (CustomVoice) or a described voice (VoiceDesign); OmniVoice: attribute tags |
 | Emotion and delivery control | IndexTTS-2.5 (emotion set apart from the voice), Fish S2 Pro and Higgs v3 (inline tags such as `[whisper]`), Breeze (a style instruction) |
-| A small GPU (8 GB or less) | Ming-3.0-TTS (3.3 GB), OmniVoice (4 GB), F5-TTS (3 GB), Qwen3-TTS 0.6B |
+| A small GPU (8 GB or less) | F5-TTS (1.5 GB), Ming-3.0-TTS (3.3 GB), OmniVoice (4.5 GB), Qwen3-TTS 0.6B |
 
 **Every engine**
 
@@ -234,7 +234,23 @@ Any engine marked "saved presets" can store a cloned or designed voice and reuse
 | Fish Audio S2 Pro (`fish`) | ✅ (transcript required) / inline tags / ❌ | 83 | 0.5× | Very expressive tags; 44.1 kHz | Non-commercial; 12 GB VRAM; slowest; Hindi not good |
 | Breeze TTS 2 (`breeze`) | ✅ (transcript required) / style instruction / ❌ | English, Chinese | ≈0.9× | Word-perfect English and Chinese in tests; batched | The clip must be in the book's language; non-commercial (not even selling the book); 9 GB VRAM |
 | Ming-3.0-TTS 0.5B (`ming`) | ✅ (transcript required) / ❌ / ❌ | 7 | 0.44× per GPU | MIT (commercial use); small; 44.1 kHz; word-perfect English and Chinese in tests | Needs its own environment (transformers 4.46.3); one chunk at a time; slow |
-| F5-TTS (`f5tts`) | ✅ / ❌ / ❌ | English, Chinese | not measured | Tiny (3 GB) | Non-commercial; not tested on Kaggle |
+| F5-TTS (`f5tts`) | ✅ / ❌ / ❌ | English, Chinese | 1.9× (short chapter) | Tiny (1.5 GB); fastest on a short chapter | Non-commercial; keeps only ~12 s of the narrator clip |
+
+**Measured on one 3-minute chapter** (chapter 1 of the English test book, 13 chunks, 2 × T4, one 22-second English narrator clip, October 2026; each engine except Qwen and Breeze in its own environment). A short chapter fills only one batch per GPU, so batched engines run slower here than on long chapters, where the speeds in the table above were measured.
+
+| Engine | Word errors (Whisper) | Speed, synthesis only | Speed incl. model load | GPU memory |
+|---|---|---|---|---|
+| Qwen3-TTS | 2.0% | 1.4× | 0.8× | 6.5 GB |
+| F5-TTS | 1.8% | 1.9× | 0.9× | 1.5 GB |
+| Breeze TTS 2 | 0–5% (test lines) | 0.9× | 0.8× | 8.7 GB |
+| IndexTTS-2.5 | 2.0% | 0.7× | 0.45× | 9.6 GB |
+| Fish Audio S2 Pro | 2.4% | 0.7× | 0.45× | 12.8 GB |
+| Higgs Audio v3 | 1.1–2.1% | 0.6× | 0.5× | 11.6 GB |
+| Ming-3.0-TTS | 0–1.4% (test lines) | 0.6× | 0.45× | 4.3 GB |
+| OmniVoice | 0.7–3.9% | 0.55× | 0.5× | 4.5 GB |
+| MOSS-TTS | 0.8–1.3% | 0.55× | 0.35× | 10.8 GB |
+
+Higgs Audio v3 now and then does not stop on a chunk; after three tries that GPU hands its chunks to the other one and the chapter still finishes, a few minutes later.
 
 Engines are not tested for languages outside their own list. For a book in another language, use a narrator clip in that language: cloning across languages was accented (Qwen3-TTS) or garbled (Breeze).
 

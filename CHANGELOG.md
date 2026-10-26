@@ -27,6 +27,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Engines installed side by side (`engine_envs.py`, `engine_worker.py`, `tts_providers/remote_provider.py`)**: each engine that needs its own `transformers` gets an environment of its own (`python -m audiobook_factory.engine_envs install <engine>`), sharing torch and the app's packages with the main environment. The app runs it in a worker process per GPU; switching engines needs no reinstall, and ending the worker frees all its GPU memory. Environments are built with `venv --without-pip` plus the main environment's package folders, which also works on Kaggle (whose `venv` cannot see its own packages).
 - **Two notebooks per platform**: *Try engines* (install several engines, hear the same text in each, with speed, GPU memory and Whisper word errors; `audiobook_factory/engine_trial.py`) and *Make the audiobook* (only the chosen engine).
 
+### 🐛 Fixed (found by the Kaggle rounds of the side-by-side engines)
+- **F5-TTS read the end of the narrator transcript aloud** before the text (65% word errors on a chapter): it keeps only ~12 s of the reference clip, so the transcript of a longer clip no longer matches. The transcript is now passed only for clips F5 keeps whole (1.8% word errors after).
+- **One GPU did most of a short chapter**: chunks are queued longest first, and the first GPU took the first half (2,500 against 684 characters). Chunks are now dealt to the free GPUs in turn; on 2 × T4 the busy times came out at 126 / 124 s (Qwen) and 340 / 351 s (MOSS).
+- **Engine workers see only their own GPU** (`CUDA_VISIBLE_DEVICES`).
+
 ### 🚀 Changed
 - **Engines that speak one chunk at a time** (Ming, Fish S2 Pro, IndexTTS, F5-TTS) now take one chunk per turn instead of four, so both GPUs finish a chapter together. Measured with Ming on 2 × T4: the GPUs' busy times went from 268 s / 397 s to 274 s / 271 s, and the chapter's synthesis from 397 s to 274 s.
 - **`parallel_mode="auto"` and `"chapters"` measured on 2 × T4**: four 3-minute chapters took 293 s and 294 s (2.6× real time) against 521 s (1.4×) with the default `chunks`. The Kaggle run notebook was run end to end (Rust build, API server, web UI, CLI in all three modes).
