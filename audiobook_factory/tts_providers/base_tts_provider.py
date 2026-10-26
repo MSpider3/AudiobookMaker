@@ -590,6 +590,18 @@ def get_tts_provider(
     from audiobook_factory.tts_providers.registry import canonical_name, provider_class
 
     key = canonical_name(name)
+    if key != "mock" and not os.environ.get("ABM_ENGINE_WORKER"):
+        from audiobook_factory import engine_envs
+
+        python = engine_envs.env_python(key)
+        if python:
+            # Installed side by side in its own environment: run it there.
+            from audiobook_factory.tts_providers.remote_provider import RemoteProvider
+
+            return RemoteProvider(key, python, engine_envs.engine_env_vars(key), config,
+                                  device=device, dtype_override=dtype_override)
+        for variable, value in engine_envs.engine_env_vars(key).items():
+            os.environ.setdefault(variable, value)   # e.g. where Breeze's clone is
     cls = provider_class(key)
     if key == "mock":
         if device is not None:

@@ -309,7 +309,7 @@ class TestVoiceCheck:
         monkeypatch.delenv("ABM_SKIP_ENGINE_CHECK", raising=False)
         monkeypatch.setattr(app, "_missing_requirements", lambda info: ["transformers==5.0.0 (installed: 4.57.1)"])
         problem = app._voice_problem(self._cfg(tts_provider_name="moss", tts_model_name="", voice_file=_VOICE))
-        assert "not installed" in problem and "pip install" in problem and "transformers==5.0.0" in problem
+        assert "not installed" in problem and "engine_envs install moss" in problem and "transformers==5.0.0" in problem
         assert "Not installed here" in app._provider_markdown("moss")
         monkeypatch.setattr(app, "_missing_requirements", lambda info: [])
         assert app._engine_problem("moss") is None

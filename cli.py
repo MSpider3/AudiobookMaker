@@ -794,8 +794,22 @@ def _missing_requirements(requirements: Iterable[str]) -> list[str]:
     return missing
 
 
+def _engine_missing(info: Any) -> list[str]:
+    """Missing packages of an engine; none once installed with engine_envs."""
+    from audiobook_factory import engine_envs
+
+    if engine_envs.is_installed(str(getattr(info, "name", ""))):
+        return []
+    return _missing_requirements(getattr(info, "pip_requirements", ()) or ())
+
+
 def _install_command(info: Any) -> str:
-    """The ``pip install`` line for a provider's own dependencies."""
+    """The command that installs a provider's own dependencies."""
+    from audiobook_factory import engine_envs
+
+    name = str(getattr(info, "name", ""))
+    if name in engine_envs.SETUPS and name != "qwen":
+        return engine_envs.install_command(name)
     requirements = list(getattr(info, "pip_requirements", ()) or ())
     if not requirements:
         return ""
@@ -835,7 +849,7 @@ def _check_provider_installed(provider: str) -> None:
         ) from exc
     if os.environ.get("ABM_SKIP_INSTALL_CHECK") == "1":
         return
-    missing = _missing_requirements(getattr(info, "pip_requirements", ()) or ())
+    missing = _engine_missing(info)
     if missing:
         raise _CliError(
             f"TTS engine '{info.display_name}' ({provider}) is not installed — "
@@ -870,7 +884,7 @@ def _print_providers() -> None:
             print(f"{_h(name)} — {_warn('unavailable')}: {exc}")
             continue
         commercial = "commercial use allowed" if info.commercial_use else "NON-COMMERCIAL use only"
-        missing = _missing_requirements(info.pip_requirements)
+        missing = _engine_missing(info)
         installed = _ok("installed") if not missing else _warn("not installed (missing: " + ", ".join(missing) + ")")
         extra_models = max(0, len(info.models) - 1)
         languages = str(len(info.languages)) if info.languages else "not restricted"
@@ -1665,7 +1679,7 @@ def _print_dry_run(
         print(f"  {_h('Engine:')}    {cfg.tts_provider_name} — {_warn(f'unavailable: {exc}')}")
     if info is not None:
         commercial = "commercial use allowed" if info.commercial_use else "NON-COMMERCIAL use only"
-        missing = _missing_requirements(info.pip_requirements)
+        missing = _engine_missing(info)
         print(f"  {_h('Engine:')}    {info.display_name} ({cfg.tts_provider_name})")
         print(f"  {_h('Licence:')}   {info.license} — {commercial}")
         print(f"  {_h('Model:')}     {cfg.tts_model_name or info.default_model}")

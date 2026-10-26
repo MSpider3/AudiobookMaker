@@ -155,13 +155,17 @@ AudiobookMaker/
 
 \* Estimated from weight sizes. Run `python cli.py --list-providers` for each engine's options and install command.
 
-**One engine per environment.** The engines pin incompatible `transformers` versions (Ming 4.46, IndexTTS 4.52, Qwen and Breeze 4.57, MOSS exactly 5.0.0, OmniVoice and Higgs 5.3+), so install only the one you use on top of `requirements.txt`:
+**Engines installed side by side.** The engines pin incompatible `transformers` versions (Ming 4.46, IndexTTS 4.52, Qwen and Breeze 4.57, MOSS exactly 5.0.0, OmniVoice and Higgs 5.3+), and one Python process can load only one. So each engine that needs other versions gets an environment of its own, and the app runs it in a worker process with that environment's Python. Install any number of them; switching engines needs no reinstall:
 
 ```bash
-pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | fish | higgs | breeze | ming
+python -m audiobook_factory.engine_envs install higgs moss   # indextts | moss | omnivoice | fish | higgs | breeze | ming | f5tts
+python -m audiobook_factory.engine_envs list
 ```
 
-`requirements/tts-<engine>.txt` lists any second step an engine needs. `breeze` and `ming` run from a clone of their upstream repository at a reviewed commit, named by `ABM_BREEZE_REPO` or `ABM_MING_REPO`; the notebooks' engine cell clones it for you.
+- An engine environment holds only what the engine pins differently (about 0.1–1 GB); torch and everything else come from the main environment. Environments live in `~/.cache/audiobookmaker/engines` (set `ABM_ENGINE_ENVS` to move them).
+- Qwen3-TTS runs in the main environment. Breeze does too (it shares Qwen's versions); `install breeze` only clones its code. Ming and Breeze run from a clone of their repository at a reviewed commit, which `install` makes for you.
+- When an engine is switched or the run ends, its worker process exits, which frees all of its GPU memory.
+- `requirements/tts-<engine>.txt` still lists each engine's packages, for installing one engine into an environment by hand.
 
 **The newest engines on Kaggle (2 × T4, 2026-10-26):**
 - **Breeze TTS 2:** word-perfect in English (0–5% word errors) and Chinese (0%) **when the narrator clip is in the book's language**; an English clip reading Chinese came out garbled. A 3.4-minute chapter took about 4 minutes on two T4s (≈0.9× real time); 8.8 GB per GPU.
@@ -382,21 +386,26 @@ python cli.py generation_progress.json --force-reprocess
 
 ## ☁️ Cloud Notebooks (Google Colab & Kaggle)
 
-You can run AudiobookMaker entirely in cloud notebooks — no local GPU or installation required.
+You can run AudiobookMaker entirely in cloud notebooks — no local GPU or installation required. Each platform has two notebooks:
+
+| Notebook | What it is for |
+|---|---|
+| **Try engines** — [`AudiobookMaker_Kaggle_Try_Engines.ipynb`](notebooks/AudiobookMaker_Kaggle_Try_Engines.ipynb), [`AudiobookMaker_Colab_Try_Engines.ipynb`](notebooks/AudiobookMaker_Colab_Try_Engines.ipynb) | Installs the engines you list (each in its own environment) and reads the same test text in your narrator's voice in each, with an audio player, speed, GPU memory and Whisper word errors. Use it to choose an engine. |
+| **Make the audiobook** — [`AudiobookMaker_Kaggle.ipynb`](notebooks/AudiobookMaker_Kaggle.ipynb), [`AudiobookMaker_Colab.ipynb`](notebooks/AudiobookMaker_Colab.ipynb) | Installs the app and only the engine you chose, then the web UI or the headless CLI makes the book. |
 
 ### 🟡 Google Colab
 
-1. **Open** [`notebooks/AudiobookMaker_Colab.ipynb`](notebooks/AudiobookMaker_Colab.ipynb) in Google Colab.
+1. **Open** the notebook in Google Colab.
 2. **Enable a GPU runtime:** Go to **Runtime → Change runtime type → T4 GPU** → Save.
 3. **Run pre-run diagnostics (optional but recommended):**
    ```python
    !python scripts/colab_prerun_check.py
    ```
-4. **Run all notebook cells in order.** The notebook will automatically install dependencies, compile the Rust PyO3 extension, launch the background FastAPI server, and provide a public `gradio.live` link.
+4. **Run all notebook cells in order.** "Make the audiobook" installs dependencies, compiles the Rust PyO3 extension, launches the background FastAPI server and gives a public `gradio.live` link.
 
 ### 🟦 Kaggle Notebooks (Dual GPU T4x2 Support)
 
-1. **Upload or open** [`notebooks/AudiobookMaker_Kaggle.ipynb`](notebooks/AudiobookMaker_Kaggle.ipynb) in Kaggle.
+1. **Upload or open** the notebook in Kaggle.
 2. **Configure Session Options (Right Sidebar):**
    - **Accelerator:** Set to **GPU T4x2** (enables dual-GPU parallel synthesis).
    - **Internet:** Toggle **ON** (required to clone repo and download models).
@@ -430,7 +439,7 @@ python combine_book.py part1.zip part2.zip more_chapters/ --progress generation_
 | Feature / Behavior | Detail |
 |--------------------|--------|
 | **Multi-GPU Parallelism** | Kaggle T4x2 assigns one model instance per GPU. Long chapters gain about 1.6× from the second GPU; for books with short chapters choose Parallelism `auto`. |
-| **Other engines** | Each optional engine needs its own `transformers` version, so install one per session (the notebooks have a cell for it). |
+| **Other engines** | Each optional engine is installed in an environment of its own (`python -m audiobook_factory.engine_envs install <engine>`, or the notebooks' engine cell), so several can be installed in one session. Their downloads are large; delete the ones you no longer need. |
 | **Flash Attention** | T4 GPUs don't have `flash_attn` pre-installed. The app auto-detects this and uses PyTorch SDPA — generation still works flawlessly. |
 | **Rust Acceleration** | Pre-run check compiles `audiobook_rust` via `maturin`. If compilation fails, pure-Python fallbacks activate automatically. |
 | **Chunk-Level Resume** | Progress and chunk audio (`.temp_chunks/`) are cached to disk so you can resume interrupted cloud sessions without losing progress. |

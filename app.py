@@ -816,6 +816,10 @@ def _missing_requirements(info: Any) -> list[str]:
     except Exception:
         Requirement = None  # type: ignore[assignment]
 
+    from audiobook_factory import engine_envs
+
+    if engine_envs.is_installed(str(getattr(info, "name", ""))):
+        return []   # installed with engine_envs, possibly in an environment of its own
     missing: list[str] = []
     for spec in getattr(info, "pip_requirements", ()) or ():
         name = re.split(r"[\s\[<>=!~;@]", str(spec).strip(), maxsplit=1)[0]
@@ -846,7 +850,11 @@ def _missing_requirements(info: Any) -> list[str]:
 
 
 def _install_command(key: str, info: Any) -> str:
-    """The pip command that installs an engine's own dependencies."""
+    """The command that installs an engine's own dependencies."""
+    from audiobook_factory import engine_envs
+
+    if key in engine_envs.SETUPS and key != "qwen":
+        return engine_envs.install_command(key)
     requirements_file = os.path.join("requirements", f"tts-{key}.txt")
     if os.path.isfile(os.path.join(_ROOT, requirements_file)):
         return f"pip install -r {requirements_file}"
