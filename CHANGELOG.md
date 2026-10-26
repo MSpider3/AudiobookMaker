@@ -7,11 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### ⚡ Added
-- **Three new TTS engines** (Breeze and Ming checked on Kaggle 2 × T4; S1-mini not yet, it is gated):
-  - **Fish Audio S1-mini (`fish_s1`)**: 0.5B, 13 languages. Needs the fish-speech code from before S2 (`d3df505`) in its own environment, and `HF_TOKEN` (gated, CC-BY-NC-SA-4.0).
+- **Two new TTS engines**, checked on Kaggle 2 × T4:
   - **Breeze TTS 2 (`breeze`)**: English / Chinese with style instructions, batched; shares the Qwen3-TTS environment. Weights are research / non-commercial only. On 2 × T4: 0–5% word errors with a narrator clip in the book's language, about 0.9× real time.
   - **Ming-3.0-TTS 0.5B (`ming`)**: seven languages, MIT licence. Needs transformers 4.46.3 in its own environment: under 4.57.3 even upstream's example is unintelligible on a T4; under 4.46.3 it was word-perfect.
-  - The three run from a clone of their repository (`ABM_FISH_S1_REPO`, `ABM_BREEZE_REPO`, `ABM_MING_REPO`); the notebooks' engine cell clones it at the reviewed commit.
+  - Both run from a clone of their repository (`ABM_BREEZE_REPO`, `ABM_MING_REPO`); the notebooks' engine cell clones it at the reviewed commit.
 - **Fish Audio Drama-3 is listed as planned** in the README: it needs 48 GB+ of GPU memory (FP8 on Ada/Hopper) and transformers 5.19, so it cannot run on Kaggle or Colab.
 
 ### 🐛 Fixed

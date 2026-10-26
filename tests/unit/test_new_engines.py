@@ -1,7 +1,7 @@
 """
 test_new_engines.py
 ===================
-Breeze TTS 2, Ming-3.0-TTS and Fish S1-mini against fake upstream code.
+Breeze TTS 2 and Ming-3.0-TTS against fake upstream code.
 
 The real models need a GPU and their own environments; these tests check how
 each provider drives upstream: the requests it builds, batching and the
@@ -201,80 +201,3 @@ def test_ming_refuses_other_transformers_versions(ming, monkeypatch):
     provider = get_tts_provider("ming", AudiobookConfig(voice_transcript="Hi."), device="cpu")
     with pytest.raises(RuntimeError, match="4.46"):
         provider.ensure_ready()
-
-
-# ── Fish S1-mini ──────────────────────────────────────────────────────────────
-
-class _FakeCodec(torch.nn.Module):
-    sample_rate = 44100
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(1))
-        self.encoded: list[int] = []
-
-    def encode(self, audios, lengths):
-        self.encoded.append(int(lengths[0]))
-        frames = int(lengths[0]) // 2048 + 1
-        return torch.ones(1, 10, frames + 3, dtype=torch.long), torch.tensor([frames])
-
-    def decode(self, indices, lengths):
-        return torch.full((1, 1, int(lengths[0]) * 2048), 0.1), lengths
-
-
-@pytest.fixture
-def fish_s1(monkeypatch, tmp_path):
-    _clone(tmp_path, "ABM_FISH_S1_REPO", ".project-root", monkeypatch)
-    _hub(monkeypatch, tmp_path)
-    seen: dict = {}
-    inference = types.ModuleType("fish_speech.models.text2semantic.inference")
-    inference.init_model = lambda path, device, precision, compile=False: (seen.setdefault("precision", precision), "decode")
-
-    def _generate_long(**kwargs):
-        seen.setdefault("calls", []).append(kwargs)
-        yield types.SimpleNamespace(action="sample", codes=torch.ones(10, 43, dtype=torch.long))
-        yield types.SimpleNamespace(action="next", codes=None)
-
-    inference.generate_long = _generate_long
-    text2semantic = types.ModuleType("fish_speech.models.text2semantic")
-    text2semantic.inference = inference
-    _install(monkeypatch, {
-        "fish_speech": types.ModuleType("fish_speech"), "fish_speech.models": types.ModuleType("fish_speech.models"),
-        "fish_speech.models.text2semantic": text2semantic,
-        "fish_speech.models.text2semantic.inference": inference,
-    })
-    codec = _FakeCodec()
-    import audiobook_factory.tts_providers.fish_s1_provider as module
-    monkeypatch.setattr(module, "_load_codec", lambda path, device: codec)
-    return seen, codec
-
-
-class TestFishS1:
-
-    def test_clones_from_cached_reference_codes(self, fish_s1, tmp_path):
-        pytest.importorskip("torchaudio")
-        seen, codec = fish_s1
-        config = AudiobookConfig(voice_transcript="Reference words.", temperature=0.7, top_p=0.9)
-        provider = get_tts_provider("fish_s1", config, device="cpu")
-        voice = _voice(tmp_path)
-        audio, duration = provider.synthesize("Hello there.", voice, return_bytes=True)
-        provider.synthesize("Again.", voice, return_bytes=True)
-        call = seen["calls"][0]
-        assert call["prompt_text"] == ["Reference words."]
-        assert call["prompt_tokens"][0].shape[0] == 10
-        assert call["temperature"] == 0.7 and call["top_p"] == 0.9
-        assert call["max_new_tokens"] == 64 + 4 * len("Hello there.")
-        assert len(codec.encoded) == 1                  # the reference is encoded once
-        assert seen["precision"] == torch.half          # fp16 by default
-        assert duration == pytest.approx(43 * 2048 / 44100)
-
-    def test_transcript_is_required(self, fish_s1, tmp_path):
-        provider = get_tts_provider("fish_s1", AudiobookConfig(voice_transcript=""), device="cpu")
-        with pytest.raises(RuntimeError, match="transcript"):
-            provider.synthesize("Text.", _voice(tmp_path), return_bytes=True)
-
-    def test_wrong_fish_speech_version_is_explained(self, fish_s1, monkeypatch):
-        del sys.modules["fish_speech.models.text2semantic.inference"].generate_long
-        provider = get_tts_provider("fish_s1", AudiobookConfig(voice_transcript="Hi."), device="cpu")
-        with pytest.raises(RuntimeError, match="d3df505"):
-            provider.ensure_ready()
