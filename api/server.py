@@ -482,6 +482,7 @@ async def task_websocket_endpoint(websocket: WebSocket, task_id: str):
     ws_queue: asyncio.Queue = asyncio.Queue(maxsize=_MAX_SUBSCRIBER_EVENTS)
     task.subscribers.append(ws_queue)
     history = list(task.logs)
+    history_base = task.log_base
     print(f"[WebSocket] Client connected to task subscription: {task_id}")
 
     async def _ws_keepalive():
@@ -509,8 +510,8 @@ async def task_websocket_endpoint(websocket: WebSocket, task_id: str):
 
     try:
         # Send historical logs first
-        for log_msg in history:
-            await websocket.send_json({"type": "log", "message": log_msg})
+        for position, log_msg in enumerate(history):
+            await websocket.send_json({"type": "log", "message": log_msg, "index": history_base + position})
         # Send progress baseline
         await websocket.send_json({"type": "progress", "progress": task.progress})
         await websocket.send_json({"type": "status", "status": task.status})

@@ -92,6 +92,20 @@ class TestBoundedBackendMemory:
         tail = asyncio.run(server_mod.get_task_status("t-log", since=245))
         assert tail["logs"] == [f"line {i}" for i in range(245, 250)]
 
+    def test_log_events_carry_their_line_number(self, monkeypatch):
+        monkeypatch.setattr(worker_mod, "_MAX_TASK_LOG_LINES", 5)
+        monkeypatch.setattr(worker_mod, "_LOG_TRIM_SLACK", 1)
+        task = worker_mod.Task(task_id="t-idx", config_dict={}, chapters=[])
+
+        async def _run():
+            queue: asyncio.Queue = asyncio.Queue()
+            task.subscribers.append(queue)
+            for index in range(12):
+                await task.add_log(f"line {index}")
+            return [queue.get_nowait()["index"] for _ in range(queue.qsize())]
+
+        assert asyncio.run(_run()) == list(range(12))
+
     def test_slow_websocket_client_keeps_the_newest_events(self):
         task = worker_mod.Task(task_id="t-ws", config_dict={}, chapters=[])
 

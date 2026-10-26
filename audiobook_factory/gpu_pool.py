@@ -245,6 +245,10 @@ class ProviderPool:
         self._device_map: dict[str, BaseTTSProvider] = {}
         # Every take and release happens under this, so a multi-GPU take is atomic.
         self._available = threading.Condition()
+        # Runs using this pool (begin_job/end_job): it must not be evicted
+        # between their chapters, when no provider happens to be checked out.
+        self._jobs: int = 0
+        self._closed: bool = False
 
         logger.info(
             "Initializing ProviderPool[%s] with %d device(s): %s",
@@ -293,11 +297,31 @@ class ProviderPool:
         Returns:
             True if no device's provider is currently acquired.
         """
+        if self._jobs:
+            return False
         if not self._devices:
             return True
         return all(
             dev_queue.full() for dev_queue in self._device_queues.values()
         )
+
+    def begin_job(self) -> None:
+        """Marks a run as using this pool until :meth:`end_job`."""
+        with self._available:
+            self._jobs += 1
+
+    def end_job(self) -> None:
+        """Ends a run started with :meth:`begin_job`."""
+        with self._available:
+            self._jobs = max(0, self._jobs - 1)
+            self._available.notify_all()
+
+    def _check_open(self) -> None:
+        """Raises if the pool was cleaned up (the caller holds ``_available``)."""
+        if self._closed or not self._device_queues:
+            raise RuntimeError(
+                f"The {self._provider_name} GPU pool was released (another TTS engine was loaded); run again."
+            )
 
     def cleanup(self) -> None:
         """Releases every provider's GPU/model resources and empties the pool.
@@ -308,6 +332,10 @@ class ProviderPool:
         though callers should prefer waiting for `is_idle` first so an
         in-flight synthesis isn't disrupted.
         """
+        with self._available:
+            # Waiters stop instead of polling queues that will never refill.
+            self._closed = True
+            self._available.notify_all()
         for device, provider_instance in list(self._device_map.items()):
             try:
                 provider_instance.cleanup()
@@ -403,6 +431,7 @@ class ProviderPool:
         with self._available:
             while True:
                 _check_cancellation(cancel_token)
+                self._check_open()
                 preferred = self._device_queues.get(preferred_device) if preferred_device else None
                 if preferred is not None and not preferred.empty():
                     return preferred.get_nowait()
@@ -442,6 +471,7 @@ class ProviderPool:
         with self._available:
             while True:
                 _check_cancellation(cancel_token)
+                self._check_open()
                 if all(not self._device_queues[device].empty() for device in devices):
                     return {device: self._device_queues[device].get_nowait() for device in devices}
                 next_log = self._wait_turn(started, next_log, ", ".join(devices))

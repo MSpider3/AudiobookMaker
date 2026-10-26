@@ -253,11 +253,13 @@ class Task:
 
     async def add_log(self, text: str):
         self.logs.append(text)
+        index = self.log_base + len(self.logs) - 1
         if len(self.logs) > _MAX_TASK_LOG_LINES + _LOG_TRIM_SLACK:
             dropped = len(self.logs) - _MAX_TASK_LOG_LINES
             del self.logs[:dropped]
             self.log_base += dropped
-        await self.broadcast({"type": "log", "message": text})
+        # The absolute line number lets a client resume polling at the right line.
+        await self.broadcast({"type": "log", "message": text, "index": index})
 
     async def set_progress(self, val: float):
         self.progress = val

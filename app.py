@@ -1450,10 +1450,22 @@ def _with_preview_provider(cfg: AudiobookConfig, action: Callable[[Any], Any]) -
         # One caller per model at a time, and never next to a loaded job pool.
         with pipeline_module._preview_cache_lock:
             try:
-                pipeline_module._pool_for_preview(cfg.tts_provider_name)
-            except RuntimeError as exc:
+                pool = pipeline_module._pool_for_preview(cfg.tts_provider_name)
+                provider = pool.acquire(
+                    cancel_token=pipeline_module._Deadline(pipeline_module._PREVIEW_POOL_WAIT_SEC)
+                ) if pool is not None else None
+            except (RuntimeError, *pipeline_module._CANCELLED_ERRORS) as exc:
+                if not isinstance(exc, RuntimeError):
+                    exc = RuntimeError("A book is being generated. Try again after it finishes.")
                 raise _UiError(f"⚠️ {exc}") from exc
-            return action(_preview_provider(cfg))
+            if provider is None:
+                return action(_preview_provider(cfg))
+            # The idle job model: borrowing it loads no second copy.
+            try:
+                provider.config = cfg
+                return action(provider)
+            finally:
+                pool.release(provider)
     finally:
         if backend_up:
             _release_preview_provider()
@@ -1924,7 +1936,9 @@ async def _listen_task_ws(run: _Run, task_id: str) -> None:
                 kind = data.get("type")
                 if kind == "log":
                     run.add_log(str(data.get("message", "")))
-                    run.remote_log_count += 1
+                    # Lines can be trimmed or dropped on the way: trust the server's index.
+                    index = data.get("index")
+                    run.remote_log_count = int(index) + 1 if isinstance(index, int) else run.remote_log_count + 1
                 elif kind == "progress":
                     run.set_progress(float(data.get("progress") or 0.0))
                 elif kind == "status":

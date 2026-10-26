@@ -71,7 +71,7 @@ class BreezeTTSProvider(BaseTTSProvider):
                 help="Sampling temperature of the speech tokens (upstream default 0.9).",
             ),
         ),
-        pip_requirements=("-r requirements.txt",),
+        pip_requirements=("qwen-tts", "transformers==4.57.3"),
         install_notes=(
             "Clone https://github.com/breezeblue-ai/breeze-tts and set ABM_BREEZE_REPO to it; "
             "uses the Qwen3-TTS environment. Weights (7.7 GB) download on first use. "

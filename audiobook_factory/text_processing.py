@@ -1,25 +1,30 @@
 import re
+import threading
 import nltk
 from nltk.tokenize import sent_tokenize
 
 _PUNKT_CHECKED: bool = False
+_PUNKT_LOCK = threading.Lock()
 
 
 def _ensure_punkt() -> None:
     """Fetches NLTK's punkt data on first use (not at import: importing the
-    library must not touch the network)."""
+    library must not touch the network). Other threads wait for the download."""
     global _PUNKT_CHECKED
     if _PUNKT_CHECKED:
         return
-    _PUNKT_CHECKED = True
-    for resource in ("punkt", "punkt_tab"):
-        try:
+    with _PUNKT_LOCK:
+        if _PUNKT_CHECKED:
+            return
+        for resource in ("punkt", "punkt_tab"):
             try:
-                nltk.data.find(f"tokenizers/{resource}")
-            except LookupError:
-                nltk.download(resource, quiet=True)
-        except Exception as e:
-            print(f"[WARNING] Failed to load/download NLTK {resource}: {e}")
+                try:
+                    nltk.data.find(f"tokenizers/{resource}")
+                except LookupError:
+                    nltk.download(resource, quiet=True)
+            except Exception as e:
+                print(f"[WARNING] Failed to load/download NLTK {resource}: {e}")
+        _PUNKT_CHECKED = True
 
 try:
     import audiobook_rust

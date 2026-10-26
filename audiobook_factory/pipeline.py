@@ -965,6 +965,8 @@ def run_pipeline(
         finally:
             _update_chapter_prog(num, 1.0)
 
+    # Until the run ends the pool stays loaded, even between chapters.
+    pool.begin_job()
     try:
         max_parallel = _get_chapter_parallelism(pool, config)
         if max_parallel > 1 and config.parallel_mode == "auto":
@@ -1060,6 +1062,7 @@ def run_pipeline(
         return output_files
 
     finally:
+        pool.end_job()
         for p in [prog_path_out, prog_path_tmp]:
             _finalize_progress_file(p, chapters)
         _await_subtitle_futures(subtitle_futures, cancel)
@@ -2270,7 +2273,7 @@ def preview_tts(text: str, config: AudiobookConfig) -> bytes | None:
             if pool is not None:
                 try:
                     provider = pool.acquire(cancel_token=_Deadline(_PREVIEW_POOL_WAIT_SEC))
-                except CancelledError as exc:
+                except _CANCELLED_ERRORS as exc:
                     raise RuntimeError("A book is being generated. Test the voice after it finishes.") from exc
                 try:
                     provider.config = config

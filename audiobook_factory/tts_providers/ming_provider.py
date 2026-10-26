@@ -60,9 +60,10 @@ class MingTTSProvider(BaseTTSProvider):
         transcript="required",
         supports_batch=False,
         supports_seed=True,
-        pip_requirements=("-r requirements/tts-ming.txt",),
+        pip_requirements=("x-transformers==2.9.2", "diffusers==0.33.0", "onnxruntime", "inflect", "loguru", "einops"),
         install_notes=(
-            "Clone https://github.com/inclusionAI/Ming-3.0-tts and set ABM_MING_REPO to it. "
+            "pip install -r requirements/tts-ming.txt, then clone https://github.com/inclusionAI/Ming-3.0-tts "
+            "and set ABM_MING_REPO to it. "
             "Weights (3 GB) download on first use."
         ),
     )

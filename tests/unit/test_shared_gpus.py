@@ -191,6 +191,53 @@ class TestPreviewNextToAJob:
         assert wav and wav[:4] == b"RIFF"
         assert pool.is_idle
 
+    def test_preview_gives_up_politely_when_the_gpus_stay_taken(self, monkeypatch):
+        # The pool looks idle when checked, then a job takes every GPU.
+        pool = _pool(AudiobookConfig())
+        self._register(pool)
+        held = pool.acquire_devices(list(_DEVICES))
+        monkeypatch.setattr(pipeline_mod, "_pool_for_preview", lambda name: pool)
+        monkeypatch.setattr(pipeline_mod, "_PREVIEW_POOL_WAIT_SEC", 0.3)
+        try:
+            with pytest.raises(RuntimeError, match="being generated"):
+                pipeline_mod.preview_tts("Hello there.", AudiobookConfig(tts_provider_name="mock"))
+        finally:
+            for provider in held.values():
+                pool.release(provider)
+
+    def test_a_job_between_chapters_keeps_its_pool(self):
+        pool = _pool(AudiobookConfig())
+        self._register(pool)
+        GPUPoolManager.instance()._pools["other"] = _pool(AudiobookConfig())
+        pool.begin_job()
+        try:
+            assert not pool.is_idle   # no provider checked out, but a run is using it
+            with pytest.raises(RuntimeError, match="being generated"):
+                pipeline_mod.preview_tts("Hello there.", AudiobookConfig(tts_provider_name="other"))
+            assert "mock" in GPUPoolManager.instance().all_pools()
+        finally:
+            pool.end_job()
+        assert pool.is_idle
+
+    def test_waiters_stop_when_the_pool_is_released(self):
+        pool = _pool(AudiobookConfig())
+        held = pool.acquire(preferred_device="cuda:0")
+        errors: list = []
+
+        def _wait():
+            try:
+                pool.acquire_devices(list(_DEVICES))
+            except RuntimeError as exc:
+                errors.append(exc)
+
+        waiter = threading.Thread(target=_wait)
+        waiter.start()
+        time.sleep(0.2)
+        pool.cleanup()
+        waiter.join(timeout=5)
+        assert not waiter.is_alive() and "released" in str(errors[0])
+        assert held is not None
+
     def test_two_previews_never_share_the_model_at_once(self):
         config = AudiobookConfig(tts_provider_name="mock")
         active, peak = [0], [0]
@@ -308,3 +355,17 @@ class TestProgressFileAcrossProcesses:
             done = read_progress_file(path)["chapters"][0]["completed_chunks"]
             assert sorted(done) == list(range(2 * count))
             json.dumps(done)
+
+
+class TestVoiceDesignNextToAJobModel:
+
+    def test_voice_design_borrows_the_idle_job_model(self, monkeypatch):
+        import app
+
+        pool = _pool(AudiobookConfig())
+        GPUPoolManager.instance()._pools["mock"] = pool
+        monkeypatch.setattr(app, "_active_local_run", lambda: None)
+        monkeypatch.setattr(app, "is_api_healthy", lambda: False)
+        monkeypatch.setattr(app, "_preview_provider", lambda cfg: pytest.fail("a second model was loaded"))
+        seen = app._with_preview_provider(AudiobookConfig(tts_provider_name="mock"), lambda provider: provider.device)
+        assert seen in _DEVICES and pool.is_idle

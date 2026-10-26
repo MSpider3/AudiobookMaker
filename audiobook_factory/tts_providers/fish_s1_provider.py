@@ -72,8 +72,9 @@ class FishS1Provider(BaseTTSProvider):
                 help="fp16 weights (upstream --half); off loads bfloat16, which GPUs before Ampere run slowly.",
             ),
         ),
-        pip_requirements=("-r requirements/tts-fish_s1.txt",),
+        pip_requirements=("tiktoken", "loralib", "hydra-core>=1.3.2", "pyrootutils", "einx==0.2.2"),
         install_notes=(
+            "Follow requirements/tts-fish_s1.txt (two pip steps). "
             "Clone https://github.com/fishaudio/fish-speech at d3df505 and set ABM_FISH_S1_REPO to it, "
             "in an environment without the fish engine. Accept the model licence on Hugging Face and set HF_TOKEN."
         ),
