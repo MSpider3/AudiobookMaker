@@ -150,16 +150,28 @@ AudiobookMaker/
 | Fish Audio S2 Pro (`fish`) | Fish Audio Research License | **no** | 12 GB | no | **required** | 44.1 kHz, inline emotion tags; slower than real time on a T4 |
 | Higgs Audio v3 (`higgs`) | Boson research / non-commercial | **no** (creator grant with attribution) | 11 GB | yes | optional | Ported from the reference server; no official in-process path exists |
 | F5-TTS (`f5tts`) | CC-BY-NC-4.0 | **no** | 3 GB | no | optional | English / Chinese |
+| Fish Audio S1-mini (`fish_s1`) | CC-BY-NC-SA-4.0, gated | **no** | 4 GB | no | **required** | 0.5B, 13 languages, 44.1 kHz; needs `HF_TOKEN` and its own environment (older fish-speech) |
+| Breeze TTS 2 (`breeze`) | BreezeBlue Research and Non-Commercial | **no**, not even selling the audiobook | 9 GB | yes | **required** | English / Chinese, style instructions; shares the Qwen3-TTS environment |
+| Ming-3.0-TTS 0.5B (`ming`) | MIT | yes | 5 GB | no | **required** | 7 languages (zh, en, ja, ko, de, fr, es), 44.1 kHz |
 
 \* Estimated from weight sizes. Run `python cli.py --list-providers` for each engine's options and install command.
 
 **One engine per environment.** The engines pin incompatible `transformers` versions (IndexTTS 4.52, Qwen 4.57, MOSS exactly 5.0.0, OmniVoice and Higgs 5.3+), so install only the one you use on top of `requirements.txt`:
 
 ```bash
-pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | fish | higgs
+pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | fish | fish_s1 | higgs | breeze | ming
 ```
 
-`requirements/tts-<engine>.txt` lists any second step an engine needs. Read the licence of an engine before publishing audio made with it: the non-commercial ones do not allow selling the result.
+`requirements/tts-<engine>.txt` lists any second step an engine needs. `fish_s1`, `breeze` and `ming` run from a clone of their upstream repository at a reviewed commit, named by `ABM_FISH_S1_REPO`, `ABM_BREEZE_REPO` or `ABM_MING_REPO`; the notebooks' engine cell clones it for you.
+
+> **Not yet run on a GPU:** `fish_s1`, `breeze` and `ming` were written from their upstream code and tested against stand-ins only. Their speed and quality on a T4 are unknown. Breeze and Ming load bfloat16, as upstream does, which a T4 runs slowly; S1-mini uses fp16.
+
+**Planned, needs bigger hardware: Fish Audio Drama-3** ([fishaudio/drama-3](https://huggingface.co/fishaudio/drama-3)). A 35B mixture-of-experts model (3B active) with multi-speaker dialogue, about 80 languages and voice cloning. Not added yet because it cannot run on Kaggle or Colab:
+- it needs at least 48 GB of GPU memory with its FP8 weights, and FP8 needs an Ada/Hopper GPU (compute capability 8.9+); on older GPUs it falls back to fp16 weights of about 70 GB, a path upstream has not tested;
+- it needs `transformers==5.19.0` and fish-speech v3.0.0-beta (`1ff3c3e` or later), so it would be another engine with its own environment;
+- licence: Fish Audio Community License v1.0 (commercial use only below USD 500k revenue, a "Built with Fish Audio" notice, no cloning without consent).
+
+To add it later: an `L40S`/`A100 80GB`/`H100` class GPU, a provider modelled on `fish_provider.py` driving `fish_speech/models/text2semantic/fish_omni`, and a test round like the Kaggle one. Read the licence of an engine before publishing audio made with it: the non-commercial ones do not allow selling the result.
 
 ### Measured on Kaggle (2 × Tesla T4)
 
@@ -419,7 +431,7 @@ Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as nar
 
 ### 4. ⚙️ Advanced Tab
 - **Max chunk length** — TTS input character limit per sentence chunk (default 399).
-- **TTS Provider** — Qwen3-TTS by default; IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish Audio S2 Pro, Higgs Audio v3 and F5-TTS once installed (see [TTS engines](#-tts-engines)).
+- **TTS Provider** — Qwen3-TTS by default; IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish Audio S2 Pro, Fish Audio S1-mini, Higgs Audio v3, Breeze TTS 2, Ming-3.0-TTS and F5-TTS once installed (see [TTS engines](#-tts-engines)).
 - **Parallelism** — How several GPUs are used. `chunks`: every GPU shares one chapter (default). `chapters`: one chapter per GPU. `auto`: short chapters one per GPU, long ones shared.
 - **EasyOCR** — Enable to extract text from images embedded inside EPUB files.
 - **Force reprocess** — Re-extract text even if cached output exists.

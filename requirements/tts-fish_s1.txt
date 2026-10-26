@@ -1,0 +1,39 @@
+# ─── AudiobookMaker — Fish Audio S1-mini provider (tts_provider_name = "fish_s1") ─
+# Provider: audiobook_factory/tts_providers/fish_s1_provider.py
+# Upstream: https://github.com/fishaudio/fish-speech at d3df505 (before S2)
+#
+# S1-mini needs the fish-speech code from before the S2 rewrite, which is the
+# same `fish_speech` package as the "fish" engine's pin: use a separate
+# environment and do not install the fish-speech wheel in it.
+#
+#   pip install -r requirements/tts-fish_s1.txt
+#   pip install --no-deps descript-audiotools descript-audio-codec
+#   git clone https://github.com/fishaudio/fish-speech.git fish-speech-s1
+#   git -C fish-speech-s1 checkout d3df505
+#   export ABM_FISH_S1_REPO=$PWD/fish-speech-s1
+#
+# --no-deps for the two descript packages: descript-audiotools pins
+# protobuf<3.20, which breaks transformers. Do not pip install the clone
+# itself: it pins torch<2.9, pydantic 2.9.2, gradio and more.
+#
+# The model repo is GATED: open https://huggingface.co/fishaudio/s1-mini,
+# accept the non-commercial licence, and set HF_TOKEN.
+# Weights: 1.7 GB + codec. Licence: CC-BY-NC-SA-4.0 (non-commercial).
+
+einops
+loguru
+loralib
+tiktoken
+hydra-core>=1.3.2
+omegaconf
+pyrootutils
+einx[torch]==0.2.2
+argbind>=0.3.7
+flatten-dict
+julius
+ffmpy
+importlib-resources
+randomname
+tensorboard
+soundfile
+librosa

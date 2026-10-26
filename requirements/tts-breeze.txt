@@ -1,0 +1,24 @@
+# ─── AudiobookMaker — Breeze TTS 2 provider (tts_provider_name = "breeze") ────
+# Provider: audiobook_factory/tts_providers/breeze_provider.py
+# Upstream: https://github.com/breezeblue-ai/breeze-tts  (model: BreezeBlue/Breeze-TTS-2)
+#
+# Breeze runs in the Qwen3-TTS environment (the main requirements.txt): it
+# needs qwen-tts and transformers 4.57.3, the same pins as Qwen. Nothing else
+# to pip install. It conflicts with the transformers 5.x engines (OmniVoice,
+# Higgs, MOSS) like Qwen does.
+#
+# The upstream code is not a pip package. Clone it at the reviewed commit and
+# point the provider at it:
+#
+#   git clone https://github.com/breezeblue-ai/breeze-tts.git
+#   git -C breeze-tts checkout 6eba901
+#   export ABM_BREEZE_REPO=$PWD/breeze-tts
+#
+# Do NOT `pip install -r breeze-tts/requirements.txt`: it pins torch 2.9.1 and
+# would replace the notebook's torch.
+#
+# Weights: 7.7 GB (bfloat16), public, downloaded on first use. About 8 GB of
+# VRAM per GPU in eager mode.
+# Licence: code Apache-2.0; weights "BreezeBlue Research and Non-Commercial
+# License v1.1" — no commercial use, including selling or monetising the
+# audiobook.

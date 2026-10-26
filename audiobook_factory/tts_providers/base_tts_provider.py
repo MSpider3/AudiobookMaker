@@ -538,6 +538,37 @@ class BaseTTSProvider(ABC):
         return cls(config, device=device, dtype_override=dtype_override)  # type: ignore[call-arg]
 
 
+def add_clone_to_path(env_var: str, marker: str, engine: str) -> None:
+    """Puts the upstream clone named by *env_var* first on ``sys.path``.
+
+    For engines whose upstream code is a repository, not a pip package.
+
+    Raises:
+        RuntimeError: If the variable is unset, or the directory does not
+            contain *marker* (a file or folder every clone has).
+    """
+    import sys
+
+    repo = os.environ.get(env_var, "").strip()
+    if not repo:
+        raise RuntimeError(f"{engine} runs from a clone of its repository: set {env_var} to the clone.")
+    if not os.path.exists(os.path.join(repo, marker)):
+        raise RuntimeError(f"{env_var}={repo!r} is not a {engine} clone (no {marker} inside it).")
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+
+
+def is_out_of_memory(exc: BaseException) -> bool:
+    """True for a CUDA out-of-memory error."""
+    try:
+        import torch
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
 # ── Factory ───────────────────────────────────────────────────────────────────
 
 def get_tts_provider(

@@ -1,0 +1,26 @@
+# ─── AudiobookMaker — Ming-3.0-TTS provider (tts_provider_name = "ming") ──────
+# Provider: audiobook_factory/tts_providers/ming_provider.py
+# Upstream: https://github.com/inclusionAI/Ming-3.0-tts  (model: inclusionAI/Ming-3.0-tts-0.5B)
+#
+# Install with:  pip install -r requirements/tts-ming.txt
+# then clone the code (not a pip package) and point the provider at it:
+#
+#   git clone https://github.com/inclusionAI/Ming-3.0-tts.git
+#   git -C Ming-3.0-tts checkout 028c1ea
+#   export ABM_MING_REPO=$PWD/Ming-3.0-tts
+#
+# Keep the environment's torch / torchaudio / transformers: upstream pins
+# torch 2.6.0 and transformers 4.46.3, which would replace them. The provider
+# was written against transformers 4.57.3 (Kaggle's); run it in its own
+# environment, not next to the transformers 5.x engines.
+#
+# Weights: 3 GB (bfloat16), public, downloaded on first use.
+# Licence: MIT (code and weights).
+
+x_transformers==2.9.2
+diffusers==0.33.0
+onnxruntime
+inflect
+loguru
+einops
+soundfile

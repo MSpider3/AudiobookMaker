@@ -4,6 +4,30 @@ All notable changes to **AudiobookMaker** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### ⚡ Added
+- **Three new TTS engines**, written from their upstream code and tested against stand-ins (not yet on a GPU):
+  - **Fish Audio S1-mini (`fish_s1`)**: 0.5B, 13 languages. Needs the fish-speech code from before S2 (`d3df505`) in its own environment, and `HF_TOKEN` (gated, CC-BY-NC-SA-4.0).
+  - **Breeze TTS 2 (`breeze`)**: English / Chinese with style instructions, batched; shares the Qwen3-TTS environment. Weights are research / non-commercial only.
+  - **Ming-3.0-TTS 0.5B (`ming`)**: seven languages, MIT licence.
+  - The three run from a clone of their repository (`ABM_FISH_S1_REPO`, `ABM_BREEZE_REPO`, `ABM_MING_REPO`); the notebooks' engine cell clones it at the reviewed commit.
+- **Fish Audio Drama-3 is listed as planned** in the README: it needs 48 GB+ of GPU memory (FP8 on Ada/Hopper) and transformers 5.19, so it cannot run on Kaggle or Colab.
+
+### 🐛 Fixed
+- **Deadlock with two jobs on one multi-GPU pool (`gpu_pool.py`, `chapter_pipeline.py`)**: a chapter took its GPUs one at a time with no time limit, so job A could hold GPU 0 and job B GPU 1, each waiting forever for the other. A chapter now takes all its GPUs in one step (`ProviderPool.acquire_devices`); a long wait is logged every minute and can be cancelled.
+- **Fallback GPU named after the wrong device**: a chapter pinned to a busy GPU that ran on another one kept the pinned GPU's name and batch size.
+- **Voice previews next to a running job (`pipeline.py`, `app.py`)**: a preview loaded a second copy of the model outside the pool and could run the GPU out of memory, and two previews at once called one model from two threads. A preview now borrows the idle job model, is refused while a book is being generated, and previews run one at a time.
+- **Whisper chunk checks made the GPUs wait on each other (`chunk_verifier.py`)**: one shared Whisper behind one lock. Each GPU now has its own, loaded before its batch size is measured so the batches leave room for it.
+- **Progress file written by two processes (`progress_io.py`)**: the lock only worked inside one process, while the web UI and the API server both write the file (through the same temporary file). Writes now also hold an OS file lock (`generation_progress.json.lock`).
+- **Mastering silently skipped audio it could not read (`master.rs`, `chapter_pipeline.py`)**: a missing or unreadable chunk or partial file (up to 20 chunks) was dropped from the chapter with a warning. Mastering now stops with an error and the chapter is retried. The Rust pause count no longer counts skipped files.
+- **Backend memory grew without limit (`api/`)**: a task keeps its newest 10,000 log lines (`?since=` offsets stay valid) and each WebSocket client at most 1,000 queued events.
+- **Importing the library downloaded NLTK data**: now fetched the first time sentences are split.
+- **README**: config schema 7, no "SIMD" claim, the real chapter file names, sequential model warmup, and an up-to-date guide to adding an engine.
+
+### 🗑️ Removed
+- **`worker_count` / `--worker-count`**: read by nothing. Old progress files that carry it still load.
+
 ## [v1.7.0] - 2026-10-18
 
 ### ⚡ Added
