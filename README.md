@@ -23,12 +23,12 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 - **Completion Validation & Top-Level Summary Finalizer (`pipeline.py`)** — Enforces minimum WAV file size guard (`_MINIMUM_CHAPTER_WAV_BYTES = 10_000`) and outputs a top-level `generation_summary` block (completed/failed counts, failed chapter numbers, ISO timestamp) to `generation_progress.json` upon run completion.
 - **WebSocket Keep-Alive & Session End Protocol** — Background keep-alive pings (15s) and dedicated `session_end` WebSocket events for cloud proxy reliability (Kaggle/Colab).
 - **Kaggle & Cloud Pre-Flight Environment Checker (`preflight.py`)** — Validates the full execution environment in under 30 seconds before any model loading or generation begins. Verifies Python version, PyTorch, CUDA count, bfloat16 hardware support, transformers API (`BitsAndBytesConfig`), soundfile, FFmpeg, voice_ref type/existence, and Python 3.12 dict view picklability. Immediately reports errors with recommendations before spending GPU hours.
-- **Stale Checkpoint Recovery & Voice Ref Hash Caching** — Validates chunk WAV integrity (`_validate_chunk_file`) to detect missing or corrupted files on disk and automatically re-synthesizes them. SHA-256 hash caching (`_VOICE_REF_CACHE`) prevents redundant temporary WAV writes across chunk synthesis calls.
-- **Thread-Safe Atomic Progress I/O (`progress_io.py`)** — Dedicated, thread-safe file I/O layer for `generation_progress.json`. Uses atomic writes (temp file + `os.replace()`), module-level write lock (`_WRITE_LOCK`), UTF-8 BOM auto-decoding, leading garbage stripping, HTML detection, and an atomic read-inside-lock pattern to eliminate TOCTOU race conditions under concurrent GPU execution.
-- **Config Contract Schema Versioning (`AudiobookConfig`)** — Versioned config contract (`_CONFIG_SCHEMA_VERSION = 6`) with hardened `from_dict()` construction, backward-compatible default fallback, unknown key filtering, and human-readable `field_summary()` diagnostics.
-- **Eager Multi-GPU Pool Warmup & Self-Healing (`GPUPoolManager`)** — Parallel model warmup via `ThreadPoolExecutor` during pool creation. Failed/OOM GPU instances are automatically detected and pruned from the active pool, allowing healthy GPUs to continue synthesizing without failing the job.
+- **Stale Checkpoint Recovery & Voice Ref Hash Caching** — Validates chunk WAV integrity (`_validate_chunk_file`) to detect missing or corrupted files on disk and automatically re-synthesizes them.
+- **Thread-Safe Atomic Progress I/O (`progress_io.py`)** — Dedicated, thread-safe file I/O layer for `generation_progress.json`. Uses atomic writes (temp file + `os.replace()`), a lock that holds across threads and processes (an OS file lock on `generation_progress.json.lock`, so the web UI and the API server cannot overwrite each other), UTF-8 BOM auto-decoding, leading garbage stripping, HTML detection, and an atomic read-inside-lock pattern to eliminate TOCTOU race conditions under concurrent GPU execution.
+- **Config Contract Schema Versioning (`AudiobookConfig`)** — Versioned config contract (`_CONFIG_SCHEMA_VERSION = 7`) with hardened `from_dict()` construction, backward-compatible default fallback, unknown key filtering, and human-readable `field_summary()` diagnostics.
+- **Eager Multi-GPU Pool Warmup & Self-Healing (`GPUPoolManager`)** — Models are loaded at pool creation, one GPU at a time (loading two at once runs out of CPU RAM on Kaggle). Failed/OOM GPU instances are automatically detected and pruned from the active pool, allowing healthy GPUs to continue synthesizing without failing the job.
 - **3-Stage Overlapped Pipeline & Chunk-Level Resume** — `chapter_pipeline.py` implements a high-throughput 3-stage pipeline (Stage A: CPU text preparation, Stage B: parallel GPU synthesis workers, Stage C: streaming audio mastering and async disk I/O). Sentence audio chunks are cached incrementally in `.temp_chunks/` — if interrupted, generation resumes mid-chapter without re-synthesizing completed chunks.
-- **Rust PyO3 SIMD Acceleration (`audiobook_rust`)** — High-performance Rust extension providing 5.5× faster audio mastering, SIMD sentence splitting, and ultra-fast text normalization compiled with `maturin` (with transparent Python fallbacks).
+- **Optional Rust extension (`audiobook_rust`)** — Audio mastering (WAV chunks decoded in parallel, EBU R128 loudness, MP3 encoding), sentence splitting and text normalization in Rust, built with `maturin`. Every function has a pure-Python fallback, used when the extension is not built.
 - **Headless CLI generation (`cli.py`)** — Run audiobook generation headless in cloud environments (Kaggle/Colab) or terminal without launching or maintaining a web browser interface. Includes flags for cover art injection (`--embed-cover-only`), quantization, device selection, and progress file execution.
 - **Cached Book Extraction** — `generation_progress.json` caches fully extracted and segmented chapter text. Re-parsing large books on session resume is completely eliminated!
 - **Export Config JSON** — Configure voice and chapters in Gradio, then click **'📋 Export Config JSON'** to save settings and cached text into a self-contained JSON ready for CLI execution.
@@ -48,7 +48,7 @@ An end-to-end AI audiobook generator with a **Gradio web UI** and a **Headless C
 - **INT8 Quantization Support (`--quantization int8`)** — 8-bit model quantization via `bitsandbytes` reduces VRAM consumption by ~50% for memory-constrained environments.
 - **Cover Image Embedding CLI Tool (`--embed-cover-only`)** — Instantly inject cover image artwork and ID3 tags into existing output audio files without running TTS generation.
 - **Multi-Format Subtitle & Timed Lyrics Export** — Generates `.lrc` timed lyrics, `.srt` subtitles, and `.vtt` WebVTT files for sync with Audiobookshelf and media players.
-- **Audiobookshelf-compatible output** — Zero-padded filenames + full ID3 tags (title, author, album, track) ready to drop into Audiobookshelf.
+- **Audiobookshelf-compatible output** — `Chapter N - Title` filenames + full ID3 tags (title, author, album, track) ready to drop into Audiobookshelf.
 - **Mastered Output & Single File Mode** — Output mastered MP3, FLAC, WAV, or M4B files. Optionally combine all chapters into a massive single unified file with one click.
 - **Live generation log & Decimal Progress** — Stream progress in real time with a **sub-chapter decimal progress bar** (e.g. 74.52%) and detailed live logs.
 - **FastAPI / WebSocket Orchestration Server** — Offloads heavy GPU jobs from Gradio to a detached FastAPI backend. Protects GPU VRAM limits via a concurrent task queue while providing real-time log and rendering progress updates via WebSockets.
@@ -271,7 +271,7 @@ python cli.py generation_progress.json \
 
 # Override generation parameters on the fly:
 python cli.py generation_progress.json \
-    --worker-count 4 \
+    --parallel-mode auto \
     --output-format mp3 \
     --output-dir ./my_output
 
@@ -310,7 +310,6 @@ python cli.py generation_progress.json --force-reprocess
 | `--local` | Run in this process even when the API server is up. |
 | `--output-dir` | Override destination output directory. |
 | `--output-format` | Override audio output format (`mp3`, `flac`, `wav`, `m4b`). |
-| `--worker-count` | Override parallel worker count. |
 | `--device` | Select compute device (`cuda` or `cpu`). |
 | `--quantization` | Model quantization mode (`none` or `int8`). |
 | `--cover-image` | Supply or override cover image file (`.jpg`, `.png`, `.webp`). |
@@ -420,7 +419,6 @@ Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as nar
 
 ### 4. ⚙️ Advanced Tab
 - **Max chunk length** — TTS input character limit per sentence chunk (default 399).
-- **Parallel chapter workers** — Process 1–8 workers simultaneously. Automatically defaults to `min(gpu_count * 4, 8)` based on detected GPUs. Thanks to our **Multi-GPU Pool** architecture (`GPUPoolManager`), workers dynamically stream work across all available GPUs in parallel with optimal VRAM management.
 - **TTS Provider** — Qwen3-TTS by default; IndexTTS-2.5, MOSS-TTS, OmniVoice, Fish Audio S2 Pro, Higgs Audio v3 and F5-TTS once installed (see [TTS engines](#-tts-engines)).
 - **Parallelism** — How several GPUs are used. `chunks`: every GPU shares one chapter (default). `chapters`: one chapter per GPU. `auto`: short chapters one per GPU, long ones shared.
 - **EasyOCR** — Enable to extract text from images embedded inside EPUB files.
@@ -450,20 +448,13 @@ Click **▶ Preview Processed Audio** to hear the result, then **💾 Use as nar
 ## 🛠️ Customizing the Project
 
 ### Change the TTS model
-Edit `audiobook_factory/tts_providers/qwen_provider.py`:
-```python
-# In _load_base_model():
-"Qwen/Qwen3-TTS-12Hz-1.7B-Base"   # replace with any compatible Qwen3 checkpoint
+Pick the engine and model in the Voice Studio tab, or on the command line with `--provider` and `--tts-model-name` (`python cli.py --list-providers` shows each engine's models). Each engine lists the checkpoints it accepts in its `INFO.models` (`audiobook_factory/tts_providers/<engine>_provider.py`).
 
-# In _run_genesis():
-"Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"   # design model used once for voice genesis
-```
-
-### Add a new TTS provider (future)
-1. Create `audiobook_factory/tts_providers/my_provider.py`
-2. Subclass `BaseTTSProvider` and implement `synthesize()`, `estimate_cost()`, `get_name()`
-3. Register the name in `base_tts_provider.get_tts_provider()`
-4. Add the name to the `tts_provider_dd` dropdown in `app.py`
+### Add a new TTS provider
+1. Create `audiobook_factory/tts_providers/my_provider.py`.
+2. Subclass `BaseTTSProvider`: describe the engine in a `ProviderInfo` (`INFO`), and implement `synthesize()`, `synthesize_batch()`, `estimate_cost()` and `get_name()`.
+3. Register it in `_PROVIDERS` in `audiobook_factory/tts_providers/registry.py`. The UI dropdown and the CLI read the registry.
+4. If it needs packages of its own, add `requirements/tts-my.txt` and an install branch in `install.sh`.
 
 ### Tune the text extraction pipeline
 Edit `audiobook_factory/extractor_engine.py`:
@@ -524,7 +515,7 @@ Edit `audiobook_factory/voice_preprocessor.py`:
 2. Audiobookshelf will auto-scan and import it as a book
 3. Each chapter file has the correct **ID3 metadata** (title, author, album, track number) so chapter ordering and library display work correctly out of the box
 
-Output filenames follow the `{NNNN}_{Chapter_Title}.mp3` format Audiobookshelf expects.
+Output filenames follow the `Chapter {N} - {Title}.mp3` pattern (`{NNNN} - {Title}.mp3` when the filesystem allows only short names). Audiobookshelf orders chapters by the track number tag.
 
 ---
 
@@ -567,8 +558,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list.
 - **3-Stage Overlapped Architecture**: Implemented `chapter_pipeline.py`, featuring CPU text preparation (Stage A), parallel GPU batch synthesis workers (Stage B), and streaming partial mastering with async disk I/O (Stage C).
 - **Chunk-Level Mid-Chapter Resumption**: Synthesized audio sentence chunks are cached to `.temp_chunks/` during generation. Interrupted runs seamlessly pick up from the exact sentence without re-synthesizing completed chunks.
 
-### 🦀 Rust PyO3 SIMD & Mastering Acceleration (`audiobook_rust`)
-- **PyO3 Extension Module**: SIMD-accelerated sentence splitting, text cleaning, text normalization, and 5.5× faster audio mastering written in Rust.
+### 🦀 Rust PyO3 Mastering Acceleration (`audiobook_rust`)
+- **PyO3 Extension Module**: sentence splitting, text cleaning, text normalization and audio mastering written in Rust.
 - **Transparent Fallback**: Graceful fallback to pure-Python implementations if Rust compilation is omitted.
 
 ### 🚀 Kaggle Dual-GPU Support & Pre-Run Diagnostics
