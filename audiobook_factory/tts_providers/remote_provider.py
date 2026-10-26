@@ -69,7 +69,7 @@ class RemoteProvider(BaseTTSProvider):
         worker_device = self._device
         if self._device.startswith("cuda:"):
             # The worker sees only its own GPU: a library that picks "the
-            # default GPU" cannot land on another worker's (seen on 2 x T4).
+            # default GPU" cannot land on another worker's.
             index = int(self._device.split(":")[1])
             visible = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
             env["CUDA_VISIBLE_DEVICES"] = visible[index] if index < len(visible) else str(index)

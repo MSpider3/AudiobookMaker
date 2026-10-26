@@ -59,7 +59,7 @@ class TestWorkShare:
     def test_three_devices_split_a_short_chapter_evenly(self):
         share, work = _WorkShare(workers=3), _queue_of(7)
         sizes = [len(share.take(work, batch_size=8)) for _ in range(3)]
-        assert sorted(sizes) == [2, 2, 3]
+        assert sizes == [3, 2, 2]
 
     def test_long_and_short_chunks_are_split_by_text_not_by_count(self):
         # Chapter 1 of the long test book, longest first: by count the first
@@ -73,6 +73,8 @@ class TestWorkShare:
         second = share.take(work, batch_size=16)
         a, b = (sum(len(text) for _, text in batch) for batch in (first, second))
         assert work.empty() and abs(a - b) < 400   # within one chunk of an even split
+        assert abs(len(first) - len(second)) <= 1   # and the same number of chunks
+        assert {first[0][0], second[0][0]} == {0, 1}  # each gets one of the two longest
 
     def test_every_chunk_is_taken_exactly_once(self):
         share, work = _WorkShare(workers=3), _queue_of(17)

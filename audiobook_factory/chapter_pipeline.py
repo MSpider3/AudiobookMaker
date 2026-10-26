@@ -118,30 +118,22 @@ class _WorkShare:
     def take(self, work_queue: queue.Queue, batch_size: int) -> list[tuple[int, str]]:
         """Takes up to *batch_size* items, but no more than an even share.
 
-        The share is of the queued *text*, not of the chunk count: chunks are
-        queued longest first, so an even count gave the first device most of
-        the reading (2,500 against 684 characters on a Kaggle chapter, and
-        that GPU took 7x longer). It is counted among the workers that are
-        not busy: a device that is free while the others are mid-batch takes
-        full batches.
+        The share is counted among the workers that are not busy: a device
+        that is free while the others are mid-batch takes full batches.
+        While several are free, chunks are dealt in turn: the queue is
+        longest first, so each device gets every n-th chunk, the same count
+        and nearly the same length of text. Taking the first half instead
+        gave one T4 2,500 characters and the other 684.
         """
         with self._lock:
             free_workers = max(1, self.workers - self._busy)
             with work_queue.mutex:
                 queued = list(work_queue.queue)
-            share = sum(max(1, len(text)) for _, text in queued) / free_workers
-            batch: list[tuple[int, str]] = []
-            taken = 0
-            for _, text in queued:
-                size = max(1, len(text))
-                # Stop where the share is closest: past it by less than half a chunk.
-                if len(batch) >= max(1, int(batch_size)) or (batch and taken + size / 2 > share):
-                    break
-                try:
-                    batch.append(work_queue.get_nowait())
-                except queue.Empty:
-                    break
-                taken += size
+                wanted = max(1, min(int(batch_size), -(-len(queued) // free_workers)))
+                batch = queued[::free_workers][:wanted]
+                taken = {id(item) for item in batch}
+                work_queue.queue.clear()
+                work_queue.queue.extend(item for item in queued if id(item) not in taken)
             if batch:
                 self._busy += 1
             return batch
