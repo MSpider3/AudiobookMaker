@@ -205,17 +205,17 @@ def _concat_partial(
         config: AudiobookConfig; ``config.pause`` is the default silence.
         pauses: Seconds of silence after each chunk, aligned with
             ``chunk_paths``. Defaults to ``config.pause`` for every chunk.
+
+    Raises:
+        RuntimeError: If a chunk file is missing or unreadable. Skipping it
+            would drop its audio from the chapter without a trace.
     """
     if pauses is None or len(pauses) != len(chunk_paths):
         pauses = [float(config.pause)] * len(chunk_paths)
-    valid = [
-        (p, pause) for p, pause in zip(chunk_paths, pauses)
-        if p and os.path.exists(p) and os.path.getsize(p) >= 100
-    ]
-    if not valid:
-        return
-    valid_paths = [p for p, _ in valid]
-    valid_pauses = [pause for _, pause in valid]
+    missing = [p for p in chunk_paths if not p or not os.path.exists(p)]
+    if missing:
+        raise RuntimeError(f"{len(missing)} chunk file(s) missing before concatenation: {missing[:3]}")
+    valid_paths, valid_pauses = list(chunk_paths), list(pauses)
     import numpy as np
     import soundfile as sf
 
@@ -246,7 +246,7 @@ def _concat_partial(
                 segments.append(data)
                 segments.append(np.zeros(int(max(0.0, valid_pauses[i]) * sr), dtype=np.float32))
         except Exception as exc:
-            logger.warning("Failed to read chunk %s during partial concat: %s", p, exc)
+            raise RuntimeError(f"Failed to read chunk {p} during partial concat: {exc}") from exc
     if segments:
         raw = np.concatenate(segments)
         sf.write(out_path, raw, sr)
@@ -260,7 +260,10 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
         normalisation was unavailable and the audio was written as-is, so the
         caller can normalise while encoding instead.
     """
-    valid_paths = [p for p in partial_paths if p and os.path.exists(p) and os.path.getsize(p) >= 100]
+    missing = [p for p in partial_paths if not p or not os.path.exists(p)]
+    if missing:
+        raise RuntimeError(f"{len(missing)} partial file(s) missing before mastering: {missing[:3]}")
+    valid_paths = [p for p in partial_paths if os.path.getsize(p) >= 100]
     if not valid_paths:
         return False
     normalized = True
@@ -289,7 +292,7 @@ def _master_final(partial_paths: list[str], out_path: str, config: AudiobookConf
                 if len(data) > 0:
                     segments.append(data)
             except Exception as exc:
-                logger.warning("Failed to read partial %s during final mastering: %s", p, exc)
+                raise RuntimeError(f"Failed to read partial {p} during final mastering: {exc}") from exc
         if segments:
             raw = np.concatenate(segments)
             # EBU R128 loudness normalisation with a peak limiter, in pure Python.

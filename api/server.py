@@ -47,7 +47,7 @@ from audiobook_factory.voice_preprocessor import (
 
 _PREPROCESS_DEFAULTS = PreprocessConfig()
 from api.worker import (
-    ConfigError, Task, evict_old_tasks, prepare_config, task_queue, tasks, worker_loop,
+    _MAX_SUBSCRIBER_EVENTS, ConfigError, Task, evict_old_tasks, prepare_config, task_queue, tasks, worker_loop,
 )
 
 logger = logging.getLogger(__name__)
@@ -313,12 +313,14 @@ async def get_task_status(task_id: str, since: Optional[int] = Query(default=Non
     ``log_count`` to receive just the new ones.
     """
     task = _get_task_or_404(task_id)
-    offset = min(since or 0, len(task.logs))
+    total = task.log_base + len(task.logs)
+    # Lines before log_base were dropped; the response then starts later.
+    offset = max(min(since or 0, total), task.log_base)
     body = task.summary()
     body.update({
-        "logs": task.logs[offset:],
+        "logs": task.logs[offset - task.log_base:],
         "log_offset": offset,
-        "log_count": len(task.logs),
+        "log_count": total,
         "output_files": task.output_files,
     })
     return body
@@ -477,7 +479,7 @@ async def task_websocket_endpoint(websocket: WebSocket, task_id: str):
     # Subscribe and snapshot the history in the same step (no await between
     # them), so a log line is delivered exactly once: from the snapshot or
     # from the queue, never both and never neither.
-    ws_queue: asyncio.Queue = asyncio.Queue()
+    ws_queue: asyncio.Queue = asyncio.Queue(maxsize=_MAX_SUBSCRIBER_EVENTS)
     task.subscribers.append(ws_queue)
     history = list(task.logs)
     print(f"[WebSocket] Client connected to task subscription: {task_id}")

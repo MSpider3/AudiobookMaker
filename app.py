@@ -1164,7 +1164,6 @@ _CONFIG_FIELDS_NOT_IN_UI: frozenset[str] = frozenset({
     "book_path",             # the uploaded file, passed in by the handler
     "output_dir",            # derived from the book title
     "redo_chapters",         # set by "Redo selected chapters"
-    "worker_count",          # read by nothing; accepted in old files only
     "device",                # the GPU pool picks devices
     "preview_mode",          # "Preview Chapters" has its own handler
     "retry_failed_at_end",   # always on
@@ -1979,6 +1978,9 @@ def _poll_task(run: _Run, task_id: str) -> None:
         if "log_offset" not in state:
             # Older backend: the whole log on every request.
             logs = logs[offset:]
+        else:
+            # Later than asked when the backend dropped old lines.
+            offset = int(state["log_offset"])
         for line in logs:
             run.add_log(str(line))
         offset += len(logs)

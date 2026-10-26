@@ -99,7 +99,6 @@ try:
         class AudiobookConfig:
             tts_provider_name = "qwen"
             device = "cuda"
-            worker_count = 4
             gpu_count = 0
         cfg = AudiobookConfig()
 
@@ -150,5 +149,5 @@ except ImportError:
 # ── Summary ───────────────────────────────────────────────────────────────────
 print("\n" + "=" * 62)
 print("All Colab pre-run diagnostic checks passed!")
-print("Recommended Settings: worker_count=4 | parallel_mode=chunks")
+print("Recommended Settings: parallel_mode=chunks")
 print("=" * 62)

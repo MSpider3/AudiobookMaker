@@ -103,7 +103,6 @@ def run_benchmark():
         tts_provider_name="qwen",
         tts_model_name="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         device=device,
-        worker_count=4,
         parallel_mode="chunks",
     )
 

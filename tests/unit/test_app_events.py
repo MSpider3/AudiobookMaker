@@ -151,6 +151,6 @@ def test_dropdown_defaults_are_among_their_choices(demo):
 
 def test_dead_and_removed_controls_are_gone(demo):
     labels = " | ".join(str(getattr(b, "label", "") or "") for b in demo.blocks.values()).lower()
-    assert "workers" not in labels and "worker" not in labels      # worker_count is read by nothing
+    assert "workers" not in labels and "worker" not in labels      # there is no worker-count setting
     assert "formant" not in labels and "quefrency" not in labels    # formant shifting was removed
     assert "nfe" not in labels                                      # now an engine option

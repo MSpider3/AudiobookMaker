@@ -128,7 +128,6 @@ _ONE_SHOT_SETTINGS: tuple[str, ...] = ("force_reprocess", "redo_chapters")
 # argparse destination → AudiobookConfig field, for flags that simply replace a value.
 _VALUE_FLAGS: tuple[tuple[str, str], ...] = (
     ("output_format", "output_format"),
-    ("worker_count", "worker_count"),
     ("parallel_mode", "parallel_mode"),
     ("device", "device"),
     ("tts_model_name", "tts_model_name"),
@@ -635,13 +634,6 @@ def _build_parser() -> argparse.ArgumentParser:
     eng.add_argument("--parallel-mode", choices=["chunks", "chapters", "auto"], default=None,
                      help="How several GPUs are used: chunks = all GPUs share one chapter (default), "
                           "chapters = one chapter per GPU, auto = short chapters one per GPU, long ones shared.")
-    eng.add_argument(
-        "--worker-count",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Number of parallel TTS workers.",
-    )
     eng.add_argument(
         "--quantization",
         choices=["none", "int8"],

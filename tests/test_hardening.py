@@ -36,9 +36,11 @@ except ImportError:
 class TestConfigContract(unittest.TestCase):
 
     def test_audiobook_config_from_dict_unknown_keys_ignored(self):
-        data = {"worker_count": 4, "unknown_field_xyz": "value"}
+        # worker_count was removed: old files that still carry it must load.
+        data = {"worker_count": 4, "pause": 0.7, "unknown_field_xyz": "value"}
         cfg = AudiobookConfig.from_dict(data)
-        self.assertEqual(cfg.worker_count, 4)
+        self.assertEqual(cfg.pause, 0.7)
+        self.assertFalse(hasattr(cfg, "worker_count"))
         self.assertFalse(hasattr(cfg, "unknown_field_xyz"))
 
     def test_audiobook_config_from_dict_missing_keys_use_defaults(self):
@@ -60,7 +62,7 @@ class TestConfigContract(unittest.TestCase):
 
     def test_field_summary(self):
         summary = AudiobookConfig.field_summary()
-        self.assertIn("worker_count", summary)
+        self.assertIn("parallel_mode", summary)
         self.assertIn("quantization", summary)
 
 

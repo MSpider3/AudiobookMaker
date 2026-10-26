@@ -33,7 +33,6 @@ class TestConfigContract:
         assert cfg.pause == 0.5
         assert cfg.lufs == -18
         assert cfg.true_peak == -1.5
-        assert cfg.worker_count == 1
         assert cfg.parallel_mode == "chunks"
         assert cfg.quantization == "none"
         assert cfg.resume_incomplete_chunks is True

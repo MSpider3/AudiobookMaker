@@ -8,7 +8,6 @@ New in this version
 - Audiobookshelf-compatible filenames via filename_sanitizer.make_safe_filename()
 - preview_mode      — returns chapter stats table without calling TTS
 - export_text       — writes a .txt file per chapter alongside the audio
-- worker_count      — ThreadPoolExecutor for parallel chapter processing
 - pronunciation_map — regex search-replace applied to text before TTS
 - tts_provider_name — selects which provider to use (currently: "qwen")
 - TTS logic delegated to tts_providers.get_tts_provider()
@@ -292,7 +291,6 @@ class AudiobookConfig:
     channels:            int   = 1        # Audio channels (1 = mono, 2 = stereo)
 
     # ── Parallelism & Hardware Optimization ───────────────────────────────────
-    worker_count:        int   = 1       # chapters/chunks in parallel
     parallel_mode:       str   = "chunks" # "chunks" | "chapters" | "auto"
     gpu_count:           int   = 0       # 0 = auto-detect at runtime
     vram_headroom_gb:    float = 2.0     # GB reserved VRAM headroom for dynamic batching

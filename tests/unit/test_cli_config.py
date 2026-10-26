@@ -188,7 +188,7 @@ class TestBuildConfig:
             "--batch-size", "4", "--gpu-count", "2", "--verify", "off",
             "--no-pack-sentences", "--no-normalize-text", "--single-file",
             "--no-resume-chunks", "--force-reprocess", "--redo", "2,4-5",
-            "--output-dir", out, "--output-format", "flac", "--worker-count", "3",
+            "--output-dir", out, "--output-format", "flac",
             "--device", "cpu", "--quantization", "int8",
         )
         meta, settings, _, _ = cli._load_config(args)
@@ -207,7 +207,7 @@ class TestBuildConfig:
         assert cfg.resume_incomplete_chunks is False
         assert cfg.force_reprocess is True and cfg.redo_chapters == [2, 4, 5]
         assert cfg.output_dir == str(out) and cfg.output_format == "flac"
-        assert (cfg.worker_count, cfg.device, cfg.quantization) == (3, "cpu", "int8")
+        assert (cfg.device, cfg.quantization) == ("cpu", "int8")
 
     def test_one_shot_settings_come_only_from_the_command_line(self, tmp_path, capsys):
         """The pipeline writes the last run's settings back; a resume must not
@@ -228,18 +228,18 @@ class TestBuildConfig:
 
     def test_string_numbers_are_coerced_and_garbage_rejected(self, tmp_path):
         path = _write_json(tmp_path, settings={
-            "tts_provider_name": "mock", "worker_count": "2", "speed": "1.5",
+            "tts_provider_name": "mock", "gpu_count": "2", "speed": "1.5",
             "export_srt": "true", "max_len": 300.0, "seed": None,
         })
         meta, settings, _, _ = cli._load_config(_parse(path))
         cfg = cli._build_audiobook_config(meta, settings, write_cover=False)
-        assert cfg.worker_count == 2 and isinstance(cfg.worker_count, int)
+        assert cfg.gpu_count == 2 and isinstance(cfg.gpu_count, int)
         assert cfg.speed == 1.5 and cfg.export_srt is True
         assert cfg.max_len == 300 and isinstance(cfg.max_len, int)
         assert cfg.seed == -1
 
-        settings["worker_count"] = "many"
-        with pytest.raises(ValueError, match="worker_count"):
+        settings["gpu_count"] = "many"
+        with pytest.raises(ValueError, match="gpu_count"):
             cli._build_audiobook_config(meta, settings, write_cover=False)
 
     def test_config_version_is_current_after_loading_an_old_file(self, tmp_path):

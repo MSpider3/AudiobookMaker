@@ -2,22 +2,24 @@ import re
 import nltk
 from nltk.tokenize import sent_tokenize
 
-# Ensure NLTK data is ready
-try:
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt', quiet=True)
-except Exception as e:
-    print(f"[WARNING] Failed to load/download NLTK punkt tokenizer: {e}")
+_PUNKT_CHECKED: bool = False
 
-try:
-    try:
-        nltk.data.find('tokenizers/punkt_tab')
-    except LookupError:
-        nltk.download('punkt_tab', quiet=True)
-except Exception as e:
-    print(f"[WARNING] Failed to load/download NLTK punkt_tab: {e}")
+
+def _ensure_punkt() -> None:
+    """Fetches NLTK's punkt data on first use (not at import: importing the
+    library must not touch the network)."""
+    global _PUNKT_CHECKED
+    if _PUNKT_CHECKED:
+        return
+    _PUNKT_CHECKED = True
+    for resource in ("punkt", "punkt_tab"):
+        try:
+            try:
+                nltk.data.find(f"tokenizers/{resource}")
+            except LookupError:
+                nltk.download(resource, quiet=True)
+        except Exception as e:
+            print(f"[WARNING] Failed to load/download NLTK {resource}: {e}")
 
 try:
     import audiobook_rust
@@ -161,6 +163,7 @@ def _python_split_sentences(text, max_len):
             
         # Level 2: Sentence Split
         sentences = []
+        _ensure_punkt()
         for candidate in sent_tokenize(cleaned_para):
             sentences.extend(
                 piece.strip() for piece in _WIDE_SENTENCE_END.split(candidate) if piece.strip()

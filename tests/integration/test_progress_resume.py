@@ -42,7 +42,6 @@ class TestProgressResume:
                 output_format="mp3",
                 tts_provider_name="mock",
                 resume_incomplete_chunks=True,
-                worker_count=1,
             )
 
             # Create mock provider and track calls
