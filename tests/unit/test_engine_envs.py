@@ -178,3 +178,58 @@ class TestEngineTrial:
         assert sf.info(results[0].wav_path).duration > 1 and results[0].speed_x > 0
         table = engine_trial.table(results)
         assert table.count("| mock |") == 2 and "❌" in table
+
+
+class TestWorkerSeesOnlyItsGpu:
+
+    @pytest.mark.parametrize("visible, device, expected", [
+        (None, "cuda:1", "1"), ("2,3", "cuda:1", "3"), (None, "cuda:0", "0"),
+    ])
+    def test_cuda_visible_devices(self, monkeypatch, visible, device, expected):
+        import audiobook_factory.tts_providers.remote_provider as remote_mod
+
+        seen = {}
+
+        class _Popen:
+            def __init__(self, args, env=None, **kwargs):
+                seen["args"], seen["env"] = args, env
+
+            def poll(self):
+                return None
+
+        if visible is None:
+            monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        else:
+            monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+        monkeypatch.setattr(remote_mod.subprocess, "Popen", _Popen)
+        RemoteProvider("mock", sys.executable, {}, AudiobookConfig(), device=device)._start()
+        assert seen["env"]["CUDA_VISIBLE_DEVICES"] == expected
+        assert seen["args"][4] == "cuda:0"     # the worker's only GPU
+
+
+class TestF5ReferenceTranscript:
+
+    @pytest.mark.parametrize("seconds, expected", [(8.0, "Words of the clip."), (22.0, "")])
+    def test_transcript_is_dropped_for_clips_f5_would_cut(self, monkeypatch, tmp_path, seconds, expected):
+        import types
+        import numpy as np
+
+        calls = {}
+
+        class _F5:
+            def __init__(self, device=None):
+                pass
+
+            def infer(self, **kwargs):
+                calls.update(kwargs)
+                return np.zeros(24000, dtype=np.float32) + 0.1, 24000, None
+
+        module = types.ModuleType("f5_tts.api")
+        module.F5TTS = _F5
+        monkeypatch.setitem(sys.modules, "f5_tts", types.ModuleType("f5_tts"))
+        monkeypatch.setitem(sys.modules, "f5_tts.api", module)
+        clip = tmp_path / "clip.wav"
+        sf.write(str(clip), np.zeros(int(16000 * seconds), dtype=np.float32), 16000)
+        provider = get_tts_provider("f5tts", AudiobookConfig(voice_transcript="Words of the clip."), device="cpu")
+        provider.synthesize("Hello.", str(clip), return_bytes=True)
+        assert calls["ref_text"] == expected and calls["gen_text"] == "Hello."

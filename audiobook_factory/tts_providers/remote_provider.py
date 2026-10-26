@@ -66,9 +66,17 @@ class RemoteProvider(BaseTTSProvider):
         env[WORKER_ENV_FLAG] = "1"
         # The engine's own packages must come before anything inherited.
         env["PYTHONPATH"] = _ROOT
+        worker_device = self._device
+        if self._device.startswith("cuda:"):
+            # The worker sees only its own GPU: a library that picks "the
+            # default GPU" cannot land on another worker's (seen on 2 x T4).
+            index = int(self._device.split(":")[1])
+            visible = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
+            env["CUDA_VISIBLE_DEVICES"] = visible[index] if index < len(visible) else str(index)
+            worker_device = "cuda:0"
         logger.info("[remote] Starting %s worker on %s (%s).", self._engine, self._device, self._python)
         self._process = subprocess.Popen(
-            [self._python, "-m", "audiobook_factory.engine_worker", self._engine, self._device, self._dtype],
+            [self._python, "-m", "audiobook_factory.engine_worker", self._engine, worker_device, self._dtype],
             cwd=_ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
         )
         return self._process
