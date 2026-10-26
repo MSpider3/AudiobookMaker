@@ -59,7 +59,20 @@ class TestWorkShare:
     def test_three_devices_split_a_short_chapter_evenly(self):
         share, work = _WorkShare(workers=3), _queue_of(7)
         sizes = [len(share.take(work, batch_size=8)) for _ in range(3)]
-        assert sizes == [3, 2, 2]
+        assert sorted(sizes) == [2, 2, 3]
+
+    def test_long_and_short_chunks_are_split_by_text_not_by_count(self):
+        # Chapter 1 of the long test book, longest first: by count the first
+        # GPU got 2,500 characters and the second 684 (Kaggle, 7x slower).
+        lengths = [393, 385, 383, 381, 372, 298, 288, 241, 161, 129, 128, 25]
+        work: queue.Queue = queue.Queue()
+        for index, length in enumerate(lengths):
+            work.put((index, "x" * length))
+        share = _WorkShare(workers=2)
+        first = share.take(work, batch_size=16)
+        second = share.take(work, batch_size=16)
+        a, b = (sum(len(text) for _, text in batch) for batch in (first, second))
+        assert work.empty() and abs(a - b) < 400   # within one chunk of an even split
 
     def test_every_chunk_is_taken_exactly_once(self):
         share, work = _WorkShare(workers=3), _queue_of(17)

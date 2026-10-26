@@ -118,19 +118,30 @@ class _WorkShare:
     def take(self, work_queue: queue.Queue, batch_size: int) -> list[tuple[int, str]]:
         """Takes up to *batch_size* items, but no more than an even share.
 
-        The share is counted among the workers that are not busy: a device
-        that is free while the others are mid-batch takes full batches.
+        The share is of the queued *text*, not of the chunk count: chunks are
+        queued longest first, so an even count gave the first device most of
+        the reading (2,500 against 684 characters on a Kaggle chapter, and
+        that GPU took 7x longer). It is counted among the workers that are
+        not busy: a device that is free while the others are mid-batch takes
+        full batches.
         """
         with self._lock:
             free_workers = max(1, self.workers - self._busy)
-            fair_share = -(-work_queue.qsize() // free_workers)
-            wanted = max(1, min(int(batch_size), fair_share))
+            with work_queue.mutex:
+                queued = list(work_queue.queue)
+            share = sum(max(1, len(text)) for _, text in queued) / free_workers
             batch: list[tuple[int, str]] = []
-            while len(batch) < wanted:
+            taken = 0
+            for _, text in queued:
+                size = max(1, len(text))
+                # Stop where the share is closest: past it by less than half a chunk.
+                if len(batch) >= max(1, int(batch_size)) or (batch and taken + size / 2 > share):
+                    break
                 try:
                     batch.append(work_queue.get_nowait())
                 except queue.Empty:
                     break
+                taken += size
             if batch:
                 self._busy += 1
             return batch
