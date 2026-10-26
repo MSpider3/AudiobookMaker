@@ -39,6 +39,9 @@ _LANGUAGE_IDS: dict[str, str] = {
 }
 # Added in Ming-3.0; upstream's MULTILINGUAL task needs the language id.
 _MULTILINGUAL: frozenset[str] = frozenset({"ja", "ko", "de", "fr", "es"})
+# Upstream's pin. Under transformers 4.57.3 the same model and upstream's own
+# example produced unintelligible babble on Kaggle T4s; under 4.46.3, 0% word errors.
+_TRANSFORMERS_SERIES: str = "4.46."
 
 
 class MingTTSProvider(BaseTTSProvider):
@@ -60,10 +63,11 @@ class MingTTSProvider(BaseTTSProvider):
         transcript="required",
         supports_batch=False,
         supports_seed=True,
-        pip_requirements=("x-transformers==2.9.2", "diffusers==0.33.0", "onnxruntime", "inflect", "loguru", "einops"),
+        pip_requirements=("transformers==4.46.3", "accelerate==1.3.0", "x-transformers==2.9.2",
+                          "diffusers==0.33.0", "onnxruntime", "inflect", "loguru", "einops"),
         install_notes=(
-            "pip install -r requirements/tts-ming.txt, then clone https://github.com/inclusionAI/Ming-3.0-tts "
-            "and set ABM_MING_REPO to it. "
+            "Own environment: pip install -r requirements/tts-ming.txt (pins transformers 4.46.3), then clone "
+            "https://github.com/inclusionAI/Ming-3.0-tts and set ABM_MING_REPO to it. "
             "Weights (3 GB) download on first use."
         ),
     )
@@ -88,6 +92,14 @@ class MingTTSProvider(BaseTTSProvider):
             if self._model is not None:
                 return
             add_clone_to_path(_REPO_ENV_VAR, "ming_tts.py", "Ming-3.0-TTS")
+            import transformers
+
+            if not transformers.__version__.startswith(_TRANSFORMERS_SERIES):
+                raise RuntimeError(
+                    f"Ming-3.0-TTS needs transformers {_TRANSFORMERS_SERIES}x, found {transformers.__version__}: "
+                    "with newer versions it speaks unintelligible babble. Install requirements/tts-ming.txt "
+                    "in an environment of its own."
+                )
             try:
                 from ming_tts import MingTTS  # type: ignore
             except ImportError as exc:

@@ -49,7 +49,8 @@ class BreezeTTSProvider(BaseTTSProvider):
         display_name="Breeze TTS 2",
         description=(
             "3.5B English / Chinese voice cloning from a clip and its transcript, with optional "
-            "style instructions. Research and non-commercial use only."
+            "style instructions. Use a narrator clip in the book's language: an English clip "
+            "reading Chinese came out garbled. Research and non-commercial use only."
         ),
         license="BreezeBlue Research and Non-Commercial License v1.1",
         commercial_use=False,

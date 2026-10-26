@@ -151,12 +151,12 @@ AudiobookMaker/
 | Higgs Audio v3 (`higgs`) | Boson research / non-commercial | **no** (creator grant with attribution) | 11 GB | yes | optional | Ported from the reference server; no official in-process path exists |
 | F5-TTS (`f5tts`) | CC-BY-NC-4.0 | **no** | 3 GB | no | optional | English / Chinese |
 | Fish Audio S1-mini (`fish_s1`) | CC-BY-NC-SA-4.0, gated | **no** | 4 GB | no | **required** | 0.5B, 13 languages, 44.1 kHz; needs `HF_TOKEN` and its own environment (older fish-speech) |
-| Breeze TTS 2 (`breeze`) | BreezeBlue Research and Non-Commercial | **no**, not even selling the audiobook | 9 GB | yes | **required** | English / Chinese, style instructions; shares the Qwen3-TTS environment |
-| Ming-3.0-TTS 0.5B (`ming`) | MIT | yes | 5 GB | no | **required** | 7 languages (zh, en, ja, ko, de, fr, es), 44.1 kHz |
+| Breeze TTS 2 (`breeze`) | BreezeBlue Research and Non-Commercial | **no**, not even selling the audiobook | 9 GB | yes | **required** | English / Chinese, style instructions; the narrator clip must be in the book's language; shares the Qwen3-TTS environment |
+| Ming-3.0-TTS 0.5B (`ming`) | MIT | yes | 4 GB | no | **required** | 7 languages (zh, en, ja, ko, de, fr, es), 44.1 kHz; needs transformers 4.46.3 (own environment) |
 
 \* Estimated from weight sizes. Run `python cli.py --list-providers` for each engine's options and install command.
 
-**One engine per environment.** The engines pin incompatible `transformers` versions (IndexTTS 4.52, Qwen 4.57, MOSS exactly 5.0.0, OmniVoice and Higgs 5.3+), so install only the one you use on top of `requirements.txt`:
+**One engine per environment.** The engines pin incompatible `transformers` versions (Ming 4.46, IndexTTS 4.52, Qwen and Breeze 4.57, MOSS exactly 5.0.0, OmniVoice and Higgs 5.3+), so install only the one you use on top of `requirements.txt`:
 
 ```bash
 pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | fish | fish_s1 | higgs | breeze | ming
@@ -164,7 +164,10 @@ pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | f
 
 `requirements/tts-<engine>.txt` lists any second step an engine needs. `fish_s1`, `breeze` and `ming` run from a clone of their upstream repository at a reviewed commit, named by `ABM_FISH_S1_REPO`, `ABM_BREEZE_REPO` or `ABM_MING_REPO`; the notebooks' engine cell clones it for you.
 
-> **Not yet run on a GPU:** `fish_s1`, `breeze` and `ming` were written from their upstream code and tested against stand-ins only. Their speed and quality on a T4 are unknown. Breeze and Ming load bfloat16, as upstream does, which a T4 runs slowly; S1-mini uses fp16.
+**The newest engines on Kaggle (2 × T4, 2026-10-26):**
+- **Breeze TTS 2:** word-perfect in English (0–5% word errors) and Chinese (0%) **when the narrator clip is in the book's language**; an English clip reading Chinese came out garbled. A 3.4-minute chapter took about 4 minutes on two T4s (≈0.9× real time); 8.8 GB per GPU.
+- **Ming-3.0-TTS 0.5B:** word-perfect in English and Chinese with transformers 4.46.3, but unintelligible with Kaggle's default 4.57.3, so it needs its own environment (the provider refuses to run on another version). About 0.4× real time per T4, 3.3 GB per GPU.
+- **Fish S1-mini:** not run yet; the model is gated, so a run needs an `HF_TOKEN`.
 
 **Planned, needs bigger hardware: Fish Audio Drama-3** ([fishaudio/drama-3](https://huggingface.co/fishaudio/drama-3)). A 35B mixture-of-experts model (3B active) with multi-speaker dialogue, about 80 languages and voice cloning. Not added yet because it cannot run on Kaggle or Colab:
 - it needs at least 48 GB of GPU memory with its FP8 weights, and FP8 needs an Ada/Hopper GPU (compute capability 8.9+); on older GPUs it falls back to fp16 weights of about 70 GB, a path upstream has not tested;

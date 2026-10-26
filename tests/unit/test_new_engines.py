@@ -154,6 +154,9 @@ class _FakeMing:
 
 @pytest.fixture
 def ming(monkeypatch, tmp_path):
+    import transformers
+
+    monkeypatch.setattr(transformers, "__version__", "4.46.3")
     _clone(tmp_path, "ABM_MING_REPO", "ming_tts.py", monkeypatch)
     module = types.ModuleType("ming_tts")
     module.MingTTS = _FakeMing
@@ -189,6 +192,15 @@ class TestMing:
         provider = get_tts_provider("ming", AudiobookConfig(voice_transcript=""), device="cpu")
         with pytest.raises(RuntimeError, match="transcript"):
             provider.synthesize("Text.", _voice(tmp_path), return_bytes=True)
+
+
+def test_ming_refuses_other_transformers_versions(ming, monkeypatch):
+    import transformers
+
+    monkeypatch.setattr(transformers, "__version__", "4.57.3")
+    provider = get_tts_provider("ming", AudiobookConfig(voice_transcript="Hi."), device="cpu")
+    with pytest.raises(RuntimeError, match="4.46"):
+        provider.ensure_ready()
 
 
 # ── Fish S1-mini ──────────────────────────────────────────────────────────────
