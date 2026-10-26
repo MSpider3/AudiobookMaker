@@ -165,7 +165,7 @@ pip install -r requirements/tts-<engine>.txt   # indextts | moss | omnivoice | f
 
 **The newest engines on Kaggle (2 × T4, 2026-10-26):**
 - **Breeze TTS 2:** word-perfect in English (0–5% word errors) and Chinese (0%) **when the narrator clip is in the book's language**; an English clip reading Chinese came out garbled. A 3.4-minute chapter took about 4 minutes on two T4s (≈0.9× real time); 8.8 GB per GPU.
-- **Ming-3.0-TTS 0.5B:** with transformers 4.46.3, 0–1.4% word errors in English and 0% in Chinese (Chinese clip); Japanese read with the English clip had 8–18% character errors. Unintelligible with Kaggle's default 4.57.3, so it needs its own environment (the provider refuses to run on another version). 0.44× real time per T4, 3.1 GB per GPU; it speaks one chunk at a time, so two GPUs roughly double that.
+- **Ming-3.0-TTS 0.5B:** with transformers 4.46.3, 0–1.4% word errors in English and 0% in Chinese (Chinese clip); Japanese read with the English clip had 8–18% character errors. Unintelligible with Kaggle's default 4.57.3, so it needs its own environment (the provider refuses to run on another version). 0.44× real time per T4, 3.1 GB per GPU; a whole chapter on two T4s ran at 0.61× (synthesis only; the GPUs finished within 3 s of each other).
 
 **Planned, needs bigger hardware: Fish Audio Drama-3** ([fishaudio/drama-3](https://huggingface.co/fishaudio/drama-3)). A 35B mixture-of-experts model (3B active) with multi-speaker dialogue, about 80 languages and voice cloning. Not added yet because it cannot run on Kaggle or Colab:
 - it needs at least 48 GB of GPU memory with its FP8 weights, and FP8 needs an Ada/Hopper GPU (compute capability 8.9+); on older GPUs it falls back to fp16 weights of about 70 GB, a path upstream has not tested;

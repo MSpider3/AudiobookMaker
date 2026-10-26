@@ -25,7 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **README**: config schema 7, no "SIMD" claim, the real chapter file names, sequential model warmup, and an up-to-date guide to adding an engine.
 
 ### 🚀 Changed
-- **Engines that speak one chunk at a time** (Ming, Fish S2 Pro, IndexTTS, F5-TTS) now take one chunk per turn instead of four, so both GPUs finish a chapter together; a Ming chapter on 2 × T4 had left one GPU idle for a third of it.
+- **Engines that speak one chunk at a time** (Ming, Fish S2 Pro, IndexTTS, F5-TTS) now take one chunk per turn instead of four, so both GPUs finish a chapter together. Measured with Ming on 2 × T4: the GPUs' busy times went from 268 s / 397 s to 274 s / 271 s, and the chapter's synthesis from 397 s to 274 s.
 - **`parallel_mode="auto"` and `"chapters"` measured on 2 × T4**: four 3-minute chapters took 293 s and 294 s (2.6× real time) against 521 s (1.4×) with the default `chunks`. The Kaggle run notebook was run end to end (Rust build, API server, web UI, CLI in all three modes).
 - **README and notebooks: "Which engine should I use?"** — best uses, pros and cons, languages and voice methods (cloning, description, built-in readers) of every engine, marked as the result of automated testing by an AI assistant.
 
