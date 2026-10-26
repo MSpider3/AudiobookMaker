@@ -110,7 +110,7 @@ class TestTTSProviderContract:
         assert cfg.tts_provider_name == "qwen"
         assert cfg.tts_model_name == AudiobookConfig().tts_model_name
 
-    def test_f5tts_temp_file_cleaned_up(self, config, monkeypatch):
+    def test_f5tts_reuses_one_reference_file_per_clip(self, config, monkeypatch):
         import numpy as np
         from audiobook_factory.tts_providers.f5tts_provider import F5TTSProvider
 
@@ -129,9 +129,10 @@ class TestTTSProviderContract:
 
         fake_voice_ref = b"RIFF" + b"\x00" * 100
         p.synthesize("Hello world", fake_voice_ref, return_bytes=True)
+        p.synthesize("Hello again", fake_voice_ref, return_bytes=True)
 
-        assert len(recorded_temp_files) == 1
-        assert not os.path.exists(recorded_temp_files[0]), "Temp file must be unlinked after synthesize"
+        # One cached file per clip, not a new temp file per chunk.
+        assert len(recorded_temp_files) == 2 and recorded_temp_files[0] == recorded_temp_files[1]
 
     def test_qwen_voice_ref_cache_limit_and_eviction(self, config):
         from audiobook_factory.tts_providers.qwen_provider import (
